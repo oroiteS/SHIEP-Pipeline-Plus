@@ -31,9 +31,10 @@ fn normalize_bind_addr(bind_addr: &str) -> String {
 fn handle_client(mut client: TcpStream) -> EcResult<()> {
     negotiate_method(&mut client)?;
     let target = read_connect_request(&mut client)?;
+    let target_addr = target.to_socket_target();
     eprintln!("[SOCKS] connect request target={target}");
-    let conn = crate::netstack::open_tcp_connection(&target)?;
-    eprintln!("[SOCKS] connected target={target} via tunnel");
+    let conn = crate::netstack::open_tcp_connection(&target_addr)?;
+    eprintln!("[SOCKS] connected target={target_addr} via tunnel");
     write_reply(&mut client, 0x00)?;
     relay(client, conn)
 }
@@ -68,14 +69,16 @@ fn negotiate_method(client: &mut TcpStream) -> EcResult<()> {
     ))
 }
 
-fn read_connect_request(client: &mut TcpStream) -> EcResult<String> {
+fn read_connect_request(client: &mut TcpStream) -> EcResult<ConnectTarget> {
     let mut req = [0u8; 4];
     client
         .read_exact(&mut req)
         .map_err(|e| EcError::Runtime(format!("socks request head read failed: {e}")))?;
 
     if req[0] != 0x05 {
-        return Err(EcError::Runtime("invalid socks request version".to_string()));
+        return Err(EcError::Runtime(
+            "invalid socks request version".to_string(),
+        ));
     }
     if req[1] != 0x01 {
         let _ = write_reply(client, 0x07);
@@ -128,7 +131,7 @@ fn read_connect_request(client: &mut TcpStream) -> EcResult<String> {
         .read_exact(&mut port_buf)
         .map_err(|e| EcError::Runtime(format!("read target port failed: {e}")))?;
     let port = u16::from_be_bytes(port_buf);
-    Ok(format!("{host}:{port}"))
+    Ok(ConnectTarget { host, port })
 }
 
 fn write_reply(client: &mut TcpStream, rep: u8) -> EcResult<()> {
@@ -180,4 +183,46 @@ fn relay(mut client: TcpStream, conn: crate::netstack::TunnelTcpConnection) -> E
     let _ = t1.join();
     let _ = t2.join();
     Ok(())
+}
+
+struct ConnectTarget {
+    host: String,
+    port: u16,
+}
+
+impl ConnectTarget {
+    fn to_socket_target(&self) -> String {
+        format!("{}:{}", self.host, self.port)
+    }
+}
+
+impl std::fmt::Display for ConnectTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.host, self.port)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ConnectTarget, normalize_bind_addr};
+
+    #[test]
+    fn normalize_bind_addr_expands_port_only() {
+        assert_eq!(normalize_bind_addr(":1080"), "0.0.0.0:1080");
+    }
+
+    #[test]
+    fn normalize_bind_addr_keeps_explicit_host() {
+        assert_eq!(normalize_bind_addr("127.0.0.1:1080"), "127.0.0.1:1080");
+    }
+
+    #[test]
+    fn connect_target_formats_socket_target() {
+        let target = ConnectTarget {
+            host: "10.0.0.1".to_string(),
+            port: 80,
+        };
+        assert_eq!(target.to_socket_target(), "10.0.0.1:80");
+        assert_eq!(target.to_string(), "10.0.0.1:80");
+    }
 }

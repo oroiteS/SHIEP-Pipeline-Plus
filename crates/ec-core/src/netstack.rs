@@ -12,6 +12,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 static CONTROL_TX: OnceLock<mpsc::Sender<ControlMessage>> = OnceLock::new();
+const OPEN_CONN_TIMEOUT: Duration = Duration::from_secs(10);
+const SOCKET_BUFFER_CAPACITY: usize = 64 * 1024;
+const NETSTACK_TICK: Duration = Duration::from_millis(2);
 
 pub fn validate_netstack_preconditions() -> EcResult<()> {
     Ok(())
@@ -52,7 +55,7 @@ pub fn open_tcp_connection(target: &str) -> EcResult<TunnelTcpConnection> {
         })
         .map_err(|e| EcError::Runtime(format!("send open connection request failed: {e}")))?;
 
-    match reply_rx.recv_timeout(Duration::from_secs(10)) {
+    match reply_rx.recv_timeout(OPEN_CONN_TIMEOUT) {
         Ok(Ok((id, rx))) => Ok(TunnelTcpConnection {
             id,
             control_tx: control,
@@ -135,7 +138,12 @@ fn run_netstack_loop(
     let mut cfg = Config::new(HardwareAddress::Ip);
     cfg.random_seed = Instant::now().elapsed().as_nanos() as u64;
     let mut iface = Interface::new(cfg, &mut device, smol_now(Instant::now()));
-    let client_ip = Ipv4Address::new(assigned_ip[0], assigned_ip[1], assigned_ip[2], assigned_ip[3]);
+    let client_ip = Ipv4Address::new(
+        assigned_ip[0],
+        assigned_ip[1],
+        assigned_ip[2],
+        assigned_ip[3],
+    );
     iface.update_ip_addrs(|ip_addrs| {
         let _ = ip_addrs.push(IpCidr::new(IpAddress::Ipv4(client_ip), 0));
     });
@@ -152,114 +160,158 @@ fn run_netstack_loop(
         }
 
         while let Ok(msg) = control_rx.try_recv() {
-            match msg {
-                ControlMessage::Open { target, reply } => {
-                    let socket = tcp::Socket::new(
-                        tcp::SocketBuffer::new(vec![0; 64 * 1024]),
-                        tcp::SocketBuffer::new(vec![0; 64 * 1024]),
-                    );
-                    let handle = sockets.add(socket);
-                    let local_port = alloc_local_port(&mut next_local_port);
-                    let connect_result = {
-                        let socket = sockets.get_mut::<tcp::Socket>(handle);
-                        socket.connect(
-                            iface.context(),
-                            (IpAddress::Ipv4(*target.ip()), target.port()),
-                            local_port,
-                        )
-                    };
-
-                    match connect_result {
-                        Ok(()) => {
-                            let (uplink_tx, uplink_rx) = mpsc::channel::<Vec<u8>>();
-                            let id = next_conn_id;
-                            next_conn_id = next_conn_id.wrapping_add(1);
-                            connections.insert(
-                                id,
-                                ConnectionState {
-                                    handle,
-                                    uplink: uplink_tx,
-                                    pending_send: VecDeque::new(),
-                                    close_requested: false,
-                                },
-                            );
-                            let _ = reply.send(Ok((id, uplink_rx)));
-                        }
-                        Err(e) => {
-                            let _ = sockets.remove(handle);
-                            let _ = reply.send(Err(EcError::Runtime(format!(
-                                "tcp connect failed: {e}"
-                            ))));
-                        }
-                    }
-                }
-                ControlMessage::Send { id, data } => {
-                    if let Some(conn) = connections.get_mut(&id) {
-                        conn.pending_send.push_back(data);
-                    }
-                }
-                ControlMessage::Close { id } => {
-                    if let Some(conn) = connections.get_mut(&id) {
-                        conn.close_requested = true;
-                    }
-                }
-            }
+            handle_control_message(
+                msg,
+                &mut iface,
+                &mut sockets,
+                &mut connections,
+                &mut next_conn_id,
+                &mut next_local_port,
+            );
         }
 
         let now = smol_now(start);
         let _ = iface.poll(now, &mut device, &mut sockets);
+        drive_connections(&mut sockets, &mut connections);
+        thread::sleep(NETSTACK_TICK);
+    }
+}
 
-        let mut remove_ids = Vec::new();
-        for (id, conn) in &mut connections {
-            let socket = sockets.get_mut::<tcp::Socket>(conn.handle);
+fn handle_control_message(
+    msg: ControlMessage,
+    iface: &mut Interface,
+    sockets: &mut SocketSet<'_>,
+    connections: &mut HashMap<u64, ConnectionState>,
+    next_conn_id: &mut u64,
+    next_local_port: &mut u16,
+) {
+    match msg {
+        ControlMessage::Open { target, reply } => {
+            let result = open_connection(
+                target,
+                iface,
+                sockets,
+                connections,
+                next_conn_id,
+                next_local_port,
+            );
+            let _ = reply.send(result);
+        }
+        ControlMessage::Send { id, data } => {
+            if let Some(conn) = connections.get_mut(&id) {
+                conn.pending_send.push_back(data);
+            }
+        }
+        ControlMessage::Close { id } => {
+            if let Some(conn) = connections.get_mut(&id) {
+                conn.close_requested = true;
+            }
+        }
+    }
+}
 
-            while socket.can_send() {
-                let Some(mut chunk) = conn.pending_send.pop_front() else {
+fn open_connection(
+    target: SocketAddrV4,
+    iface: &mut Interface,
+    sockets: &mut SocketSet<'_>,
+    connections: &mut HashMap<u64, ConnectionState>,
+    next_conn_id: &mut u64,
+    next_local_port: &mut u16,
+) -> EcResult<(u64, mpsc::Receiver<Vec<u8>>)> {
+    let socket = tcp::Socket::new(
+        tcp::SocketBuffer::new(vec![0; SOCKET_BUFFER_CAPACITY]),
+        tcp::SocketBuffer::new(vec![0; SOCKET_BUFFER_CAPACITY]),
+    );
+    let handle = sockets.add(socket);
+    let local_port = alloc_local_port(next_local_port);
+    let connect_result = {
+        let socket = sockets.get_mut::<tcp::Socket>(handle);
+        socket.connect(
+            iface.context(),
+            (IpAddress::Ipv4(*target.ip()), target.port()),
+            local_port,
+        )
+    };
+
+    match connect_result {
+        Ok(()) => {
+            let (uplink_tx, uplink_rx) = mpsc::channel::<Vec<u8>>();
+            let id = *next_conn_id;
+            *next_conn_id = (*next_conn_id).wrapping_add(1);
+            connections.insert(
+                id,
+                ConnectionState {
+                    handle,
+                    uplink: uplink_tx,
+                    pending_send: VecDeque::new(),
+                    close_requested: false,
+                },
+            );
+            Ok((id, uplink_rx))
+        }
+        Err(e) => {
+            let _ = sockets.remove(handle);
+            Err(EcError::Runtime(format!("tcp connect failed: {e}")))
+        }
+    }
+}
+
+fn drive_connections(sockets: &mut SocketSet<'_>, connections: &mut HashMap<u64, ConnectionState>) {
+    let mut remove_ids = Vec::new();
+    for (id, conn) in connections.iter_mut() {
+        let socket = sockets.get_mut::<tcp::Socket>(conn.handle);
+
+        pump_pending_sends(socket, conn);
+        pump_uplink_reads(socket, conn);
+
+        if conn.close_requested && socket.may_send() {
+            socket.close();
+        }
+        if !socket.is_open() {
+            remove_ids.push(*id);
+        }
+    }
+
+    for id in remove_ids {
+        if let Some(conn) = connections.remove(&id) {
+            let _ = sockets.remove(conn.handle);
+        }
+    }
+}
+
+fn pump_pending_sends(socket: &mut tcp::Socket, conn: &mut ConnectionState) {
+    while socket.can_send() {
+        let Some(mut chunk) = conn.pending_send.pop_front() else {
+            break;
+        };
+        match socket.send_slice(&chunk) {
+            Ok(sent) if sent == chunk.len() => {}
+            Ok(sent) => {
+                chunk.drain(..sent);
+                conn.pending_send.push_front(chunk);
+                break;
+            }
+            Err(_) => {
+                conn.close_requested = true;
+                break;
+            }
+        }
+    }
+}
+
+fn pump_uplink_reads(socket: &mut tcp::Socket, conn: &mut ConnectionState) {
+    while socket.can_recv() {
+        let mut buf = [0u8; 4096];
+        match socket.recv_slice(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if conn.uplink.send(buf[..n].to_vec()).is_err() {
+                    conn.close_requested = true;
                     break;
-                };
-                match socket.send_slice(&chunk) {
-                    Ok(sent) if sent == chunk.len() => {}
-                    Ok(sent) => {
-                        chunk.drain(..sent);
-                        conn.pending_send.push_front(chunk);
-                        break;
-                    }
-                    Err(_) => {
-                        conn.close_requested = true;
-                        break;
-                    }
                 }
             }
-
-            while socket.can_recv() {
-                let mut buf = [0u8; 4096];
-                match socket.recv_slice(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if conn.uplink.send(buf[..n].to_vec()).is_err() {
-                            conn.close_requested = true;
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-
-            if conn.close_requested && socket.may_send() {
-                socket.close();
-            }
-            if !socket.is_open() {
-                remove_ids.push(*id);
-            }
+            Err(_) => break,
         }
-
-        for id in remove_ids {
-            if let Some(conn) = connections.remove(&id) {
-                let _ = sockets.remove(conn.handle);
-            }
-        }
-
-        thread::sleep(Duration::from_millis(2));
     }
 }
 
@@ -341,7 +393,10 @@ impl Device for TunnelDevice {
     where
         Self: 'a;
 
-    fn receive(&mut self, _timestamp: SmolInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+    fn receive(
+        &mut self,
+        _timestamp: SmolInstant,
+    ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let frame = self.rx_queue.pop_front()?;
         Some((TunnelRxToken { frame }, TunnelTxToken))
     }
