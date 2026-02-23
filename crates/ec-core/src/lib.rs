@@ -3,6 +3,7 @@ pub mod config;
 pub mod error;
 
 mod auth;
+mod endpoint;
 mod netstack;
 mod protocol;
 mod socks;

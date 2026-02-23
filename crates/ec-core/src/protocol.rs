@@ -1,3 +1,4 @@
+use crate::endpoint::parse_server;
 use crate::error::{EcError, EcResult};
 use foreign_types::ForeignType;
 use openssl::error::ErrorStack;
@@ -12,6 +13,39 @@ use std::time::{Duration, Instant};
 
 const STREAM_RETRY_LIMIT: usize = 5;
 const STREAM_RETRY_DELAY: Duration = Duration::from_secs(1);
+const STREAM_IDLE_DELAY: Duration = Duration::from_millis(5);
+const QUERY_IP_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+const STREAM_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const PROTOCOL_TOKEN_LEN: usize = 48;
+
+#[derive(Clone, Copy)]
+enum StreamProfile {
+    Rx,
+    Tx,
+}
+
+impl StreamProfile {
+    fn op_code(self) -> u8 {
+        match self {
+            Self::Rx => 0x06,
+            Self::Tx => 0x05,
+        }
+    }
+
+    fn expected_reply(self) -> u8 {
+        match self {
+            Self::Rx => 0x01,
+            Self::Tx => 0x02,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Rx => "rx",
+            Self::Tx => "tx",
+        }
+    }
+}
 
 static TX_PACKET_SENDER: OnceLock<mpsc::Sender<Vec<u8>>> = OnceLock::new();
 static QUERY_KEEPALIVE: OnceLock<Mutex<Option<SslStream<TcpStream>>>> = OnceLock::new();
@@ -19,33 +53,23 @@ static RX_PACKET_RECEIVER: OnceLock<Mutex<Option<mpsc::Receiver<Vec<u8>>>>> = On
 
 pub fn query_assigned_ip(server: &str, token: &str) -> EcResult<[u8; 4]> {
     let (authority, host) = parse_server(server)?;
-    let token_bytes = token.as_bytes();
-    if token_bytes.len() != 48 {
-        return Err(EcError::Runtime(format!(
-            "invalid protocol token length: expected 48, got {}",
-            token_bytes.len()
-        )));
-    }
+    let token_bytes = parse_protocol_token(token)?;
 
-    query_assigned_ip_once(&authority, &host, token_bytes)
+    query_assigned_ip_once(&authority, &host, &token_bytes)
 }
 
 pub fn start_tunnel_runtime(server: &str, token: &str, assigned_ip: [u8; 4]) -> EcResult<()> {
     let (authority, host) = parse_server(server)?;
-    let token_bytes = token.as_bytes();
-    if token_bytes.len() != 48 {
-        return Err(EcError::Runtime(format!(
-            "invalid protocol token length: expected 48, got {}",
-            token_bytes.len()
-        )));
-    }
-    let token_arr: [u8; 48] = token_bytes.try_into().map_err(|_| {
-        EcError::Runtime("failed to convert protocol token into fixed 48-byte array".to_string())
-    })?;
-    let ip_rev = [assigned_ip[3], assigned_ip[2], assigned_ip[1], assigned_ip[0]];
+    let token_arr = parse_protocol_token(token)?;
+    let ip_rev = [
+        assigned_ip[3],
+        assigned_ip[2],
+        assigned_ip[1],
+        assigned_ip[0],
+    ];
 
-    let rx_stream = open_data_stream(&authority, &host, &token_arr, &ip_rev, 0x06, 0x01)?;
-    let tx_stream = open_data_stream(&authority, &host, &token_arr, &ip_rev, 0x05, 0x02)?;
+    let rx_stream = open_data_stream(&authority, &host, &token_arr, &ip_rev, StreamProfile::Rx)?;
+    let tx_stream = open_data_stream(&authority, &host, &token_arr, &ip_rev, StreamProfile::Tx)?;
 
     let (tx_sender, tx_receiver) = mpsc::channel::<Vec<u8>>();
     let (rx_sender, rx_receiver) = mpsc::channel::<Vec<u8>>();
@@ -68,7 +92,14 @@ pub fn start_tunnel_runtime(server: &str, token: &str, assigned_ip: [u8; 4]) -> 
     let rx_authority = authority.clone();
     let rx_host = host.clone();
     thread::spawn(move || {
-        let _ = rx_worker_loop(rx_authority, rx_host, token_arr, ip_rev, rx_stream, rx_sender);
+        let _ = rx_worker_loop(
+            rx_authority,
+            rx_host,
+            token_arr,
+            ip_rev,
+            rx_stream,
+            rx_sender,
+        );
     });
 
     thread::spawn(move || {
@@ -95,28 +126,41 @@ pub fn take_tunnel_packet_receiver() -> EcResult<mpsc::Receiver<Vec<u8>>> {
         .lock()
         .map_err(|_| EcError::Runtime("rx packet receiver mutex poisoned".to_string()))?;
     guard.take().ok_or_else(|| {
-        EcError::Runtime(
-            "tunnel packet receiver was already taken or not initialized".to_string(),
-        )
+        EcError::Runtime("tunnel packet receiver was already taken or not initialized".to_string())
     })
 }
 
-fn query_assigned_ip_once(authority: &str, host: &str, token_bytes: &[u8]) -> EcResult<[u8; 4]> {
+fn parse_protocol_token(token: &str) -> EcResult<[u8; PROTOCOL_TOKEN_LEN]> {
+    let token_bytes = token.as_bytes();
+    if token_bytes.len() != PROTOCOL_TOKEN_LEN {
+        return Err(EcError::Runtime(format!(
+            "invalid protocol token length: expected {PROTOCOL_TOKEN_LEN}, got {}",
+            token_bytes.len()
+        )));
+    }
+
+    token_bytes.try_into().map_err(|_| {
+        EcError::Runtime(format!(
+            "failed to convert protocol token into fixed {PROTOCOL_TOKEN_LEN}-byte array"
+        ))
+    })
+}
+
+fn query_assigned_ip_once(
+    authority: &str,
+    host: &str,
+    token_bytes: &[u8; PROTOCOL_TOKEN_LEN],
+) -> EcResult<[u8; 4]> {
     let mut stream = connect_vpn_tls(authority, host)?;
 
-    let mut message = Vec::with_capacity(64);
-    message.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
-    message.extend_from_slice(token_bytes);
-    message.extend_from_slice(&[
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
-    ]);
+    let message = build_query_ip_message(token_bytes);
     stream
         .write_all(&message)
         .map_err(|e| EcError::Runtime(format!("query-ip write failed: {e}")))?;
 
     let mut reply = [0u8; 0x80];
     let mut total = 0usize;
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + QUERY_IP_REPLY_TIMEOUT;
     while total < reply.len() && Instant::now() < deadline {
         match stream.read(&mut reply[total..]) {
             Ok(0) => break,
@@ -153,7 +197,7 @@ fn query_assigned_ip_once(authority: &str, host: &str, token_bytes: &[u8]) -> Ec
 fn rx_worker_loop(
     authority: String,
     host: String,
-    token: [u8; 48],
+    token: [u8; PROTOCOL_TOKEN_LEN],
     ip_rev: [u8; 4],
     mut stream: SslStream<TcpStream>,
     tx: mpsc::Sender<Vec<u8>>,
@@ -165,11 +209,14 @@ fn rx_worker_loop(
         match stream.read(&mut buf) {
             Ok(0) => {
                 retries += 1;
-                if retries > STREAM_RETRY_LIMIT {
-                    return Err(EcError::Runtime("rx stream reached retry limit".to_string()));
-                }
-                thread::sleep(STREAM_RETRY_DELAY);
-                stream = open_data_stream(&authority, &host, &token, &ip_rev, 0x06, 0x01)?;
+                stream = reopen_data_stream(
+                    &authority,
+                    &host,
+                    &token,
+                    &ip_rev,
+                    StreamProfile::Rx,
+                    retries,
+                )?;
             }
             Ok(n) => {
                 retries = 0;
@@ -177,14 +224,19 @@ fn rx_worker_loop(
                     return Ok(());
                 }
             }
-            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {}
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
+                thread::sleep(STREAM_IDLE_DELAY);
+            }
             Err(_) => {
                 retries += 1;
-                if retries > STREAM_RETRY_LIMIT {
-                    return Err(EcError::Runtime("rx stream reached retry limit".to_string()));
-                }
-                thread::sleep(STREAM_RETRY_DELAY);
-                stream = open_data_stream(&authority, &host, &token, &ip_rev, 0x06, 0x01)?;
+                stream = reopen_data_stream(
+                    &authority,
+                    &host,
+                    &token,
+                    &ip_rev,
+                    StreamProfile::Rx,
+                    retries,
+                )?;
             }
         }
     }
@@ -193,7 +245,7 @@ fn rx_worker_loop(
 fn tx_worker_loop(
     authority: String,
     host: String,
-    token: [u8; 48],
+    token: [u8; PROTOCOL_TOKEN_LEN],
     ip_rev: [u8; 4],
     mut stream: SslStream<TcpStream>,
     rx: mpsc::Receiver<Vec<u8>>,
@@ -211,46 +263,85 @@ fn tx_worker_loop(
         }
 
         retries += 1;
-        if retries > STREAM_RETRY_LIMIT {
-            return Err(EcError::Runtime("tx stream reached retry limit".to_string()));
-        }
-        thread::sleep(STREAM_RETRY_DELAY);
-        stream = open_data_stream(&authority, &host, &token, &ip_rev, 0x05, 0x02)?;
-        stream
-            .write_all(&packet)
-            .map_err(|e| EcError::Runtime(format!("tx stream write failed after reconnect: {e}")))?;
+        stream = reopen_data_stream(
+            &authority,
+            &host,
+            &token,
+            &ip_rev,
+            StreamProfile::Tx,
+            retries,
+        )?;
+        stream.write_all(&packet).map_err(|e| {
+            EcError::Runtime(format!("tx stream write failed after reconnect: {e}"))
+        })?;
     }
+}
+
+fn reopen_data_stream(
+    authority: &str,
+    host: &str,
+    token: &[u8; PROTOCOL_TOKEN_LEN],
+    ip_rev: &[u8; 4],
+    profile: StreamProfile,
+    retries: usize,
+) -> EcResult<SslStream<TcpStream>> {
+    if retries > STREAM_RETRY_LIMIT {
+        return Err(EcError::Runtime(format!(
+            "{} stream reached retry limit",
+            profile.label()
+        )));
+    }
+    thread::sleep(STREAM_RETRY_DELAY);
+    open_data_stream(authority, host, token, ip_rev, profile)
+}
+
+fn build_query_ip_message(token: &[u8; PROTOCOL_TOKEN_LEN]) -> [u8; 64] {
+    let mut message = [0u8; 64];
+    message[4..(4 + PROTOCOL_TOKEN_LEN)].copy_from_slice(token);
+    message[60..64].copy_from_slice(&[0xff, 0xff, 0xff, 0xff]);
+    message
+}
+
+fn build_stream_handshake_message(
+    op_code: u8,
+    token: &[u8; PROTOCOL_TOKEN_LEN],
+    ip_rev: &[u8; 4],
+) -> [u8; 64] {
+    let mut message = [0u8; 64];
+    message[0] = op_code;
+    message[4..(4 + PROTOCOL_TOKEN_LEN)].copy_from_slice(token);
+    message[60..64].copy_from_slice(ip_rev);
+    message
 }
 
 fn open_data_stream(
     authority: &str,
     host: &str,
-    token: &[u8; 48],
+    token: &[u8; PROTOCOL_TOKEN_LEN],
     ip_rev: &[u8; 4],
-    op_code: u8,
-    expected_reply: u8,
+    profile: StreamProfile,
 ) -> EcResult<SslStream<TcpStream>> {
     let mut stream = connect_vpn_tls(authority, host)?;
+    let op_code = profile.op_code();
+    let expected_reply = profile.expected_reply();
 
-    let mut message = Vec::with_capacity(64);
-    message.extend_from_slice(&[op_code, 0x00, 0x00, 0x00]);
-    message.extend_from_slice(token);
-    message.extend_from_slice(&[0x00; 8]);
-    message.extend_from_slice(ip_rev);
+    let message = build_stream_handshake_message(op_code, token, ip_rev);
     stream
         .write_all(&message)
         .map_err(|e| EcError::Runtime(format!("stream handshake write failed: {e}")))?;
 
     let mut reply = [0u8; 1500];
-    let n = read_stream_once(&mut stream, &mut reply, Duration::from_secs(10))?;
+    let n = read_stream_once(&mut stream, &mut reply, STREAM_HANDSHAKE_TIMEOUT)?;
     if n == 0 {
         return Err(EcError::Runtime(format!(
-            "stream handshake reply is empty or timed out (op=0x{op_code:02x})"
+            "{} stream handshake reply is empty or timed out (op=0x{op_code:02x})",
+            profile.label()
         )));
     }
     if reply[0] != expected_reply {
         return Err(EcError::Runtime(format!(
-            "unexpected stream handshake reply marker: expected 0x{expected_reply:02x}, got 0x{:02x} (op=0x{op_code:02x})",
+            "unexpected {} stream handshake reply marker: expected 0x{expected_reply:02x}, got 0x{:02x} (op=0x{op_code:02x})",
+            profile.label(),
             reply[0],
         )));
     }
@@ -431,67 +522,53 @@ unsafe fn ssl_session_set1_master_key(
     unsafe { SSL_SESSION_set1_master_key(session, key, len) }
 }
 
-fn parse_server(server: &str) -> EcResult<(String, String)> {
-    let trimmed = server.trim();
-    if trimmed.is_empty() {
-        return Err(EcError::InvalidConfig("server is required"));
-    }
-    let no_scheme = trimmed
-        .strip_prefix("https://")
-        .or_else(|| trimmed.strip_prefix("http://"))
-        .unwrap_or(trimmed);
-    let authority_raw = no_scheme
-        .split('/')
-        .next()
-        .ok_or_else(|| EcError::Runtime("invalid server address".to_string()))?;
-    if authority_raw.is_empty() {
-        return Err(EcError::Runtime("invalid server authority".to_string()));
-    }
-    let authority = if has_explicit_port(authority_raw) {
-        authority_raw.to_string()
-    } else {
-        format!("{authority_raw}:443")
-    };
-    let host = extract_host(&authority)?;
-    Ok((authority, host))
-}
-
-fn has_explicit_port(authority: &str) -> bool {
-    if authority.starts_with('[') {
-        authority.contains("]:")
-    } else {
-        authority.rsplit_once(':').is_some()
-    }
-}
-
-fn extract_host(authority: &str) -> EcResult<String> {
-    if authority.starts_with('[') {
-        let end = authority
-            .find(']')
-            .ok_or_else(|| EcError::Runtime("invalid ipv6 authority format".to_string()))?;
-        return Ok(authority[1..end].to_string());
-    }
-
-    if let Some((host, _)) = authority.rsplit_once(':') {
-        if host.is_empty() {
-            return Err(EcError::Runtime(
-                "invalid host in server authority".to_string(),
-            ));
-        }
-        return Ok(host.to_string());
-    }
-
-    Ok(authority.to_string())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::parse_server;
+    use super::{
+        PROTOCOL_TOKEN_LEN, build_query_ip_message, build_stream_handshake_message,
+        parse_protocol_token,
+    };
 
     #[test]
-    fn parse_server_appends_default_port() {
-        let (authority, host) = parse_server("vpn.example.com").unwrap();
-        assert_eq!(authority, "vpn.example.com:443");
-        assert_eq!(host, "vpn.example.com");
+    fn parse_protocol_token_accepts_48_bytes() {
+        let token = "a".repeat(PROTOCOL_TOKEN_LEN);
+        let parsed = parse_protocol_token(&token).unwrap();
+        assert_eq!(parsed.len(), PROTOCOL_TOKEN_LEN);
+        assert_eq!(parsed[0], b'a');
+    }
+
+    #[test]
+    fn parse_protocol_token_rejects_other_lengths() {
+        let token = "a".repeat(PROTOCOL_TOKEN_LEN - 1);
+        assert!(parse_protocol_token(&token).is_err());
+    }
+
+    #[test]
+    fn query_ip_message_has_expected_layout() {
+        let token = [0x11u8; PROTOCOL_TOKEN_LEN];
+        let message = build_query_ip_message(&token);
+        assert_eq!(message.len(), 64);
+        assert_eq!(message[0], 0x00);
+        assert!(
+            message[4..(4 + PROTOCOL_TOKEN_LEN)]
+                .iter()
+                .all(|v| *v == 0x11)
+        );
+        assert_eq!(&message[60..64], &[0xff, 0xff, 0xff, 0xff]);
+    }
+
+    #[test]
+    fn stream_message_has_expected_layout() {
+        let token = [0x22u8; PROTOCOL_TOKEN_LEN];
+        let ip_rev = [4u8, 3, 2, 1];
+        let message = build_stream_handshake_message(0x06, &token, &ip_rev);
+        assert_eq!(message.len(), 64);
+        assert_eq!(message[0], 0x06);
+        assert!(
+            message[4..(4 + PROTOCOL_TOKEN_LEN)]
+                .iter()
+                .all(|v| *v == 0x22)
+        );
+        assert_eq!(&message[60..64], &ip_rev);
     }
 }
