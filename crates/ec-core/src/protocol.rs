@@ -15,6 +15,7 @@ const STREAM_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 static TX_PACKET_SENDER: OnceLock<mpsc::Sender<Vec<u8>>> = OnceLock::new();
 static QUERY_KEEPALIVE: OnceLock<Mutex<Option<SslStream<TcpStream>>>> = OnceLock::new();
+static RX_PACKET_RECEIVER: OnceLock<Mutex<Option<mpsc::Receiver<Vec<u8>>>>> = OnceLock::new();
 
 pub fn query_assigned_ip(server: &str, token: &str) -> EcResult<[u8; 4]> {
     let (authority, host) = parse_server(server)?;
@@ -47,14 +48,27 @@ pub fn start_tunnel_runtime(server: &str, token: &str, assigned_ip: [u8; 4]) -> 
     let tx_stream = open_data_stream(&authority, &host, &token_arr, &ip_rev, 0x05, 0x02)?;
 
     let (tx_sender, tx_receiver) = mpsc::channel::<Vec<u8>>();
+    let (rx_sender, rx_receiver) = mpsc::channel::<Vec<u8>>();
     TX_PACKET_SENDER.set(tx_sender).map_err(|_| {
         EcError::Runtime("tunnel runtime already started in this process".to_string())
     })?;
+    let rx_holder = RX_PACKET_RECEIVER.get_or_init(|| Mutex::new(None));
+    {
+        let mut guard = rx_holder
+            .lock()
+            .map_err(|_| EcError::Runtime("rx packet receiver mutex poisoned".to_string()))?;
+        if guard.is_some() {
+            return Err(EcError::Runtime(
+                "tunnel runtime already started in this process".to_string(),
+            ));
+        }
+        *guard = Some(rx_receiver);
+    }
 
     let rx_authority = authority.clone();
     let rx_host = host.clone();
     thread::spawn(move || {
-        let _ = rx_worker_loop(rx_authority, rx_host, token_arr, ip_rev, rx_stream);
+        let _ = rx_worker_loop(rx_authority, rx_host, token_arr, ip_rev, rx_stream, rx_sender);
     });
 
     thread::spawn(move || {
@@ -62,6 +76,29 @@ pub fn start_tunnel_runtime(server: &str, token: &str, assigned_ip: [u8; 4]) -> 
     });
 
     Ok(())
+}
+
+pub fn send_tunnel_packet(packet: Vec<u8>) -> EcResult<()> {
+    let sender = TX_PACKET_SENDER
+        .get()
+        .ok_or_else(|| EcError::Runtime("tunnel runtime is not started".to_string()))?;
+    sender
+        .send(packet)
+        .map_err(|e| EcError::Runtime(format!("send tunnel packet failed: {e}")))
+}
+
+pub fn take_tunnel_packet_receiver() -> EcResult<mpsc::Receiver<Vec<u8>>> {
+    let holder = RX_PACKET_RECEIVER
+        .get()
+        .ok_or_else(|| EcError::Runtime("tunnel runtime is not started".to_string()))?;
+    let mut guard = holder
+        .lock()
+        .map_err(|_| EcError::Runtime("rx packet receiver mutex poisoned".to_string()))?;
+    guard.take().ok_or_else(|| {
+        EcError::Runtime(
+            "tunnel packet receiver was already taken or not initialized".to_string(),
+        )
+    })
 }
 
 fn query_assigned_ip_once(authority: &str, host: &str, token_bytes: &[u8]) -> EcResult<[u8; 4]> {
@@ -119,6 +156,7 @@ fn rx_worker_loop(
     token: [u8; 48],
     ip_rev: [u8; 4],
     mut stream: SslStream<TcpStream>,
+    tx: mpsc::Sender<Vec<u8>>,
 ) -> EcResult<()> {
     let mut retries = 0usize;
     let mut buf = [0u8; 4096];
@@ -133,8 +171,11 @@ fn rx_worker_loop(
                 thread::sleep(STREAM_RETRY_DELAY);
                 stream = open_data_stream(&authority, &host, &token, &ip_rev, 0x06, 0x01)?;
             }
-            Ok(_) => {
+            Ok(n) => {
                 retries = 0;
+                if tx.send(buf[..n].to_vec()).is_err() {
+                    return Ok(());
+                }
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {}
             Err(_) => {

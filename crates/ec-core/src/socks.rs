@@ -7,6 +7,7 @@ pub fn serve(bind_addr: &str) -> EcResult<()> {
     let normalized = normalize_bind_addr(bind_addr);
     let listener = TcpListener::bind(&normalized)
         .map_err(|e| EcError::Runtime(format!("socks bind failed on {bind_addr}: {e}")))?;
+    eprintln!("[SOCKS] listening on {normalized}");
 
     loop {
         let (stream, _peer) = match listener.accept() {
@@ -30,10 +31,11 @@ fn normalize_bind_addr(bind_addr: &str) -> String {
 fn handle_client(mut client: TcpStream) -> EcResult<()> {
     negotiate_method(&mut client)?;
     let target = read_connect_request(&mut client)?;
-    let remote = TcpStream::connect(&target)
-        .map_err(|e| EcError::Runtime(format!("connect target failed: {target}: {e}")))?;
+    eprintln!("[SOCKS] connect request target={target}");
+    let conn = crate::netstack::open_tcp_connection(&target)?;
+    eprintln!("[SOCKS] connected target={target} via tunnel");
     write_reply(&mut client, 0x00)?;
-    relay(client, remote)
+    relay(client, conn)
 }
 
 fn negotiate_method(client: &mut TcpStream) -> EcResult<()> {
@@ -136,21 +138,42 @@ fn write_reply(client: &mut TcpStream, rep: u8) -> EcResult<()> {
         .map_err(|e| EcError::Runtime(format!("socks reply write failed: {e}")))
 }
 
-fn relay(mut client: TcpStream, remote: TcpStream) -> EcResult<()> {
+fn relay(mut client: TcpStream, conn: crate::netstack::TunnelTcpConnection) -> EcResult<()> {
+    let sender = conn.sender();
+    let rx = conn.into_receiver();
     let mut c_to_r_src = client
         .try_clone()
         .map_err(|e| EcError::Runtime(format!("clone client stream failed: {e}")))?;
-    let mut c_to_r_dst = remote
-        .try_clone()
-        .map_err(|e| EcError::Runtime(format!("clone remote stream failed: {e}")))?;
-    let mut r_to_c_src = remote;
 
     let t1 = thread::spawn(move || {
-        let _ = std::io::copy(&mut c_to_r_src, &mut c_to_r_dst);
-        let _ = c_to_r_dst.shutdown(Shutdown::Write);
+        let mut buf = [0u8; 4096];
+        loop {
+            match c_to_r_src.read(&mut buf) {
+                Ok(0) => {
+                    let _ = sender.close();
+                    break;
+                }
+                Ok(n) => {
+                    if sender.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    let _ = sender.close();
+                    break;
+                }
+            }
+        }
     });
     let t2 = thread::spawn(move || {
-        let _ = std::io::copy(&mut r_to_c_src, &mut client);
+        while let Ok(chunk) = rx.recv() {
+            if chunk.is_empty() {
+                continue;
+            }
+            if client.write_all(&chunk).is_err() {
+                break;
+            }
+        }
         let _ = client.shutdown(Shutdown::Write);
     });
 
