@@ -1,6 +1,5 @@
 use crate::config::AppConfig;
 use crate::error::{EcError, EcResult};
-use regex::Regex;
 use reqwest::blocking::Client;
 use reqwest::header::{CONTENT_TYPE, COOKIE};
 use rsa::rand_core::OsRng;
@@ -20,11 +19,8 @@ pub fn login(config: &AppConfig) -> EcResult<String> {
         .text()
         .map_err(|e| EcError::Runtime(format!("login_auth body read failed: {e}")))?;
 
-    let mut twf_id = extract_tag(&login_auth_body, "TwfID")
-        .ok_or_else(|| EcError::Runtime("missing <TwfID> in login_auth response".to_string()))?;
-    let rsa_key = extract_tag(&login_auth_body, "RSA_ENCRYPT_KEY").ok_or_else(|| {
-        EcError::Runtime("missing <RSA_ENCRYPT_KEY> in login_auth response".to_string())
-    })?;
+    let mut twf_id = require_tag(&login_auth_body, "TwfID", "login_auth")?;
+    let rsa_key = require_tag(&login_auth_body, "RSA_ENCRYPT_KEY", "login_auth")?;
     let rsa_exp =
         extract_tag(&login_auth_body, "RSA_ENCRYPT_EXP").unwrap_or_else(|| "65537".to_string());
     let csrf = extract_tag(&login_auth_body, "CSRF_RAND_CODE").unwrap_or_default();
@@ -98,12 +94,18 @@ fn normalize_base_url(server: &str) -> String {
 }
 
 fn extract_tag(body: &str, tag: &str) -> Option<String> {
-    let pattern = format!(r"<{tag}>([^<]*)</{tag}>");
-    let regex = Regex::new(&pattern).ok()?;
-    regex
-        .captures(body)
-        .and_then(|caps| caps.get(1))
-        .map(|m| m.as_str().to_string())
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = body.find(&open)?;
+    let content_start = start + open.len();
+    let rest = &body[content_start..];
+    let end_rel = rest.find(&close)?;
+    Some(rest[..end_rel].to_string())
+}
+
+fn require_tag(body: &str, tag: &str, stage: &str) -> EcResult<String> {
+    extract_tag(body, tag)
+        .ok_or_else(|| EcError::Runtime(format!("missing <{tag}> in {stage} response")))
 }
 
 fn encrypt_password_hex(password: &str, rsa_key_hex: &str, rsa_exp: &str) -> EcResult<String> {
