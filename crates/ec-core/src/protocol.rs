@@ -1,12 +1,20 @@
 use crate::error::{EcError, EcResult};
 use foreign_types::ForeignType;
 use openssl::error::ErrorStack;
-use openssl::ssl::{Ssl, SslConnector, SslMethod, SslOptions, SslVerifyMode};
+use openssl::ssl::{Ssl, SslConnector, SslMethod, SslOptions, SslStream, SslVerifyMode};
 use openssl_sys as ffi;
 use std::ffi::c_uint;
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
+use std::sync::{Mutex, OnceLock, mpsc};
+use std::thread;
 use std::time::{Duration, Instant};
+
+const STREAM_RETRY_LIMIT: usize = 5;
+const STREAM_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+static TX_PACKET_SENDER: OnceLock<mpsc::Sender<Vec<u8>>> = OnceLock::new();
+static QUERY_KEEPALIVE: OnceLock<Mutex<Option<SslStream<TcpStream>>>> = OnceLock::new();
 
 pub fn query_assigned_ip(server: &str, token: &str) -> EcResult<[u8; 4]> {
     let (authority, host) = parse_server(server)?;
@@ -21,41 +29,43 @@ pub fn query_assigned_ip(server: &str, token: &str) -> EcResult<[u8; 4]> {
     query_assigned_ip_once(&authority, &host, token_bytes)
 }
 
-pub fn start_tunnel_runtime(_server: &str, _token: &str, _assigned_ip: [u8; 4]) -> EcResult<()> {
-    Err(EcError::NotImplemented("protocol.start_tunnel_runtime"))
+pub fn start_tunnel_runtime(server: &str, token: &str, assigned_ip: [u8; 4]) -> EcResult<()> {
+    let (authority, host) = parse_server(server)?;
+    let token_bytes = token.as_bytes();
+    if token_bytes.len() != 48 {
+        return Err(EcError::Runtime(format!(
+            "invalid protocol token length: expected 48, got {}",
+            token_bytes.len()
+        )));
+    }
+    let token_arr: [u8; 48] = token_bytes.try_into().map_err(|_| {
+        EcError::Runtime("failed to convert protocol token into fixed 48-byte array".to_string())
+    })?;
+    let ip_rev = [assigned_ip[3], assigned_ip[2], assigned_ip[1], assigned_ip[0]];
+
+    let rx_stream = open_data_stream(&authority, &host, &token_arr, &ip_rev, 0x06, 0x01)?;
+    let tx_stream = open_data_stream(&authority, &host, &token_arr, &ip_rev, 0x05, 0x02)?;
+
+    let (tx_sender, tx_receiver) = mpsc::channel::<Vec<u8>>();
+    TX_PACKET_SENDER.set(tx_sender).map_err(|_| {
+        EcError::Runtime("tunnel runtime already started in this process".to_string())
+    })?;
+
+    let rx_authority = authority.clone();
+    let rx_host = host.clone();
+    thread::spawn(move || {
+        let _ = rx_worker_loop(rx_authority, rx_host, token_arr, ip_rev, rx_stream);
+    });
+
+    thread::spawn(move || {
+        let _ = tx_worker_loop(authority, host, token_arr, ip_rev, tx_stream, tx_receiver);
+    });
+
+    Ok(())
 }
 
 fn query_assigned_ip_once(authority: &str, host: &str, token_bytes: &[u8]) -> EcResult<[u8; 4]> {
-    let tcp = TcpStream::connect(authority)
-        .map_err(|e| EcError::Runtime(format!("vpn tcp connect failed: {e}")))?;
-    tcp.set_read_timeout(Some(Duration::from_secs(5)))
-        .map_err(|e| EcError::Runtime(format!("set read timeout failed: {e}")))?;
-    tcp.set_write_timeout(Some(Duration::from_secs(5)))
-        .map_err(|e| EcError::Runtime(format!("set write timeout failed: {e}")))?;
-
-    let mut builder = SslConnector::builder(SslMethod::tls_client())
-        .map_err(|e| EcError::Runtime(format!("vpn tls builder create failed: {e}")))?;
-    builder.set_verify(SslVerifyMode::NONE);
-    builder.set_options(SslOptions::NO_TICKET);
-    builder.set_security_level(0);
-    builder
-        .set_cipher_list("RC4-SHA:AES128-SHA:AES256-SHA")
-        .map_err(|e| EcError::Runtime(format!("set cipher list failed: {e}")))?;
-
-    let connector = builder.build();
-    let mut config = connector
-        .configure()
-        .map_err(|e| EcError::Runtime(format!("vpn tls configure failed: {e}")))?;
-    config.set_use_server_name_indication(false);
-    config.set_verify_hostname(false);
-    let mut ssl = config
-        .into_ssl(host)
-        .map_err(|e| EcError::Runtime(format!("vpn tls prepare failed: {e}")))?;
-    apply_l3ip_session_id(&mut ssl, 0x0303)?;
-
-    let mut stream = ssl
-        .connect(tcp)
-        .map_err(|e| EcError::Runtime(format!("vpn tls handshake failed: {e}")))?;
+    let mut stream = connect_vpn_tls(authority, host)?;
 
     let mut message = Vec::with_capacity(64);
     message.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
@@ -98,7 +108,175 @@ fn query_assigned_ip_once(authority: &str, host: &str, token_bytes: &[u8]) -> Ec
         )));
     }
 
-    Ok([reply[4], reply[5], reply[6], reply[7]])
+    let assigned_ip = [reply[4], reply[5], reply[6], reply[7]];
+    keep_query_stream_alive(stream)?;
+    Ok(assigned_ip)
+}
+
+fn rx_worker_loop(
+    authority: String,
+    host: String,
+    token: [u8; 48],
+    ip_rev: [u8; 4],
+    mut stream: SslStream<TcpStream>,
+) -> EcResult<()> {
+    let mut retries = 0usize;
+    let mut buf = [0u8; 4096];
+
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => {
+                retries += 1;
+                if retries > STREAM_RETRY_LIMIT {
+                    return Err(EcError::Runtime("rx stream reached retry limit".to_string()));
+                }
+                thread::sleep(STREAM_RETRY_DELAY);
+                stream = open_data_stream(&authority, &host, &token, &ip_rev, 0x06, 0x01)?;
+            }
+            Ok(_) => {
+                retries = 0;
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {}
+            Err(_) => {
+                retries += 1;
+                if retries > STREAM_RETRY_LIMIT {
+                    return Err(EcError::Runtime("rx stream reached retry limit".to_string()));
+                }
+                thread::sleep(STREAM_RETRY_DELAY);
+                stream = open_data_stream(&authority, &host, &token, &ip_rev, 0x06, 0x01)?;
+            }
+        }
+    }
+}
+
+fn tx_worker_loop(
+    authority: String,
+    host: String,
+    token: [u8; 48],
+    ip_rev: [u8; 4],
+    mut stream: SslStream<TcpStream>,
+    rx: mpsc::Receiver<Vec<u8>>,
+) -> EcResult<()> {
+    let mut retries = 0usize;
+    loop {
+        let packet = match rx.recv() {
+            Ok(packet) => packet,
+            Err(_) => return Ok(()),
+        };
+
+        if stream.write_all(&packet).is_ok() {
+            retries = 0;
+            continue;
+        }
+
+        retries += 1;
+        if retries > STREAM_RETRY_LIMIT {
+            return Err(EcError::Runtime("tx stream reached retry limit".to_string()));
+        }
+        thread::sleep(STREAM_RETRY_DELAY);
+        stream = open_data_stream(&authority, &host, &token, &ip_rev, 0x05, 0x02)?;
+        stream
+            .write_all(&packet)
+            .map_err(|e| EcError::Runtime(format!("tx stream write failed after reconnect: {e}")))?;
+    }
+}
+
+fn open_data_stream(
+    authority: &str,
+    host: &str,
+    token: &[u8; 48],
+    ip_rev: &[u8; 4],
+    op_code: u8,
+    expected_reply: u8,
+) -> EcResult<SslStream<TcpStream>> {
+    let mut stream = connect_vpn_tls(authority, host)?;
+
+    let mut message = Vec::with_capacity(64);
+    message.extend_from_slice(&[op_code, 0x00, 0x00, 0x00]);
+    message.extend_from_slice(token);
+    message.extend_from_slice(&[0x00; 8]);
+    message.extend_from_slice(ip_rev);
+    stream
+        .write_all(&message)
+        .map_err(|e| EcError::Runtime(format!("stream handshake write failed: {e}")))?;
+
+    let mut reply = [0u8; 1500];
+    let n = read_stream_once(&mut stream, &mut reply, Duration::from_secs(10))?;
+    if n == 0 {
+        return Err(EcError::Runtime(format!(
+            "stream handshake reply is empty or timed out (op=0x{op_code:02x})"
+        )));
+    }
+    if reply[0] != expected_reply {
+        return Err(EcError::Runtime(format!(
+            "unexpected stream handshake reply marker: expected 0x{expected_reply:02x}, got 0x{:02x} (op=0x{op_code:02x})",
+            reply[0],
+        )));
+    }
+
+    Ok(stream)
+}
+
+fn connect_vpn_tls(authority: &str, host: &str) -> EcResult<SslStream<TcpStream>> {
+    let tcp = TcpStream::connect(authority)
+        .map_err(|e| EcError::Runtime(format!("vpn tcp connect failed: {e}")))?;
+    tcp.set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|e| EcError::Runtime(format!("set read timeout failed: {e}")))?;
+    tcp.set_write_timeout(Some(Duration::from_secs(5)))
+        .map_err(|e| EcError::Runtime(format!("set write timeout failed: {e}")))?;
+
+    let mut builder = SslConnector::builder(SslMethod::tls_client())
+        .map_err(|e| EcError::Runtime(format!("vpn tls builder create failed: {e}")))?;
+    builder.set_verify(SslVerifyMode::NONE);
+    builder.set_options(SslOptions::NO_TICKET);
+    builder.set_security_level(0);
+    builder
+        .set_cipher_list("RC4-SHA:AES128-SHA:AES256-SHA")
+        .map_err(|e| EcError::Runtime(format!("set cipher list failed: {e}")))?;
+
+    let connector = builder.build();
+    let mut config = connector
+        .configure()
+        .map_err(|e| EcError::Runtime(format!("vpn tls configure failed: {e}")))?;
+    config.set_use_server_name_indication(false);
+    config.set_verify_hostname(false);
+    let mut ssl = config
+        .into_ssl(host)
+        .map_err(|e| EcError::Runtime(format!("vpn tls prepare failed: {e}")))?;
+    apply_l3ip_session_id(&mut ssl, 0x0303)?;
+
+    ssl.connect(tcp)
+        .map_err(|e| EcError::Runtime(format!("vpn tls handshake failed: {e}")))
+}
+
+fn keep_query_stream_alive(stream: SslStream<TcpStream>) -> EcResult<()> {
+    let holder = QUERY_KEEPALIVE.get_or_init(|| Mutex::new(None));
+    let mut guard = holder
+        .lock()
+        .map_err(|_| EcError::Runtime("query keepalive mutex poisoned".to_string()))?;
+    *guard = Some(stream);
+    Ok(())
+}
+
+fn read_stream_once<S: Read + Write>(
+    stream: &mut SslStream<S>,
+    buf: &mut [u8],
+    timeout: Duration,
+) -> EcResult<usize> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if Instant::now() >= deadline {
+            return Ok(0);
+        }
+        match stream.read(buf) {
+            Ok(0) => return Ok(0),
+            Ok(n) => return Ok(n),
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
+                continue;
+            }
+            Err(e) => return Err(EcError::Runtime(format!("stream read failed: {e}"))),
+        }
+    }
 }
 
 fn apply_l3ip_session_id(ssl: &mut Ssl, session_version: i32) -> EcResult<()> {
