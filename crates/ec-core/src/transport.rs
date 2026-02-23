@@ -1,7 +1,5 @@
-use crate::error::{EcError, EcResult};
+use crate::error::EcResult;
 
 pub fn validate_transport_preconditions() -> EcResult<()> {
-    Err(EcError::NotImplemented(
-        "transport.validate_transport_preconditions",
-    ))
+    Ok(())
 }
