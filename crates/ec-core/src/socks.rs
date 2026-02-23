@@ -3,6 +3,8 @@ use std::io::{Read, Write};
 use std::net::{Ipv6Addr, Shutdown, TcpListener, TcpStream};
 use std::thread;
 
+const RELAY_BUFFER_SIZE: usize = 4096;
+
 pub fn serve(bind_addr: &str) -> EcResult<()> {
     let normalized = normalize_bind_addr(bind_addr);
     let listener = TcpListener::bind(&normalized)
@@ -10,12 +12,14 @@ pub fn serve(bind_addr: &str) -> EcResult<()> {
     eprintln!("[SOCKS] listening on {normalized}");
 
     loop {
-        let (stream, _peer) = match listener.accept() {
+        let (stream, peer) = match listener.accept() {
             Ok(v) => v,
             Err(_) => continue,
         };
         thread::spawn(move || {
-            let _ = handle_client(stream);
+            if let Err(err) = handle_client(stream) {
+                eprintln!("[SOCKS] client {peer} error: {err}");
+            }
         });
     }
 }
@@ -149,7 +153,7 @@ fn relay(mut client: TcpStream, conn: crate::netstack::TunnelTcpConnection) -> E
         .map_err(|e| EcError::Runtime(format!("clone client stream failed: {e}")))?;
 
     let t1 = thread::spawn(move || {
-        let mut buf = [0u8; 4096];
+        let mut buf = [0u8; RELAY_BUFFER_SIZE];
         loop {
             match c_to_r_src.read(&mut buf) {
                 Ok(0) => {

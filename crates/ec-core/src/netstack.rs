@@ -9,12 +9,14 @@ use std::net::{SocketAddr, SocketAddrV4, ToSocketAddrs};
 use std::sync::OnceLock;
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static CONTROL_TX: OnceLock<mpsc::Sender<ControlMessage>> = OnceLock::new();
 const OPEN_CONN_TIMEOUT: Duration = Duration::from_secs(10);
 const SOCKET_BUFFER_CAPACITY: usize = 64 * 1024;
 const NETSTACK_TICK: Duration = Duration::from_millis(2);
+const MAX_TUNNEL_RX_BATCH: usize = 256;
+const MAX_CONTROL_BATCH: usize = 64;
 
 pub fn validate_netstack_preconditions() -> EcResult<()> {
     Ok(())
@@ -63,7 +65,7 @@ pub fn open_tcp_connection(target: &str) -> EcResult<TunnelTcpConnection> {
         }),
         Ok(Err(e)) => Err(e),
         Err(e) => Err(EcError::Runtime(format!(
-            "wait open connection response failed: {e}"
+            "wait open connection response failed for {target}: {e}"
         ))),
     }
 }
@@ -136,7 +138,7 @@ fn run_netstack_loop(
 ) -> EcResult<()> {
     let mut device = TunnelDevice::new();
     let mut cfg = Config::new(HardwareAddress::Ip);
-    cfg.random_seed = Instant::now().elapsed().as_nanos() as u64;
+    cfg.random_seed = netstack_random_seed();
     let mut iface = Interface::new(cfg, &mut device, smol_now(Instant::now()));
     let client_ip = Ipv4Address::new(
         assigned_ip[0],
@@ -155,11 +157,17 @@ fn run_netstack_loop(
     let start = Instant::now();
 
     loop {
-        while let Ok(packet) = tunnel_rx.try_recv() {
+        for _ in 0..MAX_TUNNEL_RX_BATCH {
+            let Ok(packet) = tunnel_rx.try_recv() else {
+                break;
+            };
             device.push_rx(packet);
         }
 
-        while let Ok(msg) = control_rx.try_recv() {
+        for _ in 0..MAX_CONTROL_BATCH {
+            let Ok(msg) = control_rx.try_recv() else {
+                break;
+            };
             handle_control_message(
                 msg,
                 &mut iface,
@@ -333,6 +341,13 @@ fn alloc_local_port(next: &mut u16) -> u16 {
     port
 }
 
+fn netstack_random_seed() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x6e6574737461636b)
+}
+
 fn smol_now(start: Instant) -> SmolInstant {
     SmolInstant::from_millis(start.elapsed().as_millis() as i64)
 }
@@ -410,5 +425,24 @@ impl Device for TunnelDevice {
         caps.medium = Medium::Ip;
         caps.max_transmission_unit = 1500;
         caps
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{alloc_local_port, netstack_random_seed};
+
+    #[test]
+    fn alloc_local_port_wraps_after_60000() {
+        let mut next = 60000;
+        let p1 = alloc_local_port(&mut next);
+        let p2 = alloc_local_port(&mut next);
+        assert_eq!(p1, 60000);
+        assert_eq!(p2, 40000);
+    }
+
+    #[test]
+    fn random_seed_is_non_zero() {
+        assert_ne!(netstack_random_seed(), 0);
     }
 }

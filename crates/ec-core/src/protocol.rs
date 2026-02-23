@@ -17,6 +17,7 @@ const STREAM_IDLE_DELAY: Duration = Duration::from_millis(5);
 const QUERY_IP_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 const STREAM_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const PROTOCOL_TOKEN_LEN: usize = 48;
+const RUNTIME_ALREADY_STARTED: &str = "tunnel runtime already started in this process";
 
 #[derive(Clone, Copy)]
 enum StreamProfile {
@@ -73,39 +74,58 @@ pub fn start_tunnel_runtime(server: &str, token: &str, assigned_ip: [u8; 4]) -> 
 
     let (tx_sender, tx_receiver) = mpsc::channel::<Vec<u8>>();
     let (rx_sender, rx_receiver) = mpsc::channel::<Vec<u8>>();
-    TX_PACKET_SENDER.set(tx_sender).map_err(|_| {
-        EcError::Runtime("tunnel runtime already started in this process".to_string())
-    })?;
-    let rx_holder = RX_PACKET_RECEIVER.get_or_init(|| Mutex::new(None));
-    {
-        let mut guard = rx_holder
-            .lock()
-            .map_err(|_| EcError::Runtime("rx packet receiver mutex poisoned".to_string()))?;
-        if guard.is_some() {
-            return Err(EcError::Runtime(
-                "tunnel runtime already started in this process".to_string(),
-            ));
-        }
-        *guard = Some(rx_receiver);
-    }
+    install_runtime_channels(tx_sender, rx_receiver)?;
 
     let rx_authority = authority.clone();
     let rx_host = host.clone();
     thread::spawn(move || {
-        let _ = rx_worker_loop(
+        if let Err(err) = rx_worker_loop(
             rx_authority,
             rx_host,
             token_arr,
             ip_rev,
             rx_stream,
             rx_sender,
-        );
+        ) {
+            eprintln!("[PROTOCOL] rx worker stopped: {err}");
+        }
     });
 
     thread::spawn(move || {
-        let _ = tx_worker_loop(authority, host, token_arr, ip_rev, tx_stream, tx_receiver);
+        if let Err(err) = tx_worker_loop(authority, host, token_arr, ip_rev, tx_stream, tx_receiver)
+        {
+            eprintln!("[PROTOCOL] tx worker stopped: {err}");
+        }
     });
 
+    Ok(())
+}
+
+fn install_runtime_channels(
+    tx_sender: mpsc::Sender<Vec<u8>>,
+    rx_receiver: mpsc::Receiver<Vec<u8>>,
+) -> EcResult<()> {
+    let rx_holder = RX_PACKET_RECEIVER.get_or_init(|| Mutex::new(None));
+    {
+        let guard = rx_holder
+            .lock()
+            .map_err(|_| EcError::Runtime("rx packet receiver mutex poisoned".to_string()))?;
+        if guard.is_some() {
+            return Err(EcError::Runtime(RUNTIME_ALREADY_STARTED.to_string()));
+        }
+    }
+
+    TX_PACKET_SENDER
+        .set(tx_sender)
+        .map_err(|_| EcError::Runtime(RUNTIME_ALREADY_STARTED.to_string()))?;
+
+    let mut guard = rx_holder
+        .lock()
+        .map_err(|_| EcError::Runtime("rx packet receiver mutex poisoned".to_string()))?;
+    if guard.is_some() {
+        return Err(EcError::Runtime(RUNTIME_ALREADY_STARTED.to_string()));
+    }
+    *guard = Some(rx_receiver);
     Ok(())
 }
 
