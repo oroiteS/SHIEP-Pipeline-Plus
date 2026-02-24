@@ -15,6 +15,19 @@ impl EasyConnectApp {
         crate::netstack::validate_netstack_preconditions()?;
 
         let twf_id = crate::auth::login(&self.config)?;
+        eprintln!("[APP][DEBUG] TWFID={twf_id}");
+        match crate::route_table::fetch_route_table(&self.config.server, &twf_id) {
+            Ok(table) => {
+                let install = crate::routing::install_route_table(table)?;
+                eprintln!(
+                    "[APP][DEBUG] route matcher installed: rules={} dns_records={}",
+                    install.rule_count, install.dns_record_count
+                );
+            }
+            Err(err) => {
+                eprintln!("[APP][DEBUG] rclist fetch/parse failed: {err}");
+            }
+        }
         let agent_token = crate::token::fetch_agent_token(&self.config.server, &twf_id)?;
         let token = format!("{agent_token}{twf_id}");
         let assigned_ip = crate::protocol::query_assigned_ip(&self.config.server, &token)?;
