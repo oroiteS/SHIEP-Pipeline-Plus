@@ -35,12 +35,50 @@ fn normalize_bind_addr(bind_addr: &str) -> String {
 fn handle_client(mut client: TcpStream) -> EcResult<()> {
     negotiate_method(&mut client)?;
     let target = read_connect_request(&mut client)?;
-    let target_addr = target.to_socket_target();
     eprintln!("[SOCKS] connect request target={target}");
-    let conn = crate::netstack::open_tcp_connection(&target_addr)?;
-    eprintln!("[SOCKS] connected target={target_addr} via tunnel");
-    write_reply(&mut client, 0x00)?;
-    relay(client, conn)
+
+    let route = match crate::routing::plan_target(target.host(), target.port()) {
+        Ok(crate::routing::RoutePlan::Remote {
+            dial,
+            rc_id,
+            rc_name,
+            source,
+        }) => {
+            eprintln!(
+                "[SOCKS] route remote rc_id={rc_id} name={rc_name} source={source} dial={dial}"
+            );
+            RouteTransport::Tunnel(dial)
+        }
+        Ok(crate::routing::RoutePlan::Fallback { target, reason }) => {
+            let dial = target_addr(&target);
+            eprintln!(
+                "[SOCKS] route fallback reason={reason} target={target} dial={dial} (direct)"
+            );
+            RouteTransport::Direct(dial)
+        }
+        Err(err) => {
+            let legacy = target.to_socket_target();
+            eprintln!("[SOCKS] route planner unavailable: {err}; use legacy target={legacy}");
+            RouteTransport::Tunnel(legacy)
+        }
+    };
+
+    match route {
+        RouteTransport::Tunnel(dial_target) => {
+            let conn = crate::netstack::open_tcp_connection(&dial_target)?;
+            eprintln!("[SOCKS] connected target={dial_target} via tunnel");
+            write_reply(&mut client, 0x00)?;
+            relay_tunnel(client, conn)
+        }
+        RouteTransport::Direct(dial_target) => {
+            let conn = TcpStream::connect(&dial_target).map_err(|e| {
+                EcError::Runtime(format!("direct tcp connect failed for {dial_target}: {e}"))
+            })?;
+            eprintln!("[SOCKS] connected target={dial_target} via direct");
+            write_reply(&mut client, 0x00)?;
+            relay_direct(client, conn)
+        }
+    }
 }
 
 fn negotiate_method(client: &mut TcpStream) -> EcResult<()> {
@@ -145,7 +183,7 @@ fn write_reply(client: &mut TcpStream, rep: u8) -> EcResult<()> {
         .map_err(|e| EcError::Runtime(format!("socks reply write failed: {e}")))
 }
 
-fn relay(mut client: TcpStream, conn: crate::netstack::TunnelTcpConnection) -> EcResult<()> {
+fn relay_tunnel(mut client: TcpStream, conn: crate::netstack::TunnelTcpConnection) -> EcResult<()> {
     let sender = conn.sender();
     let rx = conn.into_receiver();
     let mut c_to_r_src = client
@@ -189,14 +227,79 @@ fn relay(mut client: TcpStream, conn: crate::netstack::TunnelTcpConnection) -> E
     Ok(())
 }
 
+fn relay_direct(client: TcpStream, upstream: TcpStream) -> EcResult<()> {
+    let client_reader = client
+        .try_clone()
+        .map_err(|e| EcError::Runtime(format!("clone client stream failed: {e}")))?;
+    let upstream_reader = upstream
+        .try_clone()
+        .map_err(|e| EcError::Runtime(format!("clone upstream stream failed: {e}")))?;
+
+    let t1 = thread::spawn(move || {
+        pump_stream(client_reader, upstream);
+    });
+    let t2 = thread::spawn(move || {
+        pump_stream(upstream_reader, client);
+    });
+
+    let _ = t1.join();
+    let _ = t2.join();
+    Ok(())
+}
+
+fn pump_stream(mut src: TcpStream, mut dst: TcpStream) {
+    let mut buf = [0u8; RELAY_BUFFER_SIZE];
+    loop {
+        match src.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if dst.write_all(&buf[..n]).is_err() {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let _ = dst.shutdown(Shutdown::Write);
+}
+
+enum RouteTransport {
+    Tunnel(String),
+    Direct(String),
+}
+
+fn target_addr(target: &str) -> String {
+    if let Some((host, port)) = target.rsplit_once(':') {
+        return format_socket_target(host, port);
+    }
+    target.to_string()
+}
+
+fn format_socket_target(host: &str, port: impl std::fmt::Display) -> String {
+    let h = host.trim();
+    if h.parse::<Ipv6Addr>().is_ok() {
+        format!("[{h}]:{port}")
+    } else {
+        format!("{h}:{port}")
+    }
+}
+
 struct ConnectTarget {
     host: String,
     port: u16,
 }
 
 impl ConnectTarget {
+    fn host(&self) -> &str {
+        &self.host
+    }
+
+    fn port(&self) -> u16 {
+        self.port
+    }
+
     fn to_socket_target(&self) -> String {
-        format!("{}:{}", self.host, self.port)
+        format_socket_target(&self.host, self.port)
     }
 }
 
@@ -228,5 +331,15 @@ mod tests {
         };
         assert_eq!(target.to_socket_target(), "10.0.0.1:80");
         assert_eq!(target.to_string(), "10.0.0.1:80");
+    }
+
+    #[test]
+    fn connect_target_formats_ipv6_socket_target() {
+        let target = ConnectTarget {
+            host: "2001:db8::1".to_string(),
+            port: 443,
+        };
+        assert_eq!(target.to_socket_target(), "[2001:db8::1]:443");
+        assert_eq!(target.to_string(), "2001:db8::1:443");
     }
 }
