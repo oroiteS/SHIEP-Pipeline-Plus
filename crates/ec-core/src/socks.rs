@@ -1,6 +1,6 @@
 use crate::error::{EcError, EcResult};
 use std::io::{Read, Write};
-use std::net::{Ipv6Addr, Shutdown, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, TcpListener, TcpStream};
 use std::thread;
 
 const RELAY_BUFFER_SIZE: usize = 4096;
@@ -10,20 +10,22 @@ pub fn serve(bind_addr: &str, fallback_proxy: Option<&str>) -> EcResult<()> {
     let fallback_proxy = parse_fallback_proxy(fallback_proxy)?;
     let listener = TcpListener::bind(&normalized)
         .map_err(|e| EcError::Runtime(format!("socks bind failed on {bind_addr}: {e}")))?;
-    eprintln!("[SOCKS] listening on {normalized}");
     if let Some(proxy) = fallback_proxy.as_ref() {
-        eprintln!("[SOCKS] fallback proxy enabled: {}", proxy.addr);
+        eprintln!("[APP] fallback: proxy to {}", proxy.url);
+    } else {
+        eprintln!("[APP] fallback: direct");
     }
+    eprintln!("[APP] socks listening on {normalized}");
 
     loop {
-        let (stream, peer) = match listener.accept() {
+        let (stream, _peer) = match listener.accept() {
             Ok(v) => v,
             Err(_) => continue,
         };
         let fallback_proxy = fallback_proxy.clone();
         thread::spawn(move || {
             if let Err(err) = handle_client(stream, fallback_proxy.as_ref()) {
-                eprintln!("[SOCKS] client {peer} error: {err}");
+                eprintln!("[SOCKS][ERROR] {err}");
             }
         });
     }
@@ -40,19 +42,31 @@ fn normalize_bind_addr(bind_addr: &str) -> String {
 fn handle_client(mut client: TcpStream, fallback_proxy: Option<&FallbackProxy>) -> EcResult<()> {
     negotiate_method(&mut client)?;
     let target = read_connect_request(&mut client)?;
-    eprintln!("[SOCKS] connect request target={target}");
+    let target_display = target.to_string();
+    let target_is_ip = is_ip_host(target.host());
 
     let route = match crate::routing::plan_target(target.host(), target.port()) {
         Ok(crate::routing::RoutePlan::Remote {
             dial,
-            rc_id,
+            rc_id: _rc_id,
             rc_name,
-            source,
+            source: _source,
         }) => {
-            eprintln!(
-                "[SOCKS] route remote rc_id={rc_id} name={rc_name} source={source} dial={dial}"
-            );
-            RouteTransport::Tunnel(dial)
+            let name = if rc_name.trim().is_empty() {
+                "unknown".to_string()
+            } else {
+                rc_name
+            };
+            let line = if target_is_ip {
+                format!("{target_display} -> remote -> {name}")
+            } else {
+                format!("{target_display} -> remote -> {name}({dial})")
+            };
+            RouteDecision {
+                line,
+                path: format!("remote -> {name}({dial})"),
+                transport: RouteTransport::Tunnel(dial),
+            }
         }
         Ok(crate::routing::RoutePlan::Fallback {
             target: planned_target,
@@ -60,48 +74,63 @@ fn handle_client(mut client: TcpStream, fallback_proxy: Option<&FallbackProxy>) 
         }) => {
             let dial = target_addr(&planned_target);
             if let Some(proxy) = fallback_proxy {
-                eprintln!(
-                    "[SOCKS] route fallback reason={reason} target={planned_target} dial={dial} via proxy={}",
-                    proxy.addr
-                );
-                RouteTransport::Proxy(proxy.clone(), target.clone())
+                RouteDecision {
+                    line: format!("{target_display} -> fallback -> {}", proxy.url),
+                    path: format!("fallback -> {} reason={reason}", proxy.url),
+                    transport: RouteTransport::Proxy(proxy.clone(), target.clone()),
+                }
             } else {
-                eprintln!(
-                    "[SOCKS] route fallback reason={reason} target={planned_target} dial={dial} (direct)"
-                );
-                RouteTransport::Direct(dial)
+                RouteDecision {
+                    line: format!("{target_display} -> fallback -> direct"),
+                    path: format!("fallback -> direct dial={dial} reason={reason}"),
+                    transport: RouteTransport::Direct(dial),
+                }
             }
         }
         Err(err) => {
             let legacy = target.to_socket_target();
-            eprintln!("[SOCKS] route planner unavailable: {err}; use legacy target={legacy}");
-            RouteTransport::Tunnel(legacy)
+            RouteDecision {
+                line: format!("{target_display} -> remote -> legacy({legacy})"),
+                path: format!("remote -> legacy({legacy}) planner-unavailable={err}"),
+                transport: RouteTransport::Tunnel(legacy),
+            }
         }
     };
+    eprintln!("[SOCKS] {}", route.line);
 
-    match route {
+    match route.transport {
         RouteTransport::Tunnel(dial_target) => {
-            let conn = crate::netstack::open_tcp_connection(&dial_target)?;
-            eprintln!("[SOCKS] connected target={dial_target} via tunnel");
-            write_reply(&mut client, 0x00)?;
-            relay_tunnel(client, conn)
+            let conn = crate::netstack::open_tcp_connection(&dial_target).map_err(|e| {
+                EcError::Runtime(format!("{target_display} -> {} failed: {e}", route.path))
+            })?;
+            write_reply(&mut client, 0x00).map_err(|e| {
+                EcError::Runtime(format!("{target_display} -> {} failed: {e}", route.path))
+            })?;
+            relay_tunnel(client, conn).map_err(|e| {
+                EcError::Runtime(format!("{target_display} -> {} failed: {e}", route.path))
+            })
         }
         RouteTransport::Direct(dial_target) => {
             let conn = TcpStream::connect(&dial_target).map_err(|e| {
-                EcError::Runtime(format!("direct tcp connect failed for {dial_target}: {e}"))
+                EcError::Runtime(format!("{target_display} -> {} failed: {e}", route.path))
             })?;
-            eprintln!("[SOCKS] connected target={dial_target} via direct");
-            write_reply(&mut client, 0x00)?;
-            relay_direct(client, conn)
+            write_reply(&mut client, 0x00).map_err(|e| {
+                EcError::Runtime(format!("{target_display} -> {} failed: {e}", route.path))
+            })?;
+            relay_direct(client, conn).map_err(|e| {
+                EcError::Runtime(format!("{target_display} -> {} failed: {e}", route.path))
+            })
         }
         RouteTransport::Proxy(proxy, target) => {
-            let conn = connect_via_socks5_proxy(&proxy.addr, &target)?;
-            eprintln!(
-                "[SOCKS] connected target={target} via fallback proxy={}",
-                proxy.addr
-            );
-            write_reply(&mut client, 0x00)?;
-            relay_direct(client, conn)
+            let conn = connect_via_socks5_proxy(&proxy.addr, &target).map_err(|e| {
+                EcError::Runtime(format!("{target_display} -> {} failed: {e}", route.path))
+            })?;
+            write_reply(&mut client, 0x00).map_err(|e| {
+                EcError::Runtime(format!("{target_display} -> {} failed: {e}", route.path))
+            })?;
+            relay_direct(client, conn).map_err(|e| {
+                EcError::Runtime(format!("{target_display} -> {} failed: {e}", route.path))
+            })
         }
     }
 }
@@ -294,9 +323,16 @@ enum RouteTransport {
     Proxy(FallbackProxy, ConnectTarget),
 }
 
+struct RouteDecision {
+    line: String,
+    path: String,
+    transport: RouteTransport,
+}
+
 #[derive(Clone)]
 struct FallbackProxy {
     addr: String,
+    url: String,
 }
 
 fn target_addr(target: &str) -> String {
@@ -319,11 +355,13 @@ fn parse_fallback_proxy(raw: Option<&str>) -> EcResult<Option<FallbackProxy>> {
     let Some(raw) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
         return Ok(None);
     };
-    let addr = raw
-        .strip_prefix("socks5://")
-        .or_else(|| raw.strip_prefix("socks5h://"))
-        .unwrap_or(raw)
-        .trim();
+    let (addr, url) = if let Some(stripped) = raw.strip_prefix("socks5://") {
+        (stripped.trim(), raw.to_string())
+    } else if let Some(stripped) = raw.strip_prefix("socks5h://") {
+        (stripped.trim(), raw.to_string())
+    } else {
+        (raw.trim(), format!("socks5://{}", raw.trim()))
+    };
     if addr.is_empty() {
         return Err(EcError::InvalidConfig(
             "fallback-proxy is invalid: empty proxy address",
@@ -331,7 +369,12 @@ fn parse_fallback_proxy(raw: Option<&str>) -> EcResult<Option<FallbackProxy>> {
     }
     Ok(Some(FallbackProxy {
         addr: addr.to_string(),
+        url,
     }))
+}
+
+fn is_ip_host(host: &str) -> bool {
+    host.trim().parse::<Ipv4Addr>().is_ok() || host.trim().parse::<Ipv6Addr>().is_ok()
 }
 
 fn connect_via_socks5_proxy(proxy_addr: &str, target: &ConnectTarget) -> EcResult<TcpStream> {
@@ -514,6 +557,8 @@ mod tests {
     #[test]
     fn parse_fallback_proxy_accepts_plain_host_port() {
         let parsed = parse_fallback_proxy(Some("127.0.0.1:7890")).unwrap();
-        assert_eq!(parsed.unwrap().addr, "127.0.0.1:7890");
+        let proxy = parsed.unwrap();
+        assert_eq!(proxy.addr, "127.0.0.1:7890");
+        assert_eq!(proxy.url, "socks5://127.0.0.1:7890");
     }
 }

@@ -4,10 +4,8 @@ use openssl::ssl::{SslConnector, SslMethod, SslOptions, SslVerifyMode};
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::name::QName;
-use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
@@ -82,24 +80,7 @@ pub fn fetch_route_table(server: &str, twf_id: &str) -> EcResult<RouteTable> {
             "rclist response does not contain XML payload".to_string(),
         ));
     };
-    let xml_payload = &text[start..];
-    dump_route_table_snapshot(xml_payload);
-    parse_route_table_xml(xml_payload)
-}
-
-fn dump_route_table_snapshot(xml_payload: &str) {
-    let path = Path::new("target/.internal/rclist.latest.xml");
-    if let Some(parent) = path.parent()
-        && let Err(err) = fs::create_dir_all(parent)
-    {
-        eprintln!("[APP][DEBUG] rclist snapshot mkdir failed: {err}");
-        return;
-    }
-    if let Err(err) = fs::write(path, xml_payload) {
-        eprintln!("[APP][DEBUG] rclist snapshot write failed: {err}");
-        return;
-    }
-    eprintln!("[APP][DEBUG] rclist snapshot saved: {}", path.display());
+    parse_route_table_xml(&text[start..])
 }
 
 fn connect_tls(authority: &str, host: &str) -> EcResult<openssl::ssl::SslStream<TcpStream>> {

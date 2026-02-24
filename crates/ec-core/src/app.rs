@@ -15,17 +15,18 @@ impl EasyConnectApp {
         crate::netstack::validate_netstack_preconditions()?;
 
         let twf_id = crate::auth::login(&self.config)?;
-        eprintln!("[APP][DEBUG] TWFID={twf_id}");
+        eprintln!("[LOGIN] session id acquired: {twf_id}");
         match crate::route_table::fetch_route_table(&self.config.server, &twf_id) {
             Ok(table) => {
                 let install = crate::routing::install_route_table(table)?;
                 eprintln!(
-                    "[APP][DEBUG] route matcher installed: rules={} dns_records={}",
+                    "[APP] route table loaded: {} rules, {} dns records",
                     install.rule_count, install.dns_record_count
                 );
             }
             Err(err) => {
-                eprintln!("[APP][DEBUG] rclist fetch/parse failed: {err}");
+                eprintln!("[WARN] route table unavailable: {err}");
+                eprintln!("[WARN] split routing is disabled; fallback will use tunnel");
             }
         }
         let agent_token = crate::token::fetch_agent_token(&self.config.server, &twf_id)?;
