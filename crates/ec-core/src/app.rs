@@ -33,6 +33,9 @@ impl EasyConnectApp {
         let assigned_ip = crate::protocol::query_assigned_ip(&self.config.server, &token)?;
         crate::protocol::start_tunnel_runtime(&self.config.server, &token, assigned_ip)?;
         crate::netstack::start_runtime(assigned_ip)?;
-        crate::socks::serve(&self.config.socks_bind)
+        crate::socks::serve(
+            &self.config.socks_bind,
+            self.config.fallback_proxy.as_deref(),
+        )
     }
 }

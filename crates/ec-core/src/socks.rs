@@ -5,19 +5,24 @@ use std::thread;
 
 const RELAY_BUFFER_SIZE: usize = 4096;
 
-pub fn serve(bind_addr: &str) -> EcResult<()> {
+pub fn serve(bind_addr: &str, fallback_proxy: Option<&str>) -> EcResult<()> {
     let normalized = normalize_bind_addr(bind_addr);
+    let fallback_proxy = parse_fallback_proxy(fallback_proxy)?;
     let listener = TcpListener::bind(&normalized)
         .map_err(|e| EcError::Runtime(format!("socks bind failed on {bind_addr}: {e}")))?;
     eprintln!("[SOCKS] listening on {normalized}");
+    if let Some(proxy) = fallback_proxy.as_ref() {
+        eprintln!("[SOCKS] fallback proxy enabled: {}", proxy.addr);
+    }
 
     loop {
         let (stream, peer) = match listener.accept() {
             Ok(v) => v,
             Err(_) => continue,
         };
+        let fallback_proxy = fallback_proxy.clone();
         thread::spawn(move || {
-            if let Err(err) = handle_client(stream) {
+            if let Err(err) = handle_client(stream, fallback_proxy.as_ref()) {
                 eprintln!("[SOCKS] client {peer} error: {err}");
             }
         });
@@ -32,7 +37,7 @@ fn normalize_bind_addr(bind_addr: &str) -> String {
     }
 }
 
-fn handle_client(mut client: TcpStream) -> EcResult<()> {
+fn handle_client(mut client: TcpStream, fallback_proxy: Option<&FallbackProxy>) -> EcResult<()> {
     negotiate_method(&mut client)?;
     let target = read_connect_request(&mut client)?;
     eprintln!("[SOCKS] connect request target={target}");
@@ -49,12 +54,23 @@ fn handle_client(mut client: TcpStream) -> EcResult<()> {
             );
             RouteTransport::Tunnel(dial)
         }
-        Ok(crate::routing::RoutePlan::Fallback { target, reason }) => {
-            let dial = target_addr(&target);
-            eprintln!(
-                "[SOCKS] route fallback reason={reason} target={target} dial={dial} (direct)"
-            );
-            RouteTransport::Direct(dial)
+        Ok(crate::routing::RoutePlan::Fallback {
+            target: planned_target,
+            reason,
+        }) => {
+            let dial = target_addr(&planned_target);
+            if let Some(proxy) = fallback_proxy {
+                eprintln!(
+                    "[SOCKS] route fallback reason={reason} target={planned_target} dial={dial} via proxy={}",
+                    proxy.addr
+                );
+                RouteTransport::Proxy(proxy.clone(), target.clone())
+            } else {
+                eprintln!(
+                    "[SOCKS] route fallback reason={reason} target={planned_target} dial={dial} (direct)"
+                );
+                RouteTransport::Direct(dial)
+            }
         }
         Err(err) => {
             let legacy = target.to_socket_target();
@@ -75,6 +91,15 @@ fn handle_client(mut client: TcpStream) -> EcResult<()> {
                 EcError::Runtime(format!("direct tcp connect failed for {dial_target}: {e}"))
             })?;
             eprintln!("[SOCKS] connected target={dial_target} via direct");
+            write_reply(&mut client, 0x00)?;
+            relay_direct(client, conn)
+        }
+        RouteTransport::Proxy(proxy, target) => {
+            let conn = connect_via_socks5_proxy(&proxy.addr, &target)?;
+            eprintln!(
+                "[SOCKS] connected target={target} via fallback proxy={}",
+                proxy.addr
+            );
             write_reply(&mut client, 0x00)?;
             relay_direct(client, conn)
         }
@@ -266,6 +291,12 @@ fn pump_stream(mut src: TcpStream, mut dst: TcpStream) {
 enum RouteTransport {
     Tunnel(String),
     Direct(String),
+    Proxy(FallbackProxy, ConnectTarget),
+}
+
+#[derive(Clone)]
+struct FallbackProxy {
+    addr: String,
 }
 
 fn target_addr(target: &str) -> String {
@@ -284,6 +315,137 @@ fn format_socket_target(host: &str, port: impl std::fmt::Display) -> String {
     }
 }
 
+fn parse_fallback_proxy(raw: Option<&str>) -> EcResult<Option<FallbackProxy>> {
+    let Some(raw) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let addr = raw
+        .strip_prefix("socks5://")
+        .or_else(|| raw.strip_prefix("socks5h://"))
+        .unwrap_or(raw)
+        .trim();
+    if addr.is_empty() {
+        return Err(EcError::InvalidConfig(
+            "fallback-proxy is invalid: empty proxy address",
+        ));
+    }
+    Ok(Some(FallbackProxy {
+        addr: addr.to_string(),
+    }))
+}
+
+fn connect_via_socks5_proxy(proxy_addr: &str, target: &ConnectTarget) -> EcResult<TcpStream> {
+    let mut stream = TcpStream::connect(proxy_addr).map_err(|e| {
+        EcError::Runtime(format!("connect fallback proxy {proxy_addr} failed: {e}"))
+    })?;
+
+    stream
+        .write_all(&[0x05, 0x01, 0x00])
+        .map_err(|e| EcError::Runtime(format!("proxy greeting write failed: {e}")))?;
+
+    let mut method_resp = [0u8; 2];
+    stream
+        .read_exact(&mut method_resp)
+        .map_err(|e| EcError::Runtime(format!("proxy greeting read failed: {e}")))?;
+    if method_resp != [0x05, 0x00] {
+        return Err(EcError::Runtime(format!(
+            "fallback proxy auth method unsupported: version=0x{:02x} method=0x{:02x}",
+            method_resp[0], method_resp[1]
+        )));
+    }
+
+    let mut req = Vec::with_capacity(300);
+    req.push(0x05);
+    req.push(0x01);
+    req.push(0x00);
+    append_socks5_addr(&mut req, target.host())?;
+    req.extend_from_slice(&target.port().to_be_bytes());
+    stream
+        .write_all(&req)
+        .map_err(|e| EcError::Runtime(format!("proxy connect request write failed: {e}")))?;
+
+    let mut head = [0u8; 4];
+    stream
+        .read_exact(&mut head)
+        .map_err(|e| EcError::Runtime(format!("proxy connect reply read failed: {e}")))?;
+    if head[0] != 0x05 {
+        return Err(EcError::Runtime(format!(
+            "invalid fallback proxy reply version: 0x{:02x}",
+            head[0]
+        )));
+    }
+    if head[1] != 0x00 {
+        return Err(EcError::Runtime(format!(
+            "fallback proxy connect rejected with code: 0x{:02x}",
+            head[1]
+        )));
+    }
+
+    consume_socks5_addr_and_port(&mut stream, head[3])?;
+    Ok(stream)
+}
+
+fn append_socks5_addr(buf: &mut Vec<u8>, host: &str) -> EcResult<()> {
+    let host = host.trim();
+    if let Ok(ipv4) = host.parse::<std::net::Ipv4Addr>() {
+        buf.push(0x01);
+        buf.extend_from_slice(&ipv4.octets());
+        return Ok(());
+    }
+    if let Ok(ipv6) = host.parse::<Ipv6Addr>() {
+        buf.push(0x04);
+        buf.extend_from_slice(&ipv6.octets());
+        return Ok(());
+    }
+    if host.is_empty() || host.len() > 255 {
+        return Err(EcError::Runtime(
+            "fallback proxy target domain is empty or too long".to_string(),
+        ));
+    }
+    buf.push(0x03);
+    buf.push(host.len() as u8);
+    buf.extend_from_slice(host.as_bytes());
+    Ok(())
+}
+
+fn consume_socks5_addr_and_port(stream: &mut TcpStream, atyp: u8) -> EcResult<()> {
+    match atyp {
+        0x01 => {
+            let mut buf = [0u8; 4];
+            stream
+                .read_exact(&mut buf)
+                .map_err(|e| EcError::Runtime(format!("read proxy bind ipv4 failed: {e}")))?;
+        }
+        0x03 => {
+            let mut len = [0u8; 1];
+            stream.read_exact(&mut len).map_err(|e| {
+                EcError::Runtime(format!("read proxy bind domain length failed: {e}"))
+            })?;
+            let mut buf = vec![0u8; len[0] as usize];
+            stream
+                .read_exact(&mut buf)
+                .map_err(|e| EcError::Runtime(format!("read proxy bind domain failed: {e}")))?;
+        }
+        0x04 => {
+            let mut buf = [0u8; 16];
+            stream
+                .read_exact(&mut buf)
+                .map_err(|e| EcError::Runtime(format!("read proxy bind ipv6 failed: {e}")))?;
+        }
+        _ => {
+            return Err(EcError::Runtime(format!(
+                "unsupported fallback proxy bind atyp: 0x{atyp:02x}"
+            )));
+        }
+    }
+    let mut port = [0u8; 2];
+    stream
+        .read_exact(&mut port)
+        .map_err(|e| EcError::Runtime(format!("read proxy bind port failed: {e}")))?;
+    Ok(())
+}
+
+#[derive(Clone)]
 struct ConnectTarget {
     host: String,
     port: u16,
@@ -311,7 +473,7 @@ impl std::fmt::Display for ConnectTarget {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConnectTarget, normalize_bind_addr};
+    use super::{ConnectTarget, normalize_bind_addr, parse_fallback_proxy};
 
     #[test]
     fn normalize_bind_addr_expands_port_only() {
@@ -341,5 +503,17 @@ mod tests {
         };
         assert_eq!(target.to_socket_target(), "[2001:db8::1]:443");
         assert_eq!(target.to_string(), "2001:db8::1:443");
+    }
+
+    #[test]
+    fn parse_fallback_proxy_accepts_socks5_scheme() {
+        let parsed = parse_fallback_proxy(Some("socks5://127.0.0.1:7890")).unwrap();
+        assert_eq!(parsed.unwrap().addr, "127.0.0.1:7890");
+    }
+
+    #[test]
+    fn parse_fallback_proxy_accepts_plain_host_port() {
+        let parsed = parse_fallback_proxy(Some("127.0.0.1:7890")).unwrap();
+        assert_eq!(parsed.unwrap().addr, "127.0.0.1:7890");
     }
 }

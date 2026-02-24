@@ -6,6 +6,7 @@ pub struct AppConfig {
     pub username: String,
     pub password: String,
     pub socks_bind: String,
+    pub fallback_proxy: Option<String>,
 }
 
 impl AppConfig {
@@ -14,12 +15,17 @@ impl AppConfig {
         username: String,
         password: String,
         socks_bind: String,
+        fallback_proxy: Option<String>,
     ) -> EcResult<Self> {
+        let fallback_proxy = fallback_proxy
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
         let cfg = Self {
             server,
             username,
             password,
             socks_bind,
+            fallback_proxy,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -53,6 +59,7 @@ mod tests {
             "alice".to_string(),
             "secret".to_string(),
             ":1080".to_string(),
+            None,
         );
         assert!(result.is_ok());
     }
@@ -64,7 +71,21 @@ mod tests {
             "alice".to_string(),
             "secret".to_string(),
             ":1080".to_string(),
+            None,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn trims_empty_fallback_proxy_to_none() {
+        let cfg = AppConfig::new(
+            "vpn.example.com:443".to_string(),
+            "alice".to_string(),
+            "secret".to_string(),
+            ":1080".to_string(),
+            Some("   ".to_string()),
+        )
+        .unwrap();
+        assert!(cfg.fallback_proxy.is_none());
     }
 }
