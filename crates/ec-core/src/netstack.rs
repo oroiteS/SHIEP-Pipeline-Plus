@@ -8,11 +8,13 @@ use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, Ipv4Address};
 use std::collections::{HashMap, VecDeque};
 use std::net::{SocketAddr, SocketAddrV4, ToSocketAddrs};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static CONTROL_TX: OnceLock<mpsc::Sender<ControlMessage>> = OnceLock::new();
+static CLOSED_TUNNEL_WARNED: AtomicBool = AtomicBool::new(false);
 const OPEN_CONN_TIMEOUT: Duration = Duration::from_secs(10);
 const SOCKET_BUFFER_CAPACITY: usize = 64 * 1024;
 const NETSTACK_TICK: Duration = Duration::from_millis(2);
@@ -27,6 +29,7 @@ pub fn start_runtime(assigned_ip: [u8; 4]) -> EcResult<()> {
     if CONTROL_TX.get().is_some() {
         return Ok(());
     }
+    CLOSED_TUNNEL_WARNED.store(false, Ordering::Relaxed);
 
     let tunnel_rx = crate::protocol::take_tunnel_packet_receiver()?;
     let (control_tx, control_rx) = mpsc::channel::<ControlMessage>();
@@ -393,7 +396,27 @@ impl TxToken for TunnelTxToken {
         let mut frame = vec![0u8; len];
         let out = f(&mut frame);
         if let Err(err) = crate::protocol::send_tunnel_packet(frame) {
-            output::warn(Scope::Netstack, format!("send tunnel packet failed: {err}"));
+            let detail = err.to_string();
+            if detail.contains("sending on a closed channel") {
+                if !CLOSED_TUNNEL_WARNED.swap(true, Ordering::Relaxed) {
+                    if let Some(reason) = crate::protocol::tunnel_fatal_reason() {
+                        output::warn(
+                            Scope::Netstack,
+                            format!("tunnel tx channel closed after protocol stop: {reason}"),
+                        );
+                    } else {
+                        output::warn(
+                            Scope::Netstack,
+                            "tunnel tx channel closed; dropping outbound packets",
+                        );
+                    }
+                }
+            } else {
+                output::warn(
+                    Scope::Netstack,
+                    format!("send tunnel packet failed: {detail}"),
+                );
+            }
         }
         out
     }

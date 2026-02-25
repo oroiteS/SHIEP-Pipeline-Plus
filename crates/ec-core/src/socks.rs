@@ -1,7 +1,7 @@
 use crate::error::{EcError, EcResult};
 use crate::output::{self, Scope};
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::thread;
 
 const RELAY_BUFFER_SIZE: usize = 4096;
@@ -17,12 +17,19 @@ pub fn serve(bind_addr: &str, fallback_proxy: Option<&str>) -> EcResult<()> {
         output::info(Scope::App, "fallback: direct");
     }
     output::info(Scope::App, format!("socks listening on {normalized}"));
+    let wake_addr = listener_wakeup_addr(&listener)?;
+    thread::spawn(move || {
+        let _ = crate::protocol::wait_tunnel_fatal_reason();
+        let _ = TcpStream::connect(&wake_addr);
+    });
 
     loop {
-        let (stream, _peer) = match listener.accept() {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
+        let (stream, _peer) = listener
+            .accept()
+            .map_err(|e| EcError::Runtime(format!("socks accept failed: {e}")))?;
+        if let Some(reason) = crate::protocol::take_tunnel_fatal_reason() {
+            return Err(EcError::Runtime(format!("tunnel terminated: {reason}")));
+        }
         let fallback_proxy = fallback_proxy.clone();
         thread::spawn(move || {
             if let Err(err) = handle_client(stream, fallback_proxy.as_ref()) {
@@ -38,6 +45,17 @@ fn normalize_bind_addr(bind_addr: &str) -> String {
     } else {
         bind_addr.to_string()
     }
+}
+
+fn listener_wakeup_addr(listener: &TcpListener) -> EcResult<String> {
+    let addr = listener
+        .local_addr()
+        .map_err(|e| EcError::Runtime(format!("query socks local addr failed: {e}")))?;
+    Ok(match addr {
+        SocketAddr::V4(v4) if v4.ip().is_unspecified() => format!("127.0.0.1:{}", v4.port()),
+        SocketAddr::V6(v6) if v6.ip().is_unspecified() => format!("[::1]:{}", v6.port()),
+        _ => addr.to_string(),
+    })
 }
 
 fn handle_client(mut client: TcpStream, fallback_proxy: Option<&FallbackProxy>) -> EcResult<()> {

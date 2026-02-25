@@ -8,7 +8,7 @@ use openssl_sys as ffi;
 use std::ffi::c_uint;
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
-use std::sync::{Mutex, OnceLock, mpsc};
+use std::sync::{Condvar, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -52,6 +52,12 @@ impl StreamProfile {
 static TX_PACKET_SENDER: OnceLock<mpsc::Sender<Vec<u8>>> = OnceLock::new();
 static QUERY_KEEPALIVE: OnceLock<Mutex<Option<SslStream<TcpStream>>>> = OnceLock::new();
 static RX_PACKET_RECEIVER: OnceLock<Mutex<Option<mpsc::Receiver<Vec<u8>>>>> = OnceLock::new();
+static TUNNEL_FATAL_STATE: OnceLock<TunnelFatalState> = OnceLock::new();
+
+struct TunnelFatalState {
+    reason: Mutex<Option<String>>,
+    cv: Condvar,
+}
 
 pub fn query_assigned_ip(server: &str, token: &str) -> EcResult<[u8; 4]> {
     let (authority, host) = parse_server(server)?;
@@ -61,6 +67,8 @@ pub fn query_assigned_ip(server: &str, token: &str) -> EcResult<[u8; 4]> {
 }
 
 pub fn start_tunnel_runtime(server: &str, token: &str, assigned_ip: [u8; 4]) -> EcResult<()> {
+    clear_tunnel_fatal_reason();
+
     let (authority, host) = parse_server(server)?;
     let token_arr = parse_protocol_token(token)?;
     let ip_rev = [
@@ -88,14 +96,18 @@ pub fn start_tunnel_runtime(server: &str, token: &str, assigned_ip: [u8; 4]) -> 
             rx_stream,
             rx_sender,
         ) {
-            output::warn(Scope::Protocol, format!("rx worker stopped: {err}"));
+            let detail = format!("rx worker stopped: {err}");
+            output::warn(Scope::Protocol, &detail);
+            record_tunnel_fatal_reason(detail);
         }
     });
 
     thread::spawn(move || {
         if let Err(err) = tx_worker_loop(authority, host, token_arr, ip_rev, tx_stream, tx_receiver)
         {
-            output::warn(Scope::Protocol, format!("tx worker stopped: {err}"));
+            let detail = format!("tx worker stopped: {err}");
+            output::warn(Scope::Protocol, &detail);
+            record_tunnel_fatal_reason(detail);
         }
     });
 
@@ -148,6 +160,63 @@ pub fn take_tunnel_packet_receiver() -> EcResult<mpsc::Receiver<Vec<u8>>> {
         .map_err(|_| EcError::Runtime("rx packet receiver mutex poisoned".to_string()))?;
     guard.take().ok_or_else(|| {
         EcError::Runtime("tunnel packet receiver was already taken or not initialized".to_string())
+    })
+}
+
+pub(crate) fn tunnel_fatal_reason() -> Option<String> {
+    let state = tunnel_fatal_state();
+    match state.reason.lock() {
+        Ok(guard) => guard.clone(),
+        Err(_) => Some("tunnel fatal reason mutex poisoned".to_string()),
+    }
+}
+
+pub(crate) fn take_tunnel_fatal_reason() -> Option<String> {
+    let state = tunnel_fatal_state();
+    match state.reason.lock() {
+        Ok(mut guard) => guard.take(),
+        Err(_) => Some("tunnel fatal reason mutex poisoned".to_string()),
+    }
+}
+
+pub(crate) fn wait_tunnel_fatal_reason() -> String {
+    let state = tunnel_fatal_state();
+    let mut guard = match state.reason.lock() {
+        Ok(guard) => guard,
+        Err(_) => return "tunnel fatal reason mutex poisoned".to_string(),
+    };
+    loop {
+        if let Some(reason) = guard.clone() {
+            return reason;
+        }
+        guard = match state.cv.wait(guard) {
+            Ok(guard) => guard,
+            Err(_) => return "tunnel fatal reason condvar wait poisoned".to_string(),
+        };
+    }
+}
+
+fn clear_tunnel_fatal_reason() {
+    let state = tunnel_fatal_state();
+    if let Ok(mut guard) = state.reason.lock() {
+        *guard = None;
+    }
+}
+
+fn record_tunnel_fatal_reason(reason: String) {
+    let state = tunnel_fatal_state();
+    if let Ok(mut guard) = state.reason.lock() {
+        if guard.is_none() {
+            *guard = Some(reason);
+            state.cv.notify_all();
+        }
+    }
+}
+
+fn tunnel_fatal_state() -> &'static TunnelFatalState {
+    TUNNEL_FATAL_STATE.get_or_init(|| TunnelFatalState {
+        reason: Mutex::new(None),
+        cv: Condvar::new(),
     })
 }
 
