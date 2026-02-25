@@ -2,6 +2,25 @@ use anstyle::{Ansi256Color, Color, Style};
 use chrono::Local;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 
+const COLOR_VALUE: u8 = 183;
+const COLOR_WEAK: u8 = 95;
+const COLOR_ROUTE_REMOTE: u8 = 81;
+const COLOR_ROUTE_FALLBACK: u8 = 215;
+const COLOR_ROUTE_DIRECT: u8 = 150;
+const COLOR_SCOPE_CLI: u8 = 117;
+const COLOR_SCOPE_APP: u8 = 81;
+const COLOR_SCOPE_LOGIN: u8 = 118;
+const COLOR_SCOPE_AGENT: u8 = 222;
+const COLOR_SCOPE_RX: u8 = 213;
+const COLOR_SCOPE_VPN: u8 = 214;
+const COLOR_SCOPE_NETSTACK: u8 = 33;
+const COLOR_TS_YEAR: u8 = 240;
+const COLOR_TS_DATE: u8 = 244;
+const COLOR_TS_CLOCK: u8 = 247;
+const COLOR_SUCCESS: u8 = 34;
+const COLOR_WARN: u8 = 220;
+const COLOR_ERROR: u8 = 196;
+
 #[derive(Clone, Copy)]
 pub enum Scope {
     Cli,
@@ -19,6 +38,13 @@ pub enum Level {
     Success,
     Warn,
     Error,
+}
+
+#[derive(Clone, Copy)]
+pub enum RouteKind {
+    Remote,
+    Fallback,
+    Direct,
 }
 
 pub struct Styled<T> {
@@ -48,13 +74,13 @@ impl Scope {
     fn style(self) -> Style {
         match self {
             // High-saturation bright mapping for quick visual separation.
-            Scope::Cli => style_ansi256(117),
-            Scope::App => style_ansi256(81),
-            Scope::Login => style_ansi256(118),
-            Scope::Agent => style_ansi256(222),
-            Scope::Socks => style_ansi256(213),
-            Scope::Protocol => style_ansi256(214),
-            Scope::Netstack => style_ansi256(33),
+            Scope::Cli => style_ansi256(COLOR_SCOPE_CLI),
+            Scope::App => style_ansi256(COLOR_SCOPE_APP),
+            Scope::Login => style_ansi256(COLOR_SCOPE_LOGIN),
+            Scope::Agent => style_ansi256(COLOR_SCOPE_AGENT),
+            Scope::Socks => style_ansi256(COLOR_SCOPE_RX),
+            Scope::Protocol => style_ansi256(COLOR_SCOPE_VPN),
+            Scope::Netstack => style_ansi256(COLOR_SCOPE_NETSTACK),
         }
     }
 }
@@ -76,21 +102,19 @@ pub fn success(scope: Scope, message: impl Display) {
 }
 
 pub fn value<T: Display>(value: T) -> Styled<T> {
-    styled(style_ansi256(183), value)
+    styled(style_ansi256(COLOR_VALUE), value)
 }
 
 pub fn weak<T: Display>(value: T) -> Styled<T> {
-    styled(style_ansi256(95), value)
+    styled(style_ansi256(COLOR_WEAK), value)
 }
 
-pub fn route_label(label: &str) -> Styled<&str> {
-    let style = match label {
-        "remote" => style_ansi256(81),
-        "fallback" => style_ansi256(215),
-        "direct" => style_ansi256(150),
-        _ => style_ansi256(250),
-    };
-    styled(style, label)
+pub fn route_label(kind: RouteKind) -> Styled<&'static str> {
+    match kind {
+        RouteKind::Remote => styled(style_ansi256(COLOR_ROUTE_REMOTE), "remote"),
+        RouteKind::Fallback => styled(style_ansi256(COLOR_ROUTE_FALLBACK), "fallback"),
+        RouteKind::Direct => styled(style_ansi256(COLOR_ROUTE_DIRECT), "direct"),
+    }
 }
 
 fn styled<T>(style: Style, value: T) -> Styled<T> {
@@ -103,9 +127,9 @@ fn log(level: Level, scope: Scope, message: impl Display) {
 
 fn emit(level: Level, scope: Scope, message: impl Display) {
     let (year, short_date, clock) = timestamp_parts();
-    let year_style = style_ansi256(240);
-    let short_date_style = style_ansi256(244);
-    let clock_style = style_ansi256(247);
+    let year_style = style_ansi256(COLOR_TS_YEAR);
+    let short_date_style = style_ansi256(COLOR_TS_DATE);
+    let clock_style = style_ansi256(COLOR_TS_CLOCK);
     let scope_style = scope.style();
     match level {
         Level::Info => {
@@ -115,21 +139,21 @@ fn emit(level: Level, scope: Scope, message: impl Display) {
             );
         }
         Level::Success => {
-            let ok_style = style_ansi256(34);
+            let ok_style = style_ansi256(COLOR_SUCCESS);
             anstream::eprintln!(
                 "{year_style}{year}{year_style:#}{short_date_style}{short_date}{short_date_style:#}{clock_style}{clock}{clock_style:#} {scope_style}[{}]{scope_style:#} {ok_style}✓ {message}{ok_style:#}",
                 scope.label()
             );
         }
         Level::Warn => {
-            let warn_style = style_ansi256(220);
+            let warn_style = style_ansi256(COLOR_WARN);
             anstream::eprintln!(
                 "{year_style}{year}{year_style:#}{short_date_style}{short_date}{short_date_style:#}{clock_style}{clock}{clock_style:#} {scope_style}[{}]{scope_style:#} {warn_style}WARN:{warn_style:#} {message}",
                 scope.label(),
             );
         }
         Level::Error => {
-            let err_style = style_ansi256(196);
+            let err_style = style_ansi256(COLOR_ERROR);
             anstream::eprintln!(
                 "{year_style}{year}{year_style:#}{short_date_style}{short_date}{short_date_style:#}{clock_style}{clock}{clock_style:#} {scope_style}[{}]{scope_style:#} {err_style}ERROR:{err_style:#} {message}",
                 scope.label(),

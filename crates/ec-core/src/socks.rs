@@ -1,5 +1,5 @@
 use crate::error::{EcError, EcResult};
-use crate::output::{self, Scope};
+use crate::output::{self, RouteKind, Scope};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, TcpListener, TcpStream};
 use std::thread;
@@ -92,12 +92,12 @@ fn handle_client(mut client: TcpStream, fallback_proxy: Option<&FallbackProxy>) 
             let line = if target_is_ip {
                 format!(
                     "{target_display}{arrow}{}{arrow}{name}",
-                    output::route_label("remote"),
+                    output::route_label(RouteKind::Remote),
                 )
             } else {
                 format!(
                     "{target_display}{arrow}{}{arrow}{name}{lparen}{dial}{rparen}",
-                    output::route_label("remote"),
+                    output::route_label(RouteKind::Remote),
                 )
             };
             RouteDecision {
@@ -115,7 +115,7 @@ fn handle_client(mut client: TcpStream, fallback_proxy: Option<&FallbackProxy>) 
                 RouteDecision {
                     line: format!(
                         "{target_display}{arrow}{}{arrow}{}",
-                        output::route_label("fallback"),
+                        output::route_label(RouteKind::Fallback),
                         output::value(proxy.url.as_str()),
                     ),
                     path: format!("fallback -> {} reason={reason}", proxy.url),
@@ -125,8 +125,8 @@ fn handle_client(mut client: TcpStream, fallback_proxy: Option<&FallbackProxy>) 
                 RouteDecision {
                     line: format!(
                         "{target_display}{arrow}{}{arrow}{}",
-                        output::route_label("fallback"),
-                        output::route_label("direct"),
+                        output::route_label(RouteKind::Fallback),
+                        output::route_label(RouteKind::Direct),
                     ),
                     path: format!("fallback -> direct dial={dial} reason={reason}"),
                     transport: RouteTransport::Direct(dial),
@@ -138,7 +138,7 @@ fn handle_client(mut client: TcpStream, fallback_proxy: Option<&FallbackProxy>) 
             RouteDecision {
                 line: format!(
                     "{target_display}{arrow}{}{arrow}legacy{lparen}{legacy}{rparen}",
-                    output::route_label("remote"),
+                    output::route_label(RouteKind::Remote),
                 ),
                 path: format!("remote -> legacy({legacy}) planner-unavailable={err}"),
                 transport: RouteTransport::Tunnel(legacy),
