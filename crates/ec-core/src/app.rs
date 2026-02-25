@@ -1,6 +1,7 @@
 use crate::config::AppConfig;
 use crate::error::EcResult;
 use crate::output::{self, Scope};
+use std::net::Ipv4Addr;
 
 pub struct EasyConnectApp {
     config: AppConfig,
@@ -48,7 +49,10 @@ impl EasyConnectApp {
         let assigned_ip = crate::protocol::query_assigned_ip(&self.config.server, &token)?;
         output::success(
             Scope::Protocol,
-            format_args!("assigned IP: {}", output::value(format_ipv4(assigned_ip))),
+            format_args!(
+                "assigned IP: {}",
+                output::value(Ipv4Addr::from(assigned_ip))
+            ),
         );
         crate::protocol::start_tunnel_runtime(&self.config.server, &token, assigned_ip)?;
         output::success(Scope::Protocol, "tunnel established");
@@ -58,8 +62,4 @@ impl EasyConnectApp {
             self.config.fallback_proxy.as_deref(),
         )
     }
-}
-
-fn format_ipv4(ip: [u8; 4]) -> String {
-    format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])
 }

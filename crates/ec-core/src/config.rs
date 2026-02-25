@@ -17,6 +17,9 @@ impl AppConfig {
         socks_bind: String,
         fallback_proxy: Option<String>,
     ) -> EcResult<Self> {
+        let server = server.trim().to_string();
+        let username = username.trim().to_string();
+        let socks_bind = socks_bind.trim().to_string();
         let fallback_proxy = fallback_proxy
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
@@ -87,5 +90,20 @@ mod tests {
         )
         .unwrap();
         assert!(cfg.fallback_proxy.is_none());
+    }
+
+    #[test]
+    fn trims_server_username_and_bind() {
+        let cfg = AppConfig::new(
+            "  vpn.example.com:443  ".to_string(),
+            "  alice  ".to_string(),
+            "secret".to_string(),
+            " 127.0.0.1:1080 ".to_string(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(cfg.server, "vpn.example.com:443");
+        assert_eq!(cfg.username, "alice");
+        assert_eq!(cfg.socks_bind, "127.0.0.1:1080");
     }
 }
