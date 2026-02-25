@@ -27,7 +27,7 @@ impl Scope {
             Scope::App => "APP",
             Scope::Login => "LOGIN",
             Scope::Agent => "AGENT",
-            Scope::Socks => "SOCKS5",
+            Scope::Socks => "RX",
             Scope::Protocol => "VPN",
             Scope::Netstack => "NETSTACK",
         }

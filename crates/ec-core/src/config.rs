@@ -58,7 +58,7 @@ mod tests {
             "vpn.example.com:443".to_string(),
             "alice".to_string(),
             "secret".to_string(),
-            ":1080".to_string(),
+            "127.0.0.1:1080".to_string(),
             None,
         );
         assert!(result.is_ok());
@@ -70,7 +70,7 @@ mod tests {
             "".to_string(),
             "alice".to_string(),
             "secret".to_string(),
-            ":1080".to_string(),
+            "127.0.0.1:1080".to_string(),
             None,
         );
         assert!(result.is_err());
@@ -82,7 +82,7 @@ mod tests {
             "vpn.example.com:443".to_string(),
             "alice".to_string(),
             "secret".to_string(),
-            ":1080".to_string(),
+            "127.0.0.1:1080".to_string(),
             Some("   ".to_string()),
         )
         .unwrap();

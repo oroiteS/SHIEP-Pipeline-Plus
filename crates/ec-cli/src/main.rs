@@ -18,7 +18,7 @@ struct CliArgs {
 
     #[arg(
         long,
-        default_value = ":1080",
+        default_value = "127.0.0.1:1080",
         help_heading = "Optional",
         help = "Local bind address"
     )]
