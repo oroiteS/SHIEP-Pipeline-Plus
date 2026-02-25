@@ -59,15 +59,7 @@ fn main() {
 
 fn parse_args() -> CliArgs {
     let mut cmd = CliArgs::command();
-    let bin = std::env::args()
-        .next()
-        .and_then(|argv0| {
-            Path::new(&argv0)
-                .file_name()
-                .map(|v| v.to_string_lossy().into_owned())
-        })
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| cmd.get_name().to_string());
+    let bin = current_bin_name().unwrap_or_else(|| cmd.get_name().to_string());
 
     let usage =
         format!("{bin} [OPTIONS] --server <SERVER> --username <USERNAME> --password <PASSWORD>");
@@ -75,4 +67,15 @@ fn parse_args() -> CliArgs {
 
     let matches = cmd.get_matches();
     CliArgs::from_arg_matches(&matches).unwrap_or_else(|e| e.exit())
+}
+
+fn current_bin_name() -> Option<String> {
+    std::env::args()
+        .next()
+        .and_then(|argv0| {
+            Path::new(&argv0)
+                .file_name()
+                .map(|v| v.to_string_lossy().into_owned())
+        })
+        .filter(|v| !v.is_empty())
 }
