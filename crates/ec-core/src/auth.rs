@@ -1,5 +1,6 @@
 use crate::config::AppConfig;
 use crate::error::{EcError, EcResult};
+use crate::output::{self, Scope};
 use reqwest::blocking::Client;
 use reqwest::header::{CONTENT_TYPE, COOKIE};
 use rsa::rand_core::OsRng;
@@ -9,6 +10,10 @@ use urlencoding::encode;
 pub fn login(config: &AppConfig) -> EcResult<String> {
     let base_url = normalize_base_url(&config.server);
     let client = build_http_client()?;
+    output::info(
+        Scope::Login,
+        format!("connecting to {server}...", server = config.server),
+    );
 
     let login_auth_url = format!("{base_url}/por/login_auth.csp?apiversion=1");
     let login_auth_body = client
@@ -24,6 +29,9 @@ pub fn login(config: &AppConfig) -> EcResult<String> {
     let rsa_exp =
         extract_tag(&login_auth_body, "RSA_ENCRYPT_EXP").unwrap_or_else(|| "65537".to_string());
     let csrf = extract_tag(&login_auth_body, "CSRF_RAND_CODE").unwrap_or_default();
+    if csrf.is_empty() {
+        output::warn(Scope::Login, "CSRF code missing; using legacy auth flow");
+    }
 
     let password_input = if csrf.is_empty() {
         config.password.clone()
@@ -31,6 +39,7 @@ pub fn login(config: &AppConfig) -> EcResult<String> {
         format!("{}_{}", config.password, csrf)
     };
     let encrypted_password_hex = encrypt_password_hex(&password_input, &rsa_key, &rsa_exp)?;
+    output::info(Scope::Login, "authenticating credentials...");
 
     let login_psw_url = format!("{base_url}/por/login_psw.csp?anti_replay=1&encrypt=1&type=cs");
     let body = format!(
@@ -74,6 +83,7 @@ pub fn login(config: &AppConfig) -> EcResult<String> {
     if let Some(updated) = extract_tag(&login_psw_body, "TwfID") {
         twf_id = updated;
     }
+    output::info(Scope::Login, "authentication successful");
 
     Ok(twf_id)
 }

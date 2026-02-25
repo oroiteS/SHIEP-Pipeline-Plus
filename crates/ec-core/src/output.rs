@@ -6,6 +6,7 @@ pub enum Scope {
     Cli,
     App,
     Login,
+    Agent,
     Socks,
     Protocol,
     Netstack,
@@ -24,8 +25,9 @@ impl Scope {
             Scope::Cli => "CLI",
             Scope::App => "APP",
             Scope::Login => "LOGIN",
-            Scope::Socks => "SOCKS",
-            Scope::Protocol => "PROTOCOL",
+            Scope::Agent => "AGENT",
+            Scope::Socks => "SOCKS5",
+            Scope::Protocol => "VPN",
             Scope::Netstack => "NETSTACK",
         }
     }
@@ -36,6 +38,7 @@ impl Scope {
             Scope::Cli => style_ansi256(117),
             Scope::App => style_ansi256(81),
             Scope::Login => style_ansi256(118),
+            Scope::Agent => style_ansi256(222),
             Scope::Socks => style_ansi256(213),
             Scope::Protocol => style_ansi256(214),
             Scope::Netstack => style_ansi256(33),
@@ -72,15 +75,15 @@ fn emit(level: Level, scope: Scope, message: &str) {
         Level::Warn => {
             let warn_style = style_ansi256(220);
             anstream::eprintln!(
-                "{timestamp} {warn_style}[WARN]{warn_style:#}{scope_style}[{}]{scope_style:#} {message}",
-                scope.label()
+                "{timestamp} {scope_style}[{}]{scope_style:#} {warn_style}WARN:{warn_style:#} {message}",
+                scope.label(),
             );
         }
         Level::Error => {
             let err_style = style_ansi256(196);
             anstream::eprintln!(
-                "{timestamp} {err_style}[ERROR]{err_style:#}{scope_style}[{}]{scope_style:#} {message}",
-                scope.label()
+                "{timestamp} {scope_style}[{}]{scope_style:#} {err_style}ERROR:{err_style:#} {message}",
+                scope.label(),
             );
         }
     }

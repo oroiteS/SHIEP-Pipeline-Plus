@@ -36,14 +36,26 @@ impl EasyConnectApp {
                 );
             }
         }
+        output::info(Scope::Agent, "fetching agent token...");
         let agent_token = crate::token::fetch_agent_token(&self.config.server, &twf_id)?;
+        output::info(Scope::Agent, "agent token acquired");
         let token = format!("{agent_token}{twf_id}");
+        output::info(Scope::Protocol, "querying assigned IP...");
         let assigned_ip = crate::protocol::query_assigned_ip(&self.config.server, &token)?;
+        output::info(
+            Scope::Protocol,
+            format!("assigned IP: {}", format_ipv4(assigned_ip)),
+        );
         crate::protocol::start_tunnel_runtime(&self.config.server, &token, assigned_ip)?;
+        output::info(Scope::Protocol, "tunnel established");
         crate::netstack::start_runtime(assigned_ip)?;
         crate::socks::serve(
             &self.config.socks_bind,
             self.config.fallback_proxy.as_deref(),
         )
     }
+}
+
+fn format_ipv4(ip: [u8; 4]) -> String {
+    format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])
 }
