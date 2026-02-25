@@ -7,6 +7,16 @@ use rsa::rand_core::OsRng;
 use rsa::{BigUint, RsaPublicKey, pkcs1v15::Pkcs1v15Encrypt};
 use urlencoding::encode;
 
+const TAG_RESULT_SUCCESS: &str = "<Result>1</Result>";
+const NEXT_SMS_MARKERS: &[&str] = &[
+    "<NextService>auth/sms</NextService>",
+    "<NextAuth>2</NextAuth>",
+];
+const NEXT_TOTP_MARKERS: &[&str] = &[
+    "<NextService>auth/token</NextService>",
+    "<NextServiceSubType>totp</NextServiceSubType>",
+];
+
 pub fn login(config: &AppConfig) -> EcResult<String> {
     let base_url = normalize_base_url(&config.server);
     let client = build_http_client()?;
@@ -60,21 +70,10 @@ pub fn login(config: &AppConfig) -> EcResult<String> {
         .text()
         .map_err(|e| EcError::Runtime(format!("login_psw body read failed: {e}")))?;
 
-    if login_psw_body.contains("<NextService>auth/sms</NextService>")
-        || login_psw_body.contains("<NextAuth>2</NextAuth>")
-    {
-        return Err(EcError::NotImplemented(
-            "sms 2fa is out of current minimal scope",
-        ));
+    if let Some(reason) = unsupported_2fa_reason(&login_psw_body) {
+        return Err(EcError::NotImplemented(reason));
     }
-    if login_psw_body.contains("<NextService>auth/token</NextService>")
-        || login_psw_body.contains("<NextServiceSubType>totp</NextServiceSubType>")
-    {
-        return Err(EcError::NotImplemented(
-            "totp 2fa is out of current minimal scope",
-        ));
-    }
-    if !login_psw_body.contains("<Result>1</Result>") {
+    if !login_psw_body.contains(TAG_RESULT_SUCCESS) {
         return Err(EcError::Runtime(
             "login failed: missing success result marker".to_string(),
         ));
@@ -118,6 +117,20 @@ fn require_tag(body: &str, tag: &str, stage: &str) -> EcResult<String> {
         .ok_or_else(|| EcError::Runtime(format!("missing <{tag}> in {stage} response")))
 }
 
+fn unsupported_2fa_reason(body: &str) -> Option<&'static str> {
+    if contains_any(body, NEXT_SMS_MARKERS) {
+        return Some("sms 2fa is out of current minimal scope");
+    }
+    if contains_any(body, NEXT_TOTP_MARKERS) {
+        return Some("totp 2fa is out of current minimal scope");
+    }
+    None
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
+}
+
 fn encrypt_password_hex(password: &str, rsa_key_hex: &str, rsa_exp: &str) -> EcResult<String> {
     let modulus = BigUint::parse_bytes(rsa_key_hex.as_bytes(), 16)
         .ok_or_else(|| EcError::Runtime("invalid RSA modulus".to_string()))?;
@@ -137,7 +150,7 @@ fn encrypt_password_hex(password: &str, rsa_key_hex: &str, rsa_exp: &str) -> EcR
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_tag, normalize_base_url};
+    use super::{contains_any, extract_tag, normalize_base_url, unsupported_2fa_reason};
 
     #[test]
     fn normalize_base_url_adds_https_scheme() {
@@ -159,5 +172,24 @@ mod tests {
     fn extract_tag_reads_expected_value() {
         let input = "<root><TwfID>ABC123</TwfID></root>";
         assert_eq!(extract_tag(input, "TwfID").as_deref(), Some("ABC123"));
+    }
+
+    #[test]
+    fn unsupported_2fa_reason_detects_sms_and_totp() {
+        assert_eq!(
+            unsupported_2fa_reason("<NextAuth>2</NextAuth>"),
+            Some("sms 2fa is out of current minimal scope")
+        );
+        assert_eq!(
+            unsupported_2fa_reason("<NextServiceSubType>totp</NextServiceSubType>"),
+            Some("totp 2fa is out of current minimal scope")
+        );
+        assert!(unsupported_2fa_reason("<Result>1</Result>").is_none());
+    }
+
+    #[test]
+    fn contains_any_matches_expected_needles() {
+        assert!(contains_any("abc def", &["xyz", "def"]));
+        assert!(!contains_any("abc def", &["xyz", "123"]));
     }
 }
