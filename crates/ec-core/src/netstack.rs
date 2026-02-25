@@ -17,8 +17,6 @@ static CONTROL_TX: OnceLock<mpsc::Sender<ControlMessage>> = OnceLock::new();
 static CLOSED_TUNNEL_WARNED: AtomicBool = AtomicBool::new(false);
 const OPEN_CONN_TIMEOUT: Duration = Duration::from_secs(10);
 const SOCKET_BUFFER_CAPACITY: usize = 64 * 1024;
-const NETSTACK_TICK: Duration = Duration::from_millis(2);
-const MAX_TUNNEL_RX_BATCH: usize = 256;
 const MAX_CONTROL_BATCH: usize = 64;
 
 pub fn validate_netstack_preconditions() -> EcResult<()> {
@@ -33,12 +31,24 @@ pub fn start_runtime(assigned_ip: [u8; 4]) -> EcResult<()> {
 
     let tunnel_rx = crate::protocol::take_tunnel_packet_receiver()?;
     let (control_tx, control_rx) = mpsc::channel::<ControlMessage>();
+    let control_tx_for_runtime = control_tx.clone();
     CONTROL_TX
         .set(control_tx)
         .map_err(|_| EcError::Runtime("netstack runtime already initialized".to_string()))?;
 
     thread::spawn(move || {
-        if let Err(err) = run_netstack_loop(assigned_ip, tunnel_rx, control_rx) {
+        while let Ok(packet) = tunnel_rx.recv() {
+            if control_tx_for_runtime
+                .send(ControlMessage::TunnelPacket { packet })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    thread::spawn(move || {
+        if let Err(err) = run_netstack_loop(assigned_ip, control_rx) {
             output::error(Scope::Netstack, format!("fatal error: {err}"));
         }
     });
@@ -115,6 +125,9 @@ impl TunnelTcpSender {
 }
 
 enum ControlMessage {
+    TunnelPacket {
+        packet: Vec<u8>,
+    },
     Open {
         target: SocketAddrV4,
         reply: mpsc::Sender<EcResult<(u64, mpsc::Receiver<Vec<u8>>)>>,
@@ -137,7 +150,6 @@ struct ConnectionState {
 
 fn run_netstack_loop(
     assigned_ip: [u8; 4],
-    tunnel_rx: mpsc::Receiver<Vec<u8>>,
     control_rx: mpsc::Receiver<ControlMessage>,
 ) -> EcResult<()> {
     let mut device = TunnelDevice::new();
@@ -161,36 +173,51 @@ fn run_netstack_loop(
     let start = Instant::now();
 
     loop {
-        for _ in 0..MAX_TUNNEL_RX_BATCH {
-            let Ok(packet) = tunnel_rx.try_recv() else {
-                break;
-            };
-            device.push_rx(packet);
-        }
-
-        for _ in 0..MAX_CONTROL_BATCH {
-            let Ok(msg) = control_rx.try_recv() else {
-                break;
-            };
+        let now = smol_now(start);
+        let wait = iface
+            .poll_delay(now, &sockets)
+            .map(|delay| Duration::from_millis(delay.total_millis()));
+        if let Some(msg) = wait_control_message(&control_rx, wait)? {
             handle_control_message(
                 msg,
+                &mut device,
                 &mut iface,
                 &mut sockets,
                 &mut connections,
                 &mut next_conn_id,
                 &mut next_local_port,
             );
+            for _ in 1..MAX_CONTROL_BATCH {
+                let msg = match control_rx.try_recv() {
+                    Ok(msg) => msg,
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        return Err(EcError::Runtime(
+                            "netstack control channel disconnected".to_string(),
+                        ));
+                    }
+                };
+                handle_control_message(
+                    msg,
+                    &mut device,
+                    &mut iface,
+                    &mut sockets,
+                    &mut connections,
+                    &mut next_conn_id,
+                    &mut next_local_port,
+                );
+            }
         }
 
         let now = smol_now(start);
         let _ = iface.poll(now, &mut device, &mut sockets);
         drive_connections(&mut sockets, &mut connections);
-        thread::sleep(NETSTACK_TICK);
     }
 }
 
 fn handle_control_message(
     msg: ControlMessage,
+    device: &mut TunnelDevice,
     iface: &mut Interface,
     sockets: &mut SocketSet<'_>,
     connections: &mut HashMap<u64, ConnectionState>,
@@ -198,6 +225,9 @@ fn handle_control_message(
     next_local_port: &mut u16,
 ) {
     match msg {
+        ControlMessage::TunnelPacket { packet } => {
+            device.push_rx(packet);
+        }
         ControlMessage::Open { target, reply } => {
             let result = open_connection(
                 target,
@@ -219,6 +249,27 @@ fn handle_control_message(
                 conn.close_requested = true;
             }
         }
+    }
+}
+
+fn wait_control_message(
+    control_rx: &mpsc::Receiver<ControlMessage>,
+    timeout: Option<Duration>,
+) -> EcResult<Option<ControlMessage>> {
+    match timeout {
+        Some(delay) => match control_rx.recv_timeout(delay) {
+            Ok(msg) => Ok(Some(msg)),
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(EcError::Runtime(
+                "netstack control channel disconnected".to_string(),
+            )),
+        },
+        None => match control_rx.recv() {
+            Ok(msg) => Ok(Some(msg)),
+            Err(_) => Err(EcError::Runtime(
+                "netstack control channel disconnected".to_string(),
+            )),
+        },
     }
 }
 

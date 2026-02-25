@@ -14,7 +14,6 @@ use std::time::{Duration, Instant};
 
 const STREAM_RETRY_LIMIT: usize = 5;
 const STREAM_RETRY_DELAY: Duration = Duration::from_secs(1);
-const STREAM_IDLE_DELAY: Duration = Duration::from_millis(5);
 const QUERY_IP_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 const STREAM_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const PROTOCOL_TOKEN_LEN: usize = 48;
@@ -88,27 +87,30 @@ pub fn start_tunnel_runtime(server: &str, token: &str, assigned_ip: [u8; 4]) -> 
     let rx_authority = authority.clone();
     let rx_host = host.clone();
     thread::spawn(move || {
-        if let Err(err) = rx_worker_loop(
+        let result = rx_worker_loop(
             rx_authority,
             rx_host,
             token_arr,
             ip_rev,
             rx_stream,
             rx_sender,
-        ) {
-            let detail = format!("rx worker stopped: {err}");
-            output::warn(Scope::Protocol, &detail);
-            record_tunnel_fatal_reason(detail);
-        }
+        );
+        let detail = match result {
+            Ok(()) => "rx worker exited unexpectedly".to_string(),
+            Err(err) => format!("rx worker stopped: {err}"),
+        };
+        output::warn(Scope::Protocol, &detail);
+        record_tunnel_fatal_reason(detail);
     });
 
     thread::spawn(move || {
-        if let Err(err) = tx_worker_loop(authority, host, token_arr, ip_rev, tx_stream, tx_receiver)
-        {
-            let detail = format!("tx worker stopped: {err}");
-            output::warn(Scope::Protocol, &detail);
-            record_tunnel_fatal_reason(detail);
-        }
+        let result = tx_worker_loop(authority, host, token_arr, ip_rev, tx_stream, tx_receiver);
+        let detail = match result {
+            Ok(()) => "tx worker exited unexpectedly".to_string(),
+            Err(err) => format!("tx worker stopped: {err}"),
+        };
+        output::warn(Scope::Protocol, &detail);
+        record_tunnel_fatal_reason(detail);
     });
 
     Ok(())
@@ -167,14 +169,6 @@ pub(crate) fn tunnel_fatal_reason() -> Option<String> {
     let state = tunnel_fatal_state();
     match state.reason.lock() {
         Ok(guard) => guard.clone(),
-        Err(_) => Some("tunnel fatal reason mutex poisoned".to_string()),
-    }
-}
-
-pub(crate) fn take_tunnel_fatal_reason() -> Option<String> {
-    let state = tunnel_fatal_state();
-    match state.reason.lock() {
-        Ok(mut guard) => guard.take(),
         Err(_) => Some("tunnel fatal reason mutex poisoned".to_string()),
     }
 }
@@ -315,7 +309,7 @@ fn rx_worker_loop(
                 }
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
-                thread::sleep(STREAM_IDLE_DELAY);
+                continue;
             }
             Err(_) => {
                 retries += 1;

@@ -1,4 +1,5 @@
 use anstyle::{Ansi256Color, Color, Style};
+use chrono::Local;
 
 #[derive(Clone, Copy)]
 pub enum Scope {
@@ -59,22 +60,26 @@ fn log(level: Level, scope: Scope, message: &str) {
 }
 
 fn emit(level: Level, scope: Scope, message: &str) {
+    let timestamp = timestamp();
     let scope_style = scope.style();
     match level {
         Level::Info => {
-            anstream::eprintln!("{scope_style}[{}]{scope_style:#} {message}", scope.label());
+            anstream::eprintln!(
+                "{timestamp} {scope_style}[{}]{scope_style:#} {message}",
+                scope.label()
+            );
         }
         Level::Warn => {
             let warn_style = style_ansi256(220);
             anstream::eprintln!(
-                "{warn_style}[WARN]{warn_style:#}{scope_style}[{}]{scope_style:#} {message}",
+                "{timestamp} {warn_style}[WARN]{warn_style:#}{scope_style}[{}]{scope_style:#} {message}",
                 scope.label()
             );
         }
         Level::Error => {
             let err_style = style_ansi256(196);
             anstream::eprintln!(
-                "{err_style}[ERROR]{err_style:#}{scope_style}[{}]{scope_style:#} {message}",
+                "{timestamp} {err_style}[ERROR]{err_style:#}{scope_style}[{}]{scope_style:#} {message}",
                 scope.label()
             );
         }
@@ -83,4 +88,8 @@ fn emit(level: Level, scope: Scope, message: &str) {
 
 fn style_ansi256(code: u8) -> Style {
     Style::new().fg_color(Some(Color::Ansi256(Ansi256Color(code))))
+}
+
+fn timestamp() -> String {
+    Local::now().format("%Y/%m/%d %H:%M:%S%.3f").to_string()
 }
