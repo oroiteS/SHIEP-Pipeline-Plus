@@ -97,16 +97,12 @@ pub fn start_tunnel_runtime(server: &str, token: &str, assigned_ip: [u8; 4]) -> 
             rx_stream,
             rx_sender,
         );
-        let detail = worker_exit_detail(StreamProfile::Rx, result);
-        output::warn(Scope::Protocol, &detail);
-        record_tunnel_fatal_reason(detail);
+        handle_worker_exit(StreamProfile::Rx, result);
     });
 
     thread::spawn(move || {
         let result = tx_worker_loop(authority, host, token_arr, ip_rev, tx_stream, tx_receiver);
-        let detail = worker_exit_detail(StreamProfile::Tx, result);
-        output::warn(Scope::Protocol, &detail);
-        record_tunnel_fatal_reason(detail);
+        handle_worker_exit(StreamProfile::Tx, result);
     });
 
     Ok(())
@@ -202,6 +198,12 @@ fn worker_exit_detail(profile: StreamProfile, result: EcResult<()>) -> String {
         Ok(()) => format!("{} worker exited unexpectedly", profile.label()),
         Err(err) => format!("{} worker stopped: {err}", profile.label()),
     }
+}
+
+fn handle_worker_exit(profile: StreamProfile, result: EcResult<()>) {
+    let detail = worker_exit_detail(profile, result);
+    output::warn(Scope::Protocol, &detail);
+    record_tunnel_fatal_reason(detail);
 }
 
 fn tunnel_fatal_state() -> &'static TunnelFatalState {
