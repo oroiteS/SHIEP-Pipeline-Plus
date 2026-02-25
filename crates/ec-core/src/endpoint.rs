@@ -18,21 +18,48 @@ pub(crate) fn parse_server(server: &str) -> EcResult<(String, String)> {
         return Err(EcError::Runtime("invalid server authority".to_string()));
     }
 
-    let authority = if has_explicit_port(authority_raw) {
-        authority_raw.to_string()
-    } else {
-        format!("{authority_raw}:443")
-    };
+    let authority = normalize_authority(authority_raw)?;
     let host = extract_host(&authority)?;
     Ok((authority, host))
 }
 
+fn normalize_authority(authority: &str) -> EcResult<String> {
+    if has_explicit_port(authority) {
+        return Ok(authority.to_string());
+    }
+
+    if looks_like_malformed_port(authority) {
+        return Err(EcError::InvalidConfig("invalid server port"));
+    }
+
+    Ok(format!("{authority}:443"))
+}
+
 fn has_explicit_port(authority: &str) -> bool {
     if authority.starts_with('[') {
-        authority.contains("]:")
+        authority
+            .rsplit_once("]:")
+            .and_then(|(_, port)| port.parse::<u16>().ok())
+            .is_some()
     } else {
-        authority.rsplit_once(':').is_some()
+        authority
+            .rsplit_once(':')
+            .and_then(|(_, port)| port.parse::<u16>().ok())
+            .is_some()
     }
+}
+
+fn looks_like_malformed_port(authority: &str) -> bool {
+    if authority.starts_with('[') {
+        return authority
+            .rsplit_once("]:")
+            .map(|(_, port)| !port.is_empty())
+            .unwrap_or(false);
+    }
+    authority
+        .rsplit_once(':')
+        .map(|(_, port)| !port.is_empty())
+        .unwrap_or(false)
 }
 
 fn extract_host(authority: &str) -> EcResult<String> {
@@ -83,10 +110,21 @@ mod tests {
     #[test]
     fn host_and_port_helpers() {
         assert!(has_explicit_port("vpn.example.com:443"));
+        assert!(has_explicit_port("[2001:db8::1]:443"));
         assert!(!has_explicit_port("vpn.example.com"));
+        assert!(!has_explicit_port("vpn.example.com:abc"));
         assert_eq!(
             extract_host("vpn.example.com:443").unwrap(),
             "vpn.example.com"
+        );
+    }
+
+    #[test]
+    fn parse_server_rejects_invalid_port() {
+        let err = parse_server("vpn.example.com:abc").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid config: invalid server port")
         );
     }
 }
