@@ -6,6 +6,18 @@ use std::thread;
 
 const RELAY_BUFFER_SIZE: usize = 4096;
 const HTTP_PROXY_HEAD_MAX_SIZE: usize = 16 * 1024;
+const SOCKS_VERSION_5: u8 = 0x05;
+const SOCKS_METHOD_NO_AUTH: u8 = 0x00;
+const SOCKS_METHOD_NOT_ACCEPTABLE: u8 = 0xff;
+const SOCKS_CMD_CONNECT: u8 = 0x01;
+const SOCKS_RSV: u8 = 0x00;
+const SOCKS_ATYP_IPV4: u8 = 0x01;
+const SOCKS_ATYP_DOMAIN: u8 = 0x03;
+const SOCKS_ATYP_IPV6: u8 = 0x04;
+const SOCKS_REP_GENERAL_FAILURE: u8 = 0x01;
+const SOCKS_REP_SUCCEEDED: u8 = 0x00;
+const SOCKS_REP_CMD_NOT_SUPPORTED: u8 = 0x07;
+const SOCKS_REP_ATYP_NOT_SUPPORTED: u8 = 0x08;
 
 pub fn serve(bind_addr: &str, fallback_proxy: Option<&str>) -> EcResult<()> {
     let normalized = normalize_bind_addr(bind_addr);
@@ -170,7 +182,8 @@ fn write_connect_ok_reply(
     target_display: &str,
     route_path: &str,
 ) -> EcResult<()> {
-    write_reply(client, 0x00).map_err(|e| route_runtime_error(target_display, route_path, e))
+    write_reply(client, SOCKS_REP_SUCCEEDED)
+        .map_err(|e| route_runtime_error(target_display, route_path, e))
 }
 
 fn relay_direct_with_reply(
@@ -195,7 +208,7 @@ fn negotiate_method(client: &mut TcpStream) -> EcResult<()> {
     client
         .read_exact(&mut head)
         .map_err(|e| EcError::Runtime(format!("socks hello read failed: {e}")))?;
-    if head[0] != 0x05 {
+    if head[0] != SOCKS_VERSION_5 {
         return Err(EcError::Runtime("unsupported socks version".to_string()));
     }
 
@@ -205,15 +218,15 @@ fn negotiate_method(client: &mut TcpStream) -> EcResult<()> {
         .read_exact(&mut methods)
         .map_err(|e| EcError::Runtime(format!("socks methods read failed: {e}")))?;
 
-    if methods.contains(&0x00) {
+    if methods.contains(&SOCKS_METHOD_NO_AUTH) {
         client
-            .write_all(&[0x05, 0x00])
+            .write_all(&[SOCKS_VERSION_5, SOCKS_METHOD_NO_AUTH])
             .map_err(|e| EcError::Runtime(format!("socks method reply failed: {e}")))?;
         return Ok(());
     }
 
     client
-        .write_all(&[0x05, 0xff])
+        .write_all(&[SOCKS_VERSION_5, SOCKS_METHOD_NOT_ACCEPTABLE])
         .map_err(|e| EcError::Runtime(format!("socks method reject reply failed: {e}")))?;
     Err(EcError::Runtime(
         "client does not support no-auth method".to_string(),
@@ -226,31 +239,31 @@ fn read_connect_request(client: &mut TcpStream) -> EcResult<ConnectTarget> {
         .read_exact(&mut req)
         .map_err(|e| EcError::Runtime(format!("socks request head read failed: {e}")))?;
 
-    if req[0] != 0x05 {
+    if req[0] != SOCKS_VERSION_5 {
         return Err(EcError::Runtime(
             "invalid socks request version".to_string(),
         ));
     }
-    if req[1] != 0x01 {
-        let _ = write_reply(client, 0x07);
+    if req[1] != SOCKS_CMD_CONNECT {
+        let _ = write_reply(client, SOCKS_REP_CMD_NOT_SUPPORTED);
         return Err(EcError::Runtime(
             "only CONNECT command is supported".to_string(),
         ));
     }
-    if req[2] != 0x00 {
-        let _ = write_reply(client, 0x01);
+    if req[2] != SOCKS_RSV {
+        let _ = write_reply(client, SOCKS_REP_GENERAL_FAILURE);
         return Err(EcError::Runtime("invalid socks reserved byte".to_string()));
     }
 
     let host = match req[3] {
-        0x01 => {
+        SOCKS_ATYP_IPV4 => {
             let mut ip = [0u8; 4];
             client
                 .read_exact(&mut ip)
                 .map_err(|e| EcError::Runtime(format!("read ipv4 failed: {e}")))?;
             format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])
         }
-        0x03 => {
+        SOCKS_ATYP_DOMAIN => {
             let mut len = [0u8; 1];
             client
                 .read_exact(&mut len)
@@ -262,7 +275,7 @@ fn read_connect_request(client: &mut TcpStream) -> EcResult<ConnectTarget> {
             String::from_utf8(domain)
                 .map_err(|e| EcError::Runtime(format!("invalid domain utf8: {e}")))?
         }
-        0x04 => {
+        SOCKS_ATYP_IPV6 => {
             let mut ip = [0u8; 16];
             client
                 .read_exact(&mut ip)
@@ -270,7 +283,7 @@ fn read_connect_request(client: &mut TcpStream) -> EcResult<ConnectTarget> {
             Ipv6Addr::from(ip).to_string()
         }
         atyp => {
-            let _ = write_reply(client, 0x08);
+            let _ = write_reply(client, SOCKS_REP_ATYP_NOT_SUPPORTED);
             return Err(EcError::Runtime(format!(
                 "unsupported socks atyp: 0x{atyp:02x}"
             )));
@@ -286,7 +299,18 @@ fn read_connect_request(client: &mut TcpStream) -> EcResult<ConnectTarget> {
 }
 
 fn write_reply(client: &mut TcpStream, rep: u8) -> EcResult<()> {
-    let reply = [0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+    let reply = [
+        SOCKS_VERSION_5,
+        rep,
+        SOCKS_RSV,
+        SOCKS_ATYP_IPV4,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ];
     client
         .write_all(&reply)
         .map_err(|e| EcError::Runtime(format!("socks reply write failed: {e}")))
@@ -456,14 +480,14 @@ fn connect_via_socks5_proxy(proxy_addr: &str, target: &ConnectTarget) -> EcResul
     })?;
 
     stream
-        .write_all(&[0x05, 0x01, 0x00])
+        .write_all(&[SOCKS_VERSION_5, 0x01, SOCKS_METHOD_NO_AUTH])
         .map_err(|e| EcError::Runtime(format!("proxy greeting write failed: {e}")))?;
 
     let mut method_resp = [0u8; 2];
     stream
         .read_exact(&mut method_resp)
         .map_err(|e| EcError::Runtime(format!("proxy greeting read failed: {e}")))?;
-    if method_resp != [0x05, 0x00] {
+    if method_resp != [SOCKS_VERSION_5, SOCKS_METHOD_NO_AUTH] {
         return Err(EcError::Runtime(format!(
             "fallback proxy auth method unsupported: version=0x{:02x} method=0x{:02x}",
             method_resp[0], method_resp[1]
@@ -471,9 +495,9 @@ fn connect_via_socks5_proxy(proxy_addr: &str, target: &ConnectTarget) -> EcResul
     }
 
     let mut req = Vec::with_capacity(300);
-    req.push(0x05);
-    req.push(0x01);
-    req.push(0x00);
+    req.push(SOCKS_VERSION_5);
+    req.push(SOCKS_CMD_CONNECT);
+    req.push(SOCKS_RSV);
     append_socks5_addr(&mut req, target.host())?;
     req.extend_from_slice(&target.port().to_be_bytes());
     stream
@@ -484,13 +508,13 @@ fn connect_via_socks5_proxy(proxy_addr: &str, target: &ConnectTarget) -> EcResul
     stream
         .read_exact(&mut head)
         .map_err(|e| EcError::Runtime(format!("proxy connect reply read failed: {e}")))?;
-    if head[0] != 0x05 {
+    if head[0] != SOCKS_VERSION_5 {
         return Err(EcError::Runtime(format!(
             "invalid fallback proxy reply version: 0x{:02x}",
             head[0]
         )));
     }
-    if head[1] != 0x00 {
+    if head[1] != SOCKS_REP_SUCCEEDED {
         return Err(EcError::Runtime(format!(
             "fallback proxy connect rejected with code: 0x{:02x}",
             head[1]
@@ -573,12 +597,12 @@ fn ensure_http_connect_success(reply_head: &str) -> EcResult<()> {
 fn append_socks5_addr(buf: &mut Vec<u8>, host: &str) -> EcResult<()> {
     let host = host.trim();
     if let Ok(ipv4) = host.parse::<std::net::Ipv4Addr>() {
-        buf.push(0x01);
+        buf.push(SOCKS_ATYP_IPV4);
         buf.extend_from_slice(&ipv4.octets());
         return Ok(());
     }
     if let Ok(ipv6) = host.parse::<Ipv6Addr>() {
-        buf.push(0x04);
+        buf.push(SOCKS_ATYP_IPV6);
         buf.extend_from_slice(&ipv6.octets());
         return Ok(());
     }
@@ -587,7 +611,7 @@ fn append_socks5_addr(buf: &mut Vec<u8>, host: &str) -> EcResult<()> {
             "fallback proxy target domain is empty or too long".to_string(),
         ));
     }
-    buf.push(0x03);
+    buf.push(SOCKS_ATYP_DOMAIN);
     buf.push(host.len() as u8);
     buf.extend_from_slice(host.as_bytes());
     Ok(())
