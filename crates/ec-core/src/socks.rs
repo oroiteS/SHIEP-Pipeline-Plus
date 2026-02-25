@@ -185,9 +185,7 @@ fn relay_direct_with_reply(
 
 fn connect_via_proxy(proxy: &FallbackProxy, target: &ConnectTarget) -> EcResult<TcpStream> {
     match proxy.kind {
-        FallbackProxyKind::Socks5 | FallbackProxyKind::Socks5h => {
-            connect_via_socks5_proxy(&proxy.addr, target)
-        }
+        FallbackProxyKind::Socks5 => connect_via_socks5_proxy(&proxy.addr, target),
         FallbackProxyKind::Http => connect_via_http_connect_proxy(&proxy.addr, target),
     }
 }
@@ -396,7 +394,6 @@ struct FallbackProxy {
 #[derive(Clone, Copy)]
 enum FallbackProxyKind {
     Socks5,
-    Socks5h,
     Http,
 }
 
@@ -423,7 +420,7 @@ fn parse_fallback_proxy(raw: Option<&str>) -> EcResult<Option<FallbackProxy>> {
     let (addr, url, kind) = if let Some(stripped) = raw.strip_prefix("socks5://") {
         (stripped.trim(), raw.to_string(), FallbackProxyKind::Socks5)
     } else if let Some(stripped) = raw.strip_prefix("socks5h://") {
-        (stripped.trim(), raw.to_string(), FallbackProxyKind::Socks5h)
+        (stripped.trim(), raw.to_string(), FallbackProxyKind::Socks5)
     } else if let Some(stripped) = raw.strip_prefix("http://") {
         (stripped.trim(), raw.to_string(), FallbackProxyKind::Http)
     } else if raw.contains("://") {
@@ -434,7 +431,7 @@ fn parse_fallback_proxy(raw: Option<&str>) -> EcResult<Option<FallbackProxy>> {
         (
             raw.trim(),
             format!("socks5h://{}", raw.trim()),
-            FallbackProxyKind::Socks5h,
+            FallbackProxyKind::Socks5,
         )
     };
     if addr.is_empty() {

@@ -2,6 +2,7 @@ use crate::endpoint::parse_server;
 use crate::error::{EcError, EcResult};
 use openssl::ssl::{SslConnector, SslMethod, SslOptions, SslVerifyMode};
 use quick_xml::Reader;
+use quick_xml::events::attributes::Attribute;
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::name::QName;
 use std::io::{ErrorKind, Read, Write};
@@ -150,10 +151,7 @@ fn parse_rc(
 
     for attr in e.attributes().with_checks(false) {
         let attr = attr.map_err(|e| EcError::Runtime(format!("xml attr parse failed: {e}")))?;
-        let value = attr
-            .decode_and_unescape_value(reader.decoder())
-            .map_err(|e| EcError::Runtime(format!("xml attr decode failed: {e}")))?
-            .into_owned();
+        let value = decode_attr_value(&attr, reader)?;
         match attr.key.as_ref() {
             b"id" => id_raw = Some(value),
             b"host" => host_raw = Some(value),
@@ -206,10 +204,7 @@ fn parse_dns(
     let mut data: Option<String> = None;
     for attr in e.attributes().with_checks(false) {
         let attr = attr.map_err(|e| EcError::Runtime(format!("xml attr parse failed: {e}")))?;
-        let value = attr
-            .decode_and_unescape_value(reader.decoder())
-            .map_err(|e| EcError::Runtime(format!("xml attr decode failed: {e}")))?
-            .into_owned();
+        let value = decode_attr_value(&attr, reader)?;
         match attr.key.as_ref() {
             b"dnsserver" => servers = Some(value),
             b"data" => data = Some(value),
@@ -249,6 +244,12 @@ fn parse_dns_record_item(item: &str) -> Option<DnsRecord> {
         return None;
     }
     Some(DnsRecord { rc_id, host, ip })
+}
+
+fn decode_attr_value(attr: &Attribute<'_>, reader: &Reader<&[u8]>) -> EcResult<String> {
+    attr.decode_and_unescape_value(reader.decoder())
+        .map(|v| v.into_owned())
+        .map_err(|e| EcError::Runtime(format!("xml attr decode failed: {e}")))
 }
 
 fn split_hosts(raw: &str) -> Vec<String> {

@@ -18,6 +18,7 @@ static CLOSED_TUNNEL_WARNED: AtomicBool = AtomicBool::new(false);
 const OPEN_CONN_TIMEOUT: Duration = Duration::from_secs(10);
 const SOCKET_BUFFER_CAPACITY: usize = 64 * 1024;
 const MAX_CONTROL_BATCH: usize = 64;
+const NETSTACK_CONTROL_DISCONNECTED: &str = "netstack control channel disconnected";
 
 pub fn validate_netstack_preconditions() -> EcResult<()> {
     Ok(())
@@ -192,9 +193,7 @@ fn run_netstack_loop(
                     Ok(msg) => msg,
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => {
-                        return Err(EcError::Runtime(
-                            "netstack control channel disconnected".to_string(),
-                        ));
+                        return Err(control_channel_disconnected_err());
                     }
                 };
                 handle_control_message(
@@ -260,17 +259,17 @@ fn wait_control_message(
         Some(delay) => match control_rx.recv_timeout(delay) {
             Ok(msg) => Ok(Some(msg)),
             Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(EcError::Runtime(
-                "netstack control channel disconnected".to_string(),
-            )),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(control_channel_disconnected_err()),
         },
         None => match control_rx.recv() {
             Ok(msg) => Ok(Some(msg)),
-            Err(_) => Err(EcError::Runtime(
-                "netstack control channel disconnected".to_string(),
-            )),
+            Err(_) => Err(control_channel_disconnected_err()),
         },
     }
+}
+
+fn control_channel_disconnected_err() -> EcError {
+    EcError::Runtime(NETSTACK_CONTROL_DISCONNECTED.to_string())
 }
 
 fn open_connection(
@@ -453,7 +452,7 @@ impl TxToken for TunnelTxToken {
                     if let Some(reason) = crate::protocol::tunnel_fatal_reason() {
                         output::warn(
                             Scope::Netstack,
-                            format!("tunnel tx channel closed after protocol stop: {reason}"),
+                            format_args!("tunnel tx channel closed after protocol stop: {reason}"),
                         );
                     } else {
                         output::warn(
@@ -465,7 +464,7 @@ impl TxToken for TunnelTxToken {
             } else {
                 output::warn(
                     Scope::Netstack,
-                    format!("send tunnel packet failed: {detail}"),
+                    format_args!("send tunnel packet failed: {detail}"),
                 );
             }
         }

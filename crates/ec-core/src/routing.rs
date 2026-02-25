@@ -86,9 +86,15 @@ enum TargetKind {
 
 impl RouteMatcher {
     fn from_table(table: RouteTable) -> EcResult<Self> {
-        let mut rules = Vec::new();
-        let mut seen_rules = HashSet::<String>::new();
-        for rule in table.rules {
+        let RouteTable {
+            rules: raw_rules,
+            dns_records: raw_dns_records,
+            ..
+        } = table;
+
+        let mut rules = Vec::with_capacity(raw_rules.len());
+        let mut seen_rules = HashSet::<RuleDedupKey>::with_capacity(raw_rules.len());
+        for rule in raw_rules {
             if let Some(compiled) = compile_rule(rule) {
                 let key = compiled.dedup_key();
                 if seen_rules.insert(key) {
@@ -98,8 +104,8 @@ impl RouteMatcher {
         }
 
         let mut dns_map = HashMap::<i32, HashMap<String, Vec<Ipv4Addr>>>::new();
-        let mut seen_dns = HashSet::<(i32, String, Ipv4Addr)>::new();
-        for rec in table.dns_records {
+        let mut seen_dns = HashSet::<(i32, String, Ipv4Addr)>::with_capacity(raw_dns_records.len());
+        for rec in raw_dns_records {
             let host = normalize_domain(&rec.host);
             if host.is_empty() {
                 continue;
@@ -181,17 +187,36 @@ impl RouteMatcher {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RuleDedupKey {
+    rc_id: i32,
+    rc_name: String,
+    matcher: MatcherDedupKey,
+    port_start: u16,
+    port_end: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum MatcherDedupKey {
+    Domain(String),
+    Ipv4(Ipv4Addr),
+    Ipv4Range(u32, u32),
+}
+
 impl CompiledRule {
-    fn dedup_key(&self) -> String {
+    fn dedup_key(&self) -> RuleDedupKey {
         let matcher = match &self.matcher {
-            HostMatcher::Domain(host) => format!("d:{host}"),
-            HostMatcher::Ipv4(ip) => format!("4:{ip}"),
-            HostMatcher::Ipv4Range(a, b) => format!("r:{a}-{b}"),
+            HostMatcher::Domain(host) => MatcherDedupKey::Domain(host.clone()),
+            HostMatcher::Ipv4(ip) => MatcherDedupKey::Ipv4(*ip),
+            HostMatcher::Ipv4Range(a, b) => MatcherDedupKey::Ipv4Range(*a, *b),
         };
-        format!(
-            "{}|{}|{}|{}|{}",
-            self.rc_id, self.rc_name, matcher, self.port.start, self.port.end
-        )
+        RuleDedupKey {
+            rc_id: self.rc_id,
+            rc_name: self.rc_name.clone(),
+            matcher,
+            port_start: self.port.start,
+            port_end: self.port.end,
+        }
     }
 }
 
