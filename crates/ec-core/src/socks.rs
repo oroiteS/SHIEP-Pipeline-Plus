@@ -5,6 +5,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, TcpListener, TcpStream};
 use std::thread;
 
 const RELAY_BUFFER_SIZE: usize = 4096;
+const HTTP_PROXY_HEAD_MAX_SIZE: usize = 16 * 1024;
 
 pub fn serve(bind_addr: &str, fallback_proxy: Option<&str>) -> EcResult<()> {
     let normalized = normalize_bind_addr(bind_addr);
@@ -134,41 +135,52 @@ fn handle_client(mut client: TcpStream, fallback_proxy: Option<&FallbackProxy>) 
     };
     output::info(Scope::Socks, &route.line);
 
+    let route_path = route.path.as_str();
     match route.transport {
         RouteTransport::Tunnel(dial_target) => {
-            let conn = crate::netstack::open_tcp_connection(&dial_target).map_err(|e| {
-                EcError::Runtime(format!("{target_display} -> {} failed: {e}", route.path))
-            })?;
-            write_reply(&mut client, 0x00).map_err(|e| {
-                EcError::Runtime(format!("{target_display} -> {} failed: {e}", route.path))
-            })?;
-            relay_tunnel(client, conn).map_err(|e| {
-                EcError::Runtime(format!("{target_display} -> {} failed: {e}", route.path))
-            })
+            let conn = crate::netstack::open_tcp_connection(&dial_target)
+                .map_err(|e| route_runtime_error(target_display.as_str(), route_path, e))?;
+            write_connect_ok_reply(&mut client, target_display.as_str(), route_path)?;
+            relay_tunnel(client, conn)
+                .map_err(|e| route_runtime_error(target_display.as_str(), route_path, e))
         }
         RouteTransport::Direct(dial_target) => {
-            let conn = TcpStream::connect(&dial_target).map_err(|e| {
-                EcError::Runtime(format!("{target_display} -> {} failed: {e}", route.path))
-            })?;
-            write_reply(&mut client, 0x00).map_err(|e| {
-                EcError::Runtime(format!("{target_display} -> {} failed: {e}", route.path))
-            })?;
-            relay_direct(client, conn).map_err(|e| {
-                EcError::Runtime(format!("{target_display} -> {} failed: {e}", route.path))
-            })
+            let conn = TcpStream::connect(&dial_target)
+                .map_err(|e| route_runtime_error(target_display.as_str(), route_path, e))?;
+            relay_direct_with_reply(client, conn, target_display.as_str(), route_path)
         }
         RouteTransport::Proxy(proxy, target) => {
-            let conn = connect_via_proxy(&proxy, &target).map_err(|e| {
-                EcError::Runtime(format!("{target_display} -> {} failed: {e}", route.path))
-            })?;
-            write_reply(&mut client, 0x00).map_err(|e| {
-                EcError::Runtime(format!("{target_display} -> {} failed: {e}", route.path))
-            })?;
-            relay_direct(client, conn).map_err(|e| {
-                EcError::Runtime(format!("{target_display} -> {} failed: {e}", route.path))
-            })
+            let conn = connect_via_proxy(&proxy, &target)
+                .map_err(|e| route_runtime_error(target_display.as_str(), route_path, e))?;
+            relay_direct_with_reply(client, conn, target_display.as_str(), route_path)
         }
     }
+}
+
+fn route_runtime_error(
+    target_display: &str,
+    route_path: &str,
+    err: impl std::fmt::Display,
+) -> EcError {
+    EcError::Runtime(format!("{target_display} -> {route_path} failed: {err}"))
+}
+
+fn write_connect_ok_reply(
+    client: &mut TcpStream,
+    target_display: &str,
+    route_path: &str,
+) -> EcResult<()> {
+    write_reply(client, 0x00).map_err(|e| route_runtime_error(target_display, route_path, e))
+}
+
+fn relay_direct_with_reply(
+    mut client: TcpStream,
+    conn: TcpStream,
+    target_display: &str,
+    route_path: &str,
+) -> EcResult<()> {
+    write_connect_ok_reply(&mut client, target_display, route_path)?;
+    relay_direct(client, conn).map_err(|e| route_runtime_error(target_display, route_path, e))
 }
 
 fn connect_via_proxy(proxy: &FallbackProxy, target: &ConnectTarget) -> EcResult<TcpStream> {
@@ -513,6 +525,8 @@ fn connect_via_http_connect_proxy(proxy_addr: &str, target: &ConnectTarget) -> E
 fn read_http_proxy_head(stream: &mut TcpStream) -> EcResult<String> {
     let mut buf = Vec::with_capacity(256);
     loop {
+        // Read one byte at a time deliberately: over-reading here could consume
+        // tunneled bytes that should be forwarded to the client after CONNECT.
         let mut one = [0u8; 1];
         let n = stream
             .read(&mut one)
@@ -526,7 +540,7 @@ fn read_http_proxy_head(stream: &mut TcpStream) -> EcResult<String> {
         if buf.len() >= 4 && &buf[buf.len() - 4..] == b"\r\n\r\n" {
             break;
         }
-        if buf.len() > 16 * 1024 {
+        if buf.len() > HTTP_PROXY_HEAD_MAX_SIZE {
             return Err(EcError::Runtime(
                 "http proxy connect reply header is too large".to_string(),
             ));

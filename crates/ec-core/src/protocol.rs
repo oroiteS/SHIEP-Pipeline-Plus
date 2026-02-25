@@ -201,11 +201,11 @@ fn clear_tunnel_fatal_reason() {
 
 fn record_tunnel_fatal_reason(reason: String) {
     let state = tunnel_fatal_state();
-    if let Ok(mut guard) = state.reason.lock() {
-        if guard.is_none() {
-            *guard = Some(reason);
-            state.cv.notify_all();
-        }
+    if let Ok(mut guard) = state.reason.lock()
+        && guard.is_none()
+    {
+        *guard = Some(reason);
+        state.cv.notify_all();
     }
 }
 
