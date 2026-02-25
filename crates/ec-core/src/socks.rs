@@ -60,6 +60,9 @@ fn handle_client(mut client: TcpStream, fallback_proxy: Option<&FallbackProxy>) 
     let target = read_connect_request(&mut client)?;
     let target_display = target.to_string();
     let target_is_ip = is_ip_host(target.host());
+    let arrow = output::weak(" -> ");
+    let lparen = output::weak("(");
+    let rparen = output::weak(")");
 
     let route = match crate::routing::plan_target(target.host(), target.port()) {
         Ok(crate::routing::RoutePlan::Remote {
@@ -74,9 +77,15 @@ fn handle_client(mut client: TcpStream, fallback_proxy: Option<&FallbackProxy>) 
                 rc_name
             };
             let line = if target_is_ip {
-                format!("{target_display} -> remote -> {name}")
+                format!(
+                    "{target_display}{arrow}{}{arrow}{name}",
+                    output::route_label("remote"),
+                )
             } else {
-                format!("{target_display} -> remote -> {name}({dial})")
+                format!(
+                    "{target_display}{arrow}{}{arrow}{name}{lparen}{dial}{rparen}",
+                    output::route_label("remote"),
+                )
             };
             RouteDecision {
                 line,
@@ -92,15 +101,20 @@ fn handle_client(mut client: TcpStream, fallback_proxy: Option<&FallbackProxy>) 
             if let Some(proxy) = fallback_proxy {
                 RouteDecision {
                     line: format!(
-                        "{target_display} -> fallback -> {}",
-                        output::value(proxy.url.as_str())
+                        "{target_display}{arrow}{}{arrow}{}",
+                        output::route_label("fallback"),
+                        output::value(proxy.url.as_str()),
                     ),
                     path: format!("fallback -> {} reason={reason}", proxy.url),
                     transport: RouteTransport::Proxy(proxy.clone(), target.clone()),
                 }
             } else {
                 RouteDecision {
-                    line: format!("{target_display} -> fallback -> direct"),
+                    line: format!(
+                        "{target_display}{arrow}{}{arrow}{}",
+                        output::route_label("fallback"),
+                        output::route_label("direct"),
+                    ),
                     path: format!("fallback -> direct dial={dial} reason={reason}"),
                     transport: RouteTransport::Direct(dial),
                 }
@@ -109,7 +123,10 @@ fn handle_client(mut client: TcpStream, fallback_proxy: Option<&FallbackProxy>) 
         Err(err) => {
             let legacy = target.to_socket_target();
             RouteDecision {
-                line: format!("{target_display} -> remote -> legacy({legacy})"),
+                line: format!(
+                    "{target_display}{arrow}{}{arrow}legacy{lparen}{legacy}{rparen}",
+                    output::route_label("remote"),
+                ),
                 path: format!("remote -> legacy({legacy}) planner-unavailable={err}"),
                 transport: RouteTransport::Tunnel(legacy),
             }

@@ -68,6 +68,21 @@ pub fn value(value: impl AsRef<str>) -> String {
     format!("{value_style}{}{value_style:#}", value.as_ref())
 }
 
+pub fn weak(value: impl AsRef<str>) -> String {
+    let weak_style = style_ansi256(95);
+    format!("{weak_style}{}{weak_style:#}", value.as_ref())
+}
+
+pub fn route_label(label: &str) -> String {
+    let style = match label {
+        "remote" => style_ansi256(81),
+        "fallback" => style_ansi256(215),
+        "direct" => style_ansi256(150),
+        _ => style_ansi256(250),
+    };
+    format!("{style}{label}{style:#}")
+}
+
 fn log(level: Level, scope: Scope, message: &str) {
     emit(level, scope, message);
 }
