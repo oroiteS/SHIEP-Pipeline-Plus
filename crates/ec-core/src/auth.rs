@@ -12,7 +12,7 @@ pub fn login(config: &AppConfig) -> EcResult<String> {
     let client = build_http_client()?;
     output::info(
         Scope::Login,
-        format!("connecting to {server}...", server = config.server),
+        format!("connecting to {}...", output::value(config.server.as_str())),
     );
 
     let login_auth_url = format!("{base_url}/por/login_auth.csp?apiversion=1");
@@ -83,7 +83,7 @@ pub fn login(config: &AppConfig) -> EcResult<String> {
     if let Some(updated) = extract_tag(&login_psw_body, "TwfID") {
         twf_id = updated;
     }
-    output::info(Scope::Login, "authentication successful");
+    output::success(Scope::Login, "authentication successful");
 
     Ok(twf_id)
 }

@@ -15,6 +15,7 @@ pub enum Scope {
 #[derive(Clone, Copy)]
 pub enum Level {
     Info,
+    Success,
     Warn,
     Error,
 }
@@ -58,31 +59,50 @@ pub fn error(scope: Scope, message: impl AsRef<str>) {
     log(Level::Error, scope, message.as_ref());
 }
 
+pub fn success(scope: Scope, message: impl AsRef<str>) {
+    log(Level::Success, scope, message.as_ref());
+}
+
+pub fn value(value: impl AsRef<str>) -> String {
+    let value_style = style_ansi256(183);
+    format!("{value_style}{}{value_style:#}", value.as_ref())
+}
+
 fn log(level: Level, scope: Scope, message: &str) {
     emit(level, scope, message);
 }
 
 fn emit(level: Level, scope: Scope, message: &str) {
-    let timestamp = timestamp();
+    let (year, short_date, clock) = timestamp_parts();
+    let year_style = style_ansi256(240);
+    let short_date_style = style_ansi256(244);
+    let clock_style = style_ansi256(247);
     let scope_style = scope.style();
     match level {
         Level::Info => {
             anstream::eprintln!(
-                "{timestamp} {scope_style}[{}]{scope_style:#} {message}",
+                "{year_style}{year}{year_style:#}{short_date_style}{short_date}{short_date_style:#}{clock_style}{clock}{clock_style:#} {scope_style}[{}]{scope_style:#} {message}",
+                scope.label()
+            );
+        }
+        Level::Success => {
+            let ok_style = style_ansi256(34);
+            anstream::eprintln!(
+                "{year_style}{year}{year_style:#}{short_date_style}{short_date}{short_date_style:#}{clock_style}{clock}{clock_style:#} {scope_style}[{}]{scope_style:#} {ok_style}✓ {message}{ok_style:#}",
                 scope.label()
             );
         }
         Level::Warn => {
             let warn_style = style_ansi256(220);
             anstream::eprintln!(
-                "{timestamp} {scope_style}[{}]{scope_style:#} {warn_style}WARN:{warn_style:#} {message}",
+                "{year_style}{year}{year_style:#}{short_date_style}{short_date}{short_date_style:#}{clock_style}{clock}{clock_style:#} {scope_style}[{}]{scope_style:#} {warn_style}WARN:{warn_style:#} {message}",
                 scope.label(),
             );
         }
         Level::Error => {
             let err_style = style_ansi256(196);
             anstream::eprintln!(
-                "{timestamp} {scope_style}[{}]{scope_style:#} {err_style}ERROR:{err_style:#} {message}",
+                "{year_style}{year}{year_style:#}{short_date_style}{short_date}{short_date_style:#}{clock_style}{clock}{clock_style:#} {scope_style}[{}]{scope_style:#} {err_style}ERROR:{err_style:#} {message}",
                 scope.label(),
             );
         }
@@ -93,6 +113,11 @@ fn style_ansi256(code: u8) -> Style {
     Style::new().fg_color(Some(Color::Ansi256(Ansi256Color(code))))
 }
 
-fn timestamp() -> String {
-    Local::now().format("%Y/%m/%d %H:%M:%S%.3f").to_string()
+fn timestamp_parts() -> (String, String, String) {
+    let now = Local::now();
+    (
+        now.format("%Y/").to_string(),
+        now.format("%m/%d").to_string(),
+        now.format(" %H:%M:%S%.3f").to_string(),
+    )
 }

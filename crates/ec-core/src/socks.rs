@@ -12,11 +12,17 @@ pub fn serve(bind_addr: &str, fallback_proxy: Option<&str>) -> EcResult<()> {
     let listener = TcpListener::bind(&normalized)
         .map_err(|e| EcError::Runtime(format!("socks bind failed on {bind_addr}: {e}")))?;
     if let Some(proxy) = fallback_proxy.as_ref() {
-        output::info(Scope::App, format!("fallback: proxy to {}", proxy.url));
+        output::info(
+            Scope::App,
+            format!("fallback: proxy to {}", output::value(proxy.url.as_str())),
+        );
     } else {
         output::info(Scope::App, "fallback: direct");
     }
-    output::info(Scope::App, format!("socks listening on {normalized}"));
+    output::info(
+        Scope::App,
+        format!("socks listening on {}", output::value(normalized.as_str())),
+    );
 
     let accept_fallback = fallback_proxy.clone();
     thread::spawn(move || {
@@ -85,7 +91,10 @@ fn handle_client(mut client: TcpStream, fallback_proxy: Option<&FallbackProxy>) 
             let dial = target_addr(&planned_target);
             if let Some(proxy) = fallback_proxy {
                 RouteDecision {
-                    line: format!("{target_display} -> fallback -> {}", proxy.url),
+                    line: format!(
+                        "{target_display} -> fallback -> {}",
+                        output::value(proxy.url.as_str())
+                    ),
                     path: format!("fallback -> {} reason={reason}", proxy.url),
                     transport: RouteTransport::Proxy(proxy.clone(), target.clone()),
                 }

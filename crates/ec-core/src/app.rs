@@ -16,7 +16,10 @@ impl EasyConnectApp {
         crate::netstack::validate_netstack_preconditions()?;
 
         let twf_id = crate::auth::login(&self.config)?;
-        output::info(Scope::Login, format!("session id acquired: {twf_id}"));
+        output::success(
+            Scope::Login,
+            format!("session id acquired: {}", output::value(twf_id.as_str())),
+        );
         match crate::route_table::fetch_route_table(&self.config.server, &twf_id) {
             Ok(table) => {
                 let install = crate::routing::install_route_table(table)?;
@@ -24,7 +27,8 @@ impl EasyConnectApp {
                     Scope::App,
                     format!(
                         "route table loaded: {} rules, {} dns records",
-                        install.rule_count, install.dns_record_count
+                        output::value(install.rule_count.to_string()),
+                        output::value(install.dns_record_count.to_string())
                     ),
                 );
             }
@@ -38,16 +42,16 @@ impl EasyConnectApp {
         }
         output::info(Scope::Agent, "fetching agent token...");
         let agent_token = crate::token::fetch_agent_token(&self.config.server, &twf_id)?;
-        output::info(Scope::Agent, "agent token acquired");
+        output::success(Scope::Agent, "agent token acquired");
         let token = format!("{agent_token}{twf_id}");
         output::info(Scope::Protocol, "querying assigned IP...");
         let assigned_ip = crate::protocol::query_assigned_ip(&self.config.server, &token)?;
-        output::info(
+        output::success(
             Scope::Protocol,
-            format!("assigned IP: {}", format_ipv4(assigned_ip)),
+            format!("assigned IP: {}", output::value(format_ipv4(assigned_ip))),
         );
         crate::protocol::start_tunnel_runtime(&self.config.server, &token, assigned_ip)?;
-        output::info(Scope::Protocol, "tunnel established");
+        output::success(Scope::Protocol, "tunnel established");
         crate::netstack::start_runtime(assigned_ip)?;
         crate::socks::serve(
             &self.config.socks_bind,

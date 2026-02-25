@@ -78,9 +78,9 @@ pub fn start_tunnel_runtime(server: &str, token: &str, assigned_ip: [u8; 4]) -> 
     ];
 
     let rx_stream = open_data_stream(&authority, &host, &token_arr, &ip_rev, StreamProfile::Rx)?;
-    output::info(Scope::Protocol, "RX handshake successful");
+    output::success(Scope::Protocol, "RX handshake successful");
     let tx_stream = open_data_stream(&authority, &host, &token_arr, &ip_rev, StreamProfile::Tx)?;
-    output::info(Scope::Protocol, "TX handshake successful");
+    output::success(Scope::Protocol, "TX handshake successful");
 
     let (tx_sender, tx_receiver) = mpsc::channel::<Vec<u8>>();
     let (rx_sender, rx_receiver) = mpsc::channel::<Vec<u8>>();
