@@ -1,5 +1,6 @@
 use anstyle::{Ansi256Color, Color, Style};
 use chrono::Local;
+use std::fmt::{Display, Formatter, Result as FmtResult};
 
 #[derive(Clone, Copy)]
 pub enum Scope {
@@ -18,6 +19,17 @@ pub enum Level {
     Success,
     Warn,
     Error,
+}
+
+pub struct Styled<T> {
+    style: Style,
+    value: T,
+}
+
+impl<T: Display> Display for Styled<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        write!(f, "{}{}{:#}", self.style, self.value, self.style)
+    }
 }
 
 impl Scope {
@@ -47,47 +59,49 @@ impl Scope {
     }
 }
 
-pub fn info(scope: Scope, message: impl AsRef<str>) {
-    log(Level::Info, scope, message.as_ref());
+pub fn info(scope: Scope, message: impl Display) {
+    log(Level::Info, scope, message);
 }
 
-pub fn warn(scope: Scope, message: impl AsRef<str>) {
-    log(Level::Warn, scope, message.as_ref());
+pub fn warn(scope: Scope, message: impl Display) {
+    log(Level::Warn, scope, message);
 }
 
-pub fn error(scope: Scope, message: impl AsRef<str>) {
-    log(Level::Error, scope, message.as_ref());
+pub fn error(scope: Scope, message: impl Display) {
+    log(Level::Error, scope, message);
 }
 
-pub fn success(scope: Scope, message: impl AsRef<str>) {
-    log(Level::Success, scope, message.as_ref());
+pub fn success(scope: Scope, message: impl Display) {
+    log(Level::Success, scope, message);
 }
 
-pub fn value(value: impl AsRef<str>) -> String {
-    let value_style = style_ansi256(183);
-    format!("{value_style}{}{value_style:#}", value.as_ref())
+pub fn value<T: Display>(value: T) -> Styled<T> {
+    styled(style_ansi256(183), value)
 }
 
-pub fn weak(value: impl AsRef<str>) -> String {
-    let weak_style = style_ansi256(95);
-    format!("{weak_style}{}{weak_style:#}", value.as_ref())
+pub fn weak<T: Display>(value: T) -> Styled<T> {
+    styled(style_ansi256(95), value)
 }
 
-pub fn route_label(label: &str) -> String {
+pub fn route_label<'a>(label: &'a str) -> Styled<&'a str> {
     let style = match label {
         "remote" => style_ansi256(81),
         "fallback" => style_ansi256(215),
         "direct" => style_ansi256(150),
         _ => style_ansi256(250),
     };
-    format!("{style}{label}{style:#}")
+    styled(style, label)
 }
 
-fn log(level: Level, scope: Scope, message: &str) {
+fn styled<T>(style: Style, value: T) -> Styled<T> {
+    Styled { style, value }
+}
+
+fn log(level: Level, scope: Scope, message: impl Display) {
     emit(level, scope, message);
 }
 
-fn emit(level: Level, scope: Scope, message: &str) {
+fn emit(level: Level, scope: Scope, message: impl Display) {
     let (year, short_date, clock) = timestamp_parts();
     let year_style = style_ansi256(240);
     let short_date_style = style_ansi256(244);

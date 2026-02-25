@@ -18,22 +18,22 @@ impl EasyConnectApp {
         let twf_id = crate::auth::login(&self.config)?;
         output::success(
             Scope::Login,
-            format!("session id acquired: {}", output::value(twf_id.as_str())),
+            format_args!("session id acquired: {}", output::value(twf_id.as_str())),
         );
         match crate::route_table::fetch_route_table(&self.config.server, &twf_id) {
             Ok(table) => {
                 let install = crate::routing::install_route_table(table)?;
                 output::info(
                     Scope::App,
-                    format!(
+                    format_args!(
                         "route table loaded: {} rules, {} dns records",
-                        output::value(install.rule_count.to_string()),
-                        output::value(install.dns_record_count.to_string())
+                        output::value(install.rule_count),
+                        output::value(install.dns_record_count)
                     ),
                 );
             }
             Err(err) => {
-                output::warn(Scope::App, format!("route table unavailable: {err}"));
+                output::warn(Scope::App, format_args!("route table unavailable: {err}"));
                 output::warn(
                     Scope::App,
                     "split routing is disabled; fallback will use tunnel",
@@ -48,7 +48,7 @@ impl EasyConnectApp {
         let assigned_ip = crate::protocol::query_assigned_ip(&self.config.server, &token)?;
         output::success(
             Scope::Protocol,
-            format!("assigned IP: {}", output::value(format_ipv4(assigned_ip))),
+            format_args!("assigned IP: {}", output::value(format_ipv4(assigned_ip))),
         );
         crate::protocol::start_tunnel_runtime(&self.config.server, &token, assigned_ip)?;
         output::success(Scope::Protocol, "tunnel established");

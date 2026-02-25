@@ -12,7 +12,7 @@ pub fn login(config: &AppConfig) -> EcResult<String> {
     let client = build_http_client()?;
     output::info(
         Scope::Login,
-        format!("connecting to {}...", output::value(config.server.as_str())),
+        format_args!("connecting to {}...", output::value(config.server.as_str())),
     );
 
     let login_auth_url = format!("{base_url}/por/login_auth.csp?apiversion=1");

@@ -49,7 +49,7 @@ pub fn start_runtime(assigned_ip: [u8; 4]) -> EcResult<()> {
 
     thread::spawn(move || {
         if let Err(err) = run_netstack_loop(assigned_ip, control_rx) {
-            output::error(Scope::Netstack, format!("fatal error: {err}"));
+            output::error(Scope::Netstack, format_args!("fatal error: {err}"));
         }
     });
 

@@ -44,7 +44,7 @@ fn main() {
     ) {
         Ok(cfg) => cfg,
         Err(err) => {
-            output::error(Scope::Cli, format!("config error: {err}"));
+            output::error(Scope::Cli, format_args!("config error: {err}"));
             std::process::exit(2);
         }
     };
@@ -52,7 +52,7 @@ fn main() {
     let app = EasyConnectApp::new(config);
 
     if let Err(err) = app.run() {
-        output::error(Scope::Cli, format!("runtime error: {err}"));
+        output::error(Scope::Cli, format_args!("runtime error: {err}"));
         std::process::exit(1);
     }
 }

@@ -15,14 +15,14 @@ pub fn serve(bind_addr: &str, fallback_proxy: Option<&str>) -> EcResult<()> {
     if let Some(proxy) = fallback_proxy.as_ref() {
         output::info(
             Scope::App,
-            format!("fallback: proxy to {}", output::value(proxy.url.as_str())),
+            format_args!("fallback: proxy to {}", output::value(proxy.url.as_str())),
         );
     } else {
         output::info(Scope::App, "fallback: direct");
     }
     output::info(
         Scope::App,
-        format!("socks listening on {}", output::value(normalized.as_str())),
+        format_args!("socks listening on {}", output::value(normalized.as_str())),
     );
 
     let accept_fallback = fallback_proxy.clone();
@@ -31,7 +31,7 @@ pub fn serve(bind_addr: &str, fallback_proxy: Option<&str>) -> EcResult<()> {
             let (stream, _peer) = match listener.accept() {
                 Ok(v) => v,
                 Err(err) => {
-                    output::warn(Scope::Socks, format!("accept failed: {err}"));
+                    output::warn(Scope::Socks, format_args!("accept failed: {err}"));
                     continue;
                 }
             };
