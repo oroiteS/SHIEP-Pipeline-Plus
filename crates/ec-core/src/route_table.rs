@@ -143,20 +143,39 @@ fn parse_rc(
     reader: &Reader<&[u8]>,
     rules: &mut Vec<RouteRule>,
 ) -> EcResult<()> {
-    let Some(id_raw) = attr_value(e, reader, b"id")? else {
-        return Ok(());
-    };
-    let Some(host_raw) = attr_value(e, reader, b"host")? else {
-        return Ok(());
-    };
-    let Some(port_raw) = attr_value(e, reader, b"port")? else {
-        return Ok(());
-    };
+    let mut id_raw: Option<String> = None;
+    let mut host_raw: Option<String> = None;
+    let mut port_raw: Option<String> = None;
+    let mut name: Option<String> = None;
 
+    for attr in e.attributes().with_checks(false) {
+        let attr = attr.map_err(|e| EcError::Runtime(format!("xml attr parse failed: {e}")))?;
+        let value = attr
+            .decode_and_unescape_value(reader.decoder())
+            .map_err(|e| EcError::Runtime(format!("xml attr decode failed: {e}")))?
+            .into_owned();
+        match attr.key.as_ref() {
+            b"id" => id_raw = Some(value),
+            b"host" => host_raw = Some(value),
+            b"port" => port_raw = Some(value),
+            b"name" => name = Some(value),
+            _ => {}
+        }
+    }
+
+    let Some(id_raw) = id_raw else {
+        return Ok(());
+    };
+    let Some(host_raw) = host_raw else {
+        return Ok(());
+    };
+    let Some(port_raw) = port_raw else {
+        return Ok(());
+    };
     let rc_id = id_raw
         .parse::<i32>()
         .map_err(|e| EcError::Runtime(format!("invalid rc id '{id_raw}': {e}")))?;
-    let name = attr_value(e, reader, b"name")?.unwrap_or_default();
+    let name = name.unwrap_or_default();
     let hosts = split_hosts(&host_raw);
     let ports = split_ports(&port_raw);
     if hosts.is_empty() || ports.is_empty() {
@@ -183,7 +202,22 @@ fn parse_dns(
     dns_servers: &mut Vec<String>,
     dns_records: &mut Vec<DnsRecord>,
 ) -> EcResult<()> {
-    if let Some(servers) = attr_value(e, reader, b"dnsserver")? {
+    let mut servers: Option<String> = None;
+    let mut data: Option<String> = None;
+    for attr in e.attributes().with_checks(false) {
+        let attr = attr.map_err(|e| EcError::Runtime(format!("xml attr parse failed: {e}")))?;
+        let value = attr
+            .decode_and_unescape_value(reader.decoder())
+            .map_err(|e| EcError::Runtime(format!("xml attr decode failed: {e}")))?
+            .into_owned();
+        match attr.key.as_ref() {
+            b"dnsserver" => servers = Some(value),
+            b"data" => data = Some(value),
+            _ => {}
+        }
+    }
+
+    if let Some(servers) = servers {
         for token in servers.split(';') {
             let s = token.trim();
             if !s.is_empty() {
@@ -191,47 +225,30 @@ fn parse_dns(
             }
         }
     }
-    if let Some(data) = attr_value(e, reader, b"data")? {
+    if let Some(data) = data {
         for token in data.split(';') {
             let item = token.trim();
             if item.is_empty() {
                 continue;
             }
-            let mut parts = item.splitn(3, ':');
-            let Some(id_raw) = parts.next() else {
-                continue;
-            };
-            let Some(host_raw) = parts.next() else {
-                continue;
-            };
-            let Some(ip_raw) = parts.next() else {
-                continue;
-            };
-            let Ok(rc_id) = id_raw.parse::<i32>() else {
-                continue;
-            };
-            let host = normalize_host_token(host_raw);
-            let ip = ip_raw.trim().to_string();
-            if host.is_empty() || ip.is_empty() {
-                continue;
+            if let Some(record) = parse_dns_record_item(item) {
+                dns_records.push(record);
             }
-            dns_records.push(DnsRecord { rc_id, host, ip });
         }
     }
     Ok(())
 }
 
-fn attr_value(e: &BytesStart<'_>, reader: &Reader<&[u8]>, key: &[u8]) -> EcResult<Option<String>> {
-    for attr in e.attributes().with_checks(false) {
-        let attr = attr.map_err(|e| EcError::Runtime(format!("xml attr parse failed: {e}")))?;
-        if attr.key == QName(key) {
-            let value = attr
-                .decode_and_unescape_value(reader.decoder())
-                .map_err(|e| EcError::Runtime(format!("xml attr decode failed: {e}")))?;
-            return Ok(Some(value.into_owned()));
-        }
+fn parse_dns_record_item(item: &str) -> Option<DnsRecord> {
+    let (id_raw, rest) = item.split_once(':')?;
+    let (host_raw, ip_raw) = rest.rsplit_once(':')?;
+    let rc_id = id_raw.parse::<i32>().ok()?;
+    let host = normalize_host_token(host_raw);
+    let ip = ip_raw.trim().to_string();
+    if host.is_empty() || ip.is_empty() {
+        return None;
     }
-    Ok(None)
+    Some(DnsRecord { rc_id, host, ip })
 }
 
 fn split_hosts(raw: &str) -> Vec<String> {
@@ -279,7 +296,7 @@ fn split_ports(raw: &str) -> Vec<PortRange> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_route_table_xml, split_hosts, split_ports};
+    use super::{parse_dns_record_item, parse_route_table_xml, split_hosts, split_ports};
 
     #[test]
     fn split_hosts_normalizes_scheme_and_path() {
@@ -319,5 +336,20 @@ mod tests {
         assert_eq!(table.dns_records.len(), 1);
         assert_eq!(table.dns_records[0].host, "ids.shiep.edu.cn");
         assert_eq!(table.dns_records[0].ip, "10.166.35.11");
+    }
+
+    #[test]
+    fn parse_dns_record_item_parses_valid_entry() {
+        let rec = parse_dns_record_item("205:https://ids.shiep.edu.cn/path:10.166.35.11").unwrap();
+        assert_eq!(rec.rc_id, 205);
+        assert_eq!(rec.host, "ids.shiep.edu.cn");
+        assert_eq!(rec.ip, "10.166.35.11");
+    }
+
+    #[test]
+    fn parse_dns_record_item_rejects_invalid_entry() {
+        assert!(parse_dns_record_item("bad").is_none());
+        assert!(parse_dns_record_item("not-int:host:10.0.0.1").is_none());
+        assert!(parse_dns_record_item("1::10.0.0.1").is_none());
     }
 }

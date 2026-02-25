@@ -59,7 +59,7 @@ pub fn plan_target(host: &str, port: u16) -> EcResult<RoutePlan> {
 #[derive(Debug, Clone)]
 struct RouteMatcher {
     rules: Vec<CompiledRule>,
-    dns_map: HashMap<(i32, String), Vec<Ipv4Addr>>,
+    dns_map: HashMap<i32, HashMap<String, Vec<Ipv4Addr>>>,
     dns_records: usize,
 }
 
@@ -97,7 +97,7 @@ impl RouteMatcher {
             }
         }
 
-        let mut dns_map = HashMap::<(i32, String), Vec<Ipv4Addr>>::new();
+        let mut dns_map = HashMap::<i32, HashMap<String, Vec<Ipv4Addr>>>::new();
         let mut seen_dns = HashSet::<(i32, String, Ipv4Addr)>::new();
         for rec in table.dns_records {
             let host = normalize_domain(&rec.host);
@@ -110,10 +110,19 @@ impl RouteMatcher {
             if !seen_dns.insert((rec.rc_id, host.clone(), ip)) {
                 continue;
             }
-            dns_map.entry((rec.rc_id, host)).or_default().push(ip);
+            dns_map
+                .entry(rec.rc_id)
+                .or_default()
+                .entry(host)
+                .or_default()
+                .push(ip);
         }
 
-        let dns_records = dns_map.values().map(Vec::len).sum();
+        let dns_records = dns_map
+            .values()
+            .flat_map(HashMap::values)
+            .map(Vec::len)
+            .sum();
         Ok(Self {
             rules,
             dns_map,
@@ -141,7 +150,10 @@ impl RouteMatcher {
                     };
                 }
                 TargetKind::Domain(domain) => {
-                    if let Some(ipv4s) = self.dns_map.get(&(rule.rc_id, domain.clone()))
+                    if let Some(ipv4s) = self
+                        .dns_map
+                        .get(&rule.rc_id)
+                        .and_then(|domains| domains.get(domain))
                         && let Some(ip) = ipv4s.first()
                     {
                         return RoutePlan::Remote {
@@ -353,8 +365,11 @@ mod tests {
         };
         let matcher = RouteMatcher::from_table(table).unwrap();
         assert_eq!(matcher.dns_records, 2);
-        let key = (205, "ids.shiep.edu.cn".to_string());
-        let ips = matcher.dns_map.get(&key).unwrap();
+        let ips = matcher
+            .dns_map
+            .get(&205)
+            .and_then(|domains| domains.get("ids.shiep.edu.cn"))
+            .unwrap();
         assert_eq!(ips.len(), 2);
         assert_eq!(ips[0].to_string(), "10.166.35.11");
         assert_eq!(ips[1].to_string(), "10.166.35.12");

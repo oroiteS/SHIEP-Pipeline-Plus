@@ -83,7 +83,7 @@ pub fn weak<T: Display>(value: T) -> Styled<T> {
     styled(style_ansi256(95), value)
 }
 
-pub fn route_label<'a>(label: &'a str) -> Styled<&'a str> {
+pub fn route_label(label: &str) -> Styled<&str> {
     let style = match label {
         "remote" => style_ansi256(81),
         "fallback" => style_ansi256(215),

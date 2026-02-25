@@ -97,20 +97,14 @@ pub fn start_tunnel_runtime(server: &str, token: &str, assigned_ip: [u8; 4]) -> 
             rx_stream,
             rx_sender,
         );
-        let detail = match result {
-            Ok(()) => "rx worker exited unexpectedly".to_string(),
-            Err(err) => format!("rx worker stopped: {err}"),
-        };
+        let detail = worker_exit_detail(StreamProfile::Rx, result);
         output::warn(Scope::Protocol, &detail);
         record_tunnel_fatal_reason(detail);
     });
 
     thread::spawn(move || {
         let result = tx_worker_loop(authority, host, token_arr, ip_rev, tx_stream, tx_receiver);
-        let detail = match result {
-            Ok(()) => "tx worker exited unexpectedly".to_string(),
-            Err(err) => format!("tx worker stopped: {err}"),
-        };
+        let detail = worker_exit_detail(StreamProfile::Tx, result);
         output::warn(Scope::Protocol, &detail);
         record_tunnel_fatal_reason(detail);
     });
@@ -123,27 +117,21 @@ fn install_runtime_channels(
     rx_receiver: mpsc::Receiver<Vec<u8>>,
 ) -> EcResult<()> {
     let rx_holder = RX_PACKET_RECEIVER.get_or_init(|| Mutex::new(None));
-    {
-        let guard = rx_holder
-            .lock()
-            .map_err(|_| EcError::Runtime("rx packet receiver mutex poisoned".to_string()))?;
-        if guard.is_some() {
-            return Err(EcError::Runtime(RUNTIME_ALREADY_STARTED.to_string()));
-        }
-    }
-
-    TX_PACKET_SENDER
-        .set(tx_sender)
-        .map_err(|_| EcError::Runtime(RUNTIME_ALREADY_STARTED.to_string()))?;
-
     let mut guard = rx_holder
         .lock()
         .map_err(|_| EcError::Runtime("rx packet receiver mutex poisoned".to_string()))?;
-    if guard.is_some() {
-        return Err(EcError::Runtime(RUNTIME_ALREADY_STARTED.to_string()));
+    if guard.is_some() || TX_PACKET_SENDER.get().is_some() {
+        return Err(runtime_already_started_err());
     }
+    TX_PACKET_SENDER
+        .set(tx_sender)
+        .map_err(|_| runtime_already_started_err())?;
     *guard = Some(rx_receiver);
     Ok(())
+}
+
+fn runtime_already_started_err() -> EcError {
+    EcError::Runtime(RUNTIME_ALREADY_STARTED.to_string())
 }
 
 pub fn send_tunnel_packet(packet: Vec<u8>) -> EcResult<()> {
@@ -182,8 +170,8 @@ pub(crate) fn wait_tunnel_fatal_reason() -> String {
         Err(_) => return "tunnel fatal reason mutex poisoned".to_string(),
     };
     loop {
-        if let Some(reason) = guard.clone() {
-            return reason;
+        if let Some(reason) = guard.as_ref() {
+            return reason.clone();
         }
         guard = match state.cv.wait(guard) {
             Ok(guard) => guard,
@@ -206,6 +194,13 @@ fn record_tunnel_fatal_reason(reason: String) {
     {
         *guard = Some(reason);
         state.cv.notify_all();
+    }
+}
+
+fn worker_exit_detail(profile: StreamProfile, result: EcResult<()>) -> String {
+    match result {
+        Ok(()) => format!("{} worker exited unexpectedly", profile.label()),
+        Err(err) => format!("{} worker stopped: {err}", profile.label()),
     }
 }
 
