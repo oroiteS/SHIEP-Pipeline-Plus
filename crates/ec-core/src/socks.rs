@@ -158,7 +158,7 @@ fn handle_client(mut client: TcpStream, fallback_proxy: Option<&FallbackProxy>) 
             })
         }
         RouteTransport::Proxy(proxy, target) => {
-            let conn = connect_via_socks5_proxy(&proxy.addr, &target).map_err(|e| {
+            let conn = connect_via_proxy(&proxy, &target).map_err(|e| {
                 EcError::Runtime(format!("{target_display} -> {} failed: {e}", route.path))
             })?;
             write_reply(&mut client, 0x00).map_err(|e| {
@@ -168,6 +168,15 @@ fn handle_client(mut client: TcpStream, fallback_proxy: Option<&FallbackProxy>) 
                 EcError::Runtime(format!("{target_display} -> {} failed: {e}", route.path))
             })
         }
+    }
+}
+
+fn connect_via_proxy(proxy: &FallbackProxy, target: &ConnectTarget) -> EcResult<TcpStream> {
+    match proxy.kind {
+        FallbackProxyKind::Socks5 | FallbackProxyKind::Socks5h => {
+            connect_via_socks5_proxy(&proxy.addr, target)
+        }
+        FallbackProxyKind::Http => connect_via_http_connect_proxy(&proxy.addr, target),
     }
 }
 
@@ -369,6 +378,14 @@ struct RouteDecision {
 struct FallbackProxy {
     addr: String,
     url: String,
+    kind: FallbackProxyKind,
+}
+
+#[derive(Clone, Copy)]
+enum FallbackProxyKind {
+    Socks5,
+    Socks5h,
+    Http,
 }
 
 fn target_addr(target: &str) -> String {
@@ -391,21 +408,32 @@ fn parse_fallback_proxy(raw: Option<&str>) -> EcResult<Option<FallbackProxy>> {
     let Some(raw) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
         return Ok(None);
     };
-    let (addr, url) = if let Some(stripped) = raw.strip_prefix("socks5://") {
-        (stripped.trim(), raw.to_string())
+    let (addr, url, kind) = if let Some(stripped) = raw.strip_prefix("socks5://") {
+        (stripped.trim(), raw.to_string(), FallbackProxyKind::Socks5)
     } else if let Some(stripped) = raw.strip_prefix("socks5h://") {
-        (stripped.trim(), raw.to_string())
+        (stripped.trim(), raw.to_string(), FallbackProxyKind::Socks5h)
+    } else if let Some(stripped) = raw.strip_prefix("http://") {
+        (stripped.trim(), raw.to_string(), FallbackProxyKind::Http)
+    } else if raw.contains("://") {
+        return Err(EcError::InvalidConfig(
+            "fallback is invalid: only socks5://, socks5h:// and http:// are supported",
+        ));
     } else {
-        (raw.trim(), format!("socks5://{}", raw.trim()))
+        (
+            raw.trim(),
+            format!("socks5h://{}", raw.trim()),
+            FallbackProxyKind::Socks5h,
+        )
     };
     if addr.is_empty() {
         return Err(EcError::InvalidConfig(
-            "fallback-proxy is invalid: empty proxy address",
+            "fallback is invalid: empty proxy address",
         ));
     }
     Ok(Some(FallbackProxy {
         addr: addr.to_string(),
         url,
+        kind,
     }))
 }
 
@@ -462,6 +490,73 @@ fn connect_via_socks5_proxy(proxy_addr: &str, target: &ConnectTarget) -> EcResul
 
     consume_socks5_addr_and_port(&mut stream, head[3])?;
     Ok(stream)
+}
+
+fn connect_via_http_connect_proxy(proxy_addr: &str, target: &ConnectTarget) -> EcResult<TcpStream> {
+    let mut stream = TcpStream::connect(proxy_addr).map_err(|e| {
+        EcError::Runtime(format!(
+            "connect fallback http proxy {proxy_addr} failed: {e}"
+        ))
+    })?;
+    let authority = target.to_socket_target();
+    let request = format!(
+        "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nConnection: keep-alive\r\nProxy-Connection: keep-alive\r\n\r\n"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| EcError::Runtime(format!("http proxy connect request write failed: {e}")))?;
+    let reply_head = read_http_proxy_head(&mut stream)?;
+    ensure_http_connect_success(reply_head.as_str())?;
+    Ok(stream)
+}
+
+fn read_http_proxy_head(stream: &mut TcpStream) -> EcResult<String> {
+    let mut buf = Vec::with_capacity(256);
+    loop {
+        let mut one = [0u8; 1];
+        let n = stream
+            .read(&mut one)
+            .map_err(|e| EcError::Runtime(format!("http proxy connect reply read failed: {e}")))?;
+        if n == 0 {
+            return Err(EcError::Runtime(
+                "http proxy connect reply is empty".to_string(),
+            ));
+        }
+        buf.push(one[0]);
+        if buf.len() >= 4 && &buf[buf.len() - 4..] == b"\r\n\r\n" {
+            break;
+        }
+        if buf.len() > 16 * 1024 {
+            return Err(EcError::Runtime(
+                "http proxy connect reply header is too large".to_string(),
+            ));
+        }
+    }
+    Ok(String::from_utf8_lossy(&buf).to_string())
+}
+
+fn ensure_http_connect_success(reply_head: &str) -> EcResult<()> {
+    let status_line = reply_head.lines().next().unwrap_or_default().trim();
+    if !status_line.starts_with("HTTP/") {
+        return Err(EcError::Runtime(format!(
+            "invalid http proxy connect reply: {status_line}"
+        )));
+    }
+    let code = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|v| v.parse::<u16>().ok())
+        .ok_or_else(|| {
+            EcError::Runtime(format!(
+                "invalid http proxy connect status line: {status_line}"
+            ))
+        })?;
+    if code != 200 {
+        return Err(EcError::Runtime(format!(
+            "http proxy connect rejected: {status_line}"
+        )));
+    }
+    Ok(())
 }
 
 fn append_socks5_addr(buf: &mut Vec<u8>, host: &str) -> EcResult<()> {
@@ -552,7 +647,9 @@ impl std::fmt::Display for ConnectTarget {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConnectTarget, normalize_bind_addr, parse_fallback_proxy};
+    use super::{
+        ConnectTarget, ensure_http_connect_success, normalize_bind_addr, parse_fallback_proxy,
+    };
 
     #[test]
     fn normalize_bind_addr_expands_port_only() {
@@ -595,6 +692,44 @@ mod tests {
         let parsed = parse_fallback_proxy(Some("127.0.0.1:7890")).unwrap();
         let proxy = parsed.unwrap();
         assert_eq!(proxy.addr, "127.0.0.1:7890");
-        assert_eq!(proxy.url, "socks5://127.0.0.1:7890");
+        assert_eq!(proxy.url, "socks5h://127.0.0.1:7890");
+    }
+
+    #[test]
+    fn parse_fallback_proxy_accepts_http_scheme() {
+        let parsed = parse_fallback_proxy(Some("http://127.0.0.1:8080")).unwrap();
+        let proxy = parsed.unwrap();
+        assert_eq!(proxy.addr, "127.0.0.1:8080");
+        assert_eq!(proxy.url, "http://127.0.0.1:8080");
+    }
+
+    #[test]
+    fn parse_fallback_proxy_rejects_unsupported_scheme() {
+        let err = match parse_fallback_proxy(Some("https://127.0.0.1:8443")) {
+            Ok(_) => panic!("expected unsupported fallback scheme to fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("only socks5://, socks5h:// and http:// are supported")
+        );
+    }
+
+    #[test]
+    fn http_connect_success_accepts_200() {
+        ensure_http_connect_success("HTTP/1.1 200 Connection Established\r\n\r\n").unwrap();
+    }
+
+    #[test]
+    fn http_connect_success_rejects_non_200() {
+        let err = ensure_http_connect_success("HTTP/1.1 407 Proxy Authentication Required\r\n\r\n")
+            .unwrap_err();
+        assert!(err.to_string().contains("http proxy connect rejected"));
+    }
+
+    #[test]
+    fn http_connect_success_rejects_non_http_response() {
+        let err = ensure_http_connect_success("HELLO\r\n\r\n").unwrap_err();
+        assert!(err.to_string().contains("invalid http proxy connect reply"));
     }
 }
