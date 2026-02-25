@@ -1,4 +1,5 @@
 use crate::error::{EcError, EcResult};
+use crate::output::{self, Scope};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::tcp;
@@ -35,7 +36,7 @@ pub fn start_runtime(assigned_ip: [u8; 4]) -> EcResult<()> {
 
     thread::spawn(move || {
         if let Err(err) = run_netstack_loop(assigned_ip, tunnel_rx, control_rx) {
-            eprintln!("[NETSTACK] fatal error: {err}");
+            output::error(Scope::Netstack, format!("fatal error: {err}"));
         }
     });
 
@@ -392,7 +393,7 @@ impl TxToken for TunnelTxToken {
         let mut frame = vec![0u8; len];
         let out = f(&mut frame);
         if let Err(err) = crate::protocol::send_tunnel_packet(frame) {
-            eprintln!("[NETSTACK] send tunnel packet failed: {err}");
+            output::warn(Scope::Netstack, format!("send tunnel packet failed: {err}"));
         }
         out
     }

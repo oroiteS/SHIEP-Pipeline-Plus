@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anstream = "0.6.21"
+anstyle = "1.0.13"
 foreign-types = "0.3.2"
 hex = "0.4.3"
 openssl = "0.10.75"

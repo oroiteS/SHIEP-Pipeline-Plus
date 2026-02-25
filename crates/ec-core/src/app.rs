@@ -1,5 +1,6 @@
 use crate::config::AppConfig;
 use crate::error::EcResult;
+use crate::output::{self, Scope};
 
 pub struct EasyConnectApp {
     config: AppConfig,
@@ -15,18 +16,24 @@ impl EasyConnectApp {
         crate::netstack::validate_netstack_preconditions()?;
 
         let twf_id = crate::auth::login(&self.config)?;
-        eprintln!("[LOGIN] session id acquired: {twf_id}");
+        output::info(Scope::Login, format!("session id acquired: {twf_id}"));
         match crate::route_table::fetch_route_table(&self.config.server, &twf_id) {
             Ok(table) => {
                 let install = crate::routing::install_route_table(table)?;
-                eprintln!(
-                    "[APP] route table loaded: {} rules, {} dns records",
-                    install.rule_count, install.dns_record_count
+                output::info(
+                    Scope::App,
+                    format!(
+                        "route table loaded: {} rules, {} dns records",
+                        install.rule_count, install.dns_record_count
+                    ),
                 );
             }
             Err(err) => {
-                eprintln!("[WARN] route table unavailable: {err}");
-                eprintln!("[WARN] split routing is disabled; fallback will use tunnel");
+                output::warn(Scope::App, format!("route table unavailable: {err}"));
+                output::warn(
+                    Scope::App,
+                    "split routing is disabled; fallback will use tunnel",
+                );
             }
         }
         let agent_token = crate::token::fetch_agent_token(&self.config.server, &twf_id)?;

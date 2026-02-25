@@ -1,4 +1,5 @@
 use clap::{CommandFactory, FromArgMatches, Parser};
+use ec_core::output::{self, Scope};
 use ec_core::{AppConfig, EasyConnectApp};
 use std::path::Path;
 
@@ -43,7 +44,7 @@ fn main() {
     ) {
         Ok(cfg) => cfg,
         Err(err) => {
-            eprintln!("config error: {err}");
+            output::error(Scope::Cli, format!("config error: {err}"));
             std::process::exit(2);
         }
     };
@@ -51,7 +52,7 @@ fn main() {
     let app = EasyConnectApp::new(config);
 
     if let Err(err) = app.run() {
-        eprintln!("runtime error: {err}");
+        output::error(Scope::Cli, format!("runtime error: {err}"));
         std::process::exit(1);
     }
 }

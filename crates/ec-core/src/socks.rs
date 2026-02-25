@@ -1,4 +1,5 @@
 use crate::error::{EcError, EcResult};
+use crate::output::{self, Scope};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, TcpListener, TcpStream};
 use std::thread;
@@ -11,11 +12,11 @@ pub fn serve(bind_addr: &str, fallback_proxy: Option<&str>) -> EcResult<()> {
     let listener = TcpListener::bind(&normalized)
         .map_err(|e| EcError::Runtime(format!("socks bind failed on {bind_addr}: {e}")))?;
     if let Some(proxy) = fallback_proxy.as_ref() {
-        eprintln!("[APP] fallback: proxy to {}", proxy.url);
+        output::info(Scope::App, format!("fallback: proxy to {}", proxy.url));
     } else {
-        eprintln!("[APP] fallback: direct");
+        output::info(Scope::App, "fallback: direct");
     }
-    eprintln!("[APP] socks listening on {normalized}");
+    output::info(Scope::App, format!("socks listening on {normalized}"));
 
     loop {
         let (stream, _peer) = match listener.accept() {
@@ -25,7 +26,7 @@ pub fn serve(bind_addr: &str, fallback_proxy: Option<&str>) -> EcResult<()> {
         let fallback_proxy = fallback_proxy.clone();
         thread::spawn(move || {
             if let Err(err) = handle_client(stream, fallback_proxy.as_ref()) {
-                eprintln!("[SOCKS][ERROR] {err}");
+                output::error(Scope::Socks, err.to_string());
             }
         });
     }
@@ -96,7 +97,7 @@ fn handle_client(mut client: TcpStream, fallback_proxy: Option<&FallbackProxy>) 
             }
         }
     };
-    eprintln!("[SOCKS] {}", route.line);
+    output::info(Scope::Socks, &route.line);
 
     match route.transport {
         RouteTransport::Tunnel(dial_target) => {

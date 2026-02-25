@@ -1,5 +1,6 @@
 use crate::endpoint::parse_server;
 use crate::error::{EcError, EcResult};
+use crate::output::{self, Scope};
 use foreign_types::ForeignType;
 use openssl::error::ErrorStack;
 use openssl::ssl::{Ssl, SslConnector, SslMethod, SslOptions, SslStream, SslVerifyMode};
@@ -87,14 +88,14 @@ pub fn start_tunnel_runtime(server: &str, token: &str, assigned_ip: [u8; 4]) -> 
             rx_stream,
             rx_sender,
         ) {
-            eprintln!("[PROTOCOL] rx worker stopped: {err}");
+            output::warn(Scope::Protocol, format!("rx worker stopped: {err}"));
         }
     });
 
     thread::spawn(move || {
         if let Err(err) = tx_worker_loop(authority, host, token_arr, ip_rev, tx_stream, tx_receiver)
         {
-            eprintln!("[PROTOCOL] tx worker stopped: {err}");
+            output::warn(Scope::Protocol, format!("tx worker stopped: {err}"));
         }
     });
 
