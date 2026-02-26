@@ -50,14 +50,17 @@ pub fn serve(bind_addr: &str, fallback_proxy: Option<&str>) -> EcResult<()> {
             let fallback_proxy = accept_fallback.clone();
             thread::spawn(move || {
                 if let Err(err) = handle_client(stream, fallback_proxy.as_ref()) {
-                    output::error(Scope::Upstream, err.to_string());
+                    output::error(Scope::Upstream, crate::error::concise_error(err));
                 }
             });
         }
     });
 
     let reason = crate::protocol::wait_tunnel_fatal_reason();
-    Err(EcError::Runtime(format!("tunnel terminated: {reason}")))
+    Err(EcError::Runtime(format!(
+        "tunnel terminated: {}",
+        crate::error::concise_message(reason)
+    )))
 }
 
 fn normalize_bind_addr(bind_addr: &str) -> String {
@@ -118,7 +121,11 @@ fn handle_client(mut client: TcpStream, fallback_proxy: Option<&FallbackProxy>) 
                         output::route_label(RouteKind::Fallback),
                         output::value(proxy.url.as_str()),
                     ),
-                    path: format!("fallback -> {} reason={reason}", proxy.url),
+                    path: format!(
+                        "fallback -> {}; {}: {reason}",
+                        proxy.url,
+                        output::value("reason")
+                    ),
                     transport: RouteTransport::Proxy(proxy.clone(), target.clone()),
                 }
             } else {
@@ -128,7 +135,10 @@ fn handle_client(mut client: TcpStream, fallback_proxy: Option<&FallbackProxy>) 
                         output::route_label(RouteKind::Fallback),
                         output::route_label(RouteKind::Direct),
                     ),
-                    path: format!("fallback -> direct dial={dial} reason={reason}"),
+                    path: format!(
+                        "fallback -> direct dial={dial}; {}: {reason}",
+                        output::value("reason")
+                    ),
                     transport: RouteTransport::Direct(dial),
                 }
             }
@@ -174,7 +184,11 @@ fn route_runtime_error(
     route_path: &str,
     err: impl std::fmt::Display,
 ) -> EcError {
-    EcError::Runtime(format!("{target_display} -> {route_path} failed: {err}"))
+    let cause = crate::error::concise_error(err);
+    EcError::Runtime(format!(
+        "{target_display} -> {route_path}; {}: {cause}",
+        output::value("failed")
+    ))
 }
 
 fn write_connect_ok_reply(
@@ -515,9 +529,11 @@ fn connect_via_socks5_proxy(proxy_addr: &str, target: &ConnectTarget) -> EcResul
         )));
     }
     if head[1] != SOCKS_REP_SUCCEEDED {
+        let code = format!("0x{:02x}", head[1]);
         return Err(EcError::Runtime(format!(
-            "fallback proxy connect rejected with code: 0x{:02x}",
-            head[1]
+            "fallback proxy connect rejected with code: {} ({})",
+            output::value(code),
+            socks5_reply_name(head[1])
         )));
     }
 
@@ -592,6 +608,21 @@ fn ensure_http_connect_success(reply_head: &str) -> EcResult<()> {
         )));
     }
     Ok(())
+}
+
+fn socks5_reply_name(code: u8) -> &'static str {
+    match code {
+        0x00 => "succeeded",
+        0x01 => "general failure",
+        0x02 => "connection not allowed",
+        0x03 => "network unreachable",
+        0x04 => "host unreachable",
+        0x05 => "connection refused",
+        0x06 => "ttl expired",
+        0x07 => "command not supported",
+        0x08 => "address type not supported",
+        _ => "unknown reply code",
+    }
 }
 
 fn append_socks5_addr(buf: &mut Vec<u8>, host: &str) -> EcResult<()> {

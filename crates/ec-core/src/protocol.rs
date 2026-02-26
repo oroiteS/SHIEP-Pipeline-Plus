@@ -196,7 +196,11 @@ fn record_tunnel_fatal_reason(reason: String) {
 fn worker_exit_detail(profile: StreamProfile, result: EcResult<()>) -> String {
     match result {
         Ok(()) => format!("{} worker exited unexpectedly", profile.label()),
-        Err(err) => format!("{} worker stopped: {err}", profile.label()),
+        Err(err) => format!(
+            "{} worker stopped: {}",
+            profile.label(),
+            crate::error::concise_error(err)
+        ),
     }
 }
 
@@ -416,16 +420,23 @@ fn open_data_stream(
     let mut reply = [0u8; 1500];
     let n = read_stream_once(&mut stream, &mut reply, STREAM_HANDSHAKE_TIMEOUT)?;
     if n == 0 {
+        let op = format!("0x{op_code:02x}");
         return Err(EcError::Runtime(format!(
-            "{} stream handshake reply is empty or timed out (op=0x{op_code:02x})",
-            profile.label()
+            "{} stream handshake reply is empty or timed out; op: {}",
+            profile.label(),
+            output::value(op),
         )));
     }
     if reply[0] != expected_reply {
+        let expected = format!("0x{expected_reply:02x}");
+        let got = format!("0x{:02x}", reply[0]);
+        let op = format!("0x{op_code:02x}");
         return Err(EcError::Runtime(format!(
-            "unexpected {} stream handshake reply marker: expected 0x{expected_reply:02x}, got 0x{:02x} (op=0x{op_code:02x})",
+            "unexpected {} stream handshake reply marker; expected: {}; got: {}; op: {}",
             profile.label(),
-            reply[0],
+            output::value(expected),
+            output::value(got),
+            output::value(op),
         )));
     }
 

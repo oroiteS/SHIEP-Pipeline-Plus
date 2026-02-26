@@ -50,7 +50,10 @@ pub fn start_runtime(assigned_ip: [u8; 4]) -> EcResult<()> {
 
     thread::spawn(move || {
         if let Err(err) = run_netstack_loop(assigned_ip, control_rx) {
-            output::error(Scope::Netstack, format_args!("fatal error: {err}"));
+            output::error(
+                Scope::Netstack,
+                format_args!("fatal error: {}", crate::error::concise_error(err)),
+            );
         }
     });
 
@@ -446,7 +449,7 @@ impl TxToken for TunnelTxToken {
         let mut frame = vec![0u8; len];
         let out = f(&mut frame);
         if let Err(err) = crate::protocol::send_tunnel_packet(frame) {
-            let detail = err.to_string();
+            let detail = crate::error::concise_error(err);
             if detail.contains("sending on a closed channel") {
                 if !CLOSED_TUNNEL_WARNED.swap(true, Ordering::Relaxed) {
                     if let Some(reason) = crate::protocol::tunnel_fatal_reason() {
