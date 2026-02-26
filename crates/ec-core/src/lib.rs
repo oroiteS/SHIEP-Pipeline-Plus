@@ -6,6 +6,7 @@ pub mod output;
 mod auth;
 mod endpoint;
 mod netstack;
+mod netstack_device;
 mod protocol;
 mod protocol_session;
 mod protocol_wire;
