@@ -18,6 +18,11 @@ const SOCKS_REP_GENERAL_FAILURE: u8 = 0x01;
 const SOCKS_REP_SUCCEEDED: u8 = 0x00;
 const SOCKS_REP_CMD_NOT_SUPPORTED: u8 = 0x07;
 const SOCKS_REP_ATYP_NOT_SUPPORTED: u8 = 0x08;
+const FALLBACK_SCHEME_SOCKS5: &str = "socks5";
+const FALLBACK_SCHEME_SOCKS5H: &str = "socks5h";
+const FALLBACK_SCHEME_HTTP: &str = "http";
+const FALLBACK_SCHEME_ERROR: &str =
+    "fallback is invalid: only socks5://, socks5h:// and http:// are supported";
 
 pub fn serve(bind_addr: &str, fallback_proxy: Option<&str>) -> EcResult<()> {
     let normalized = normalize_bind_addr(bind_addr);
@@ -262,10 +267,7 @@ fn relay_direct_with_reply(
 }
 
 fn connect_via_proxy(proxy: &FallbackProxy, target: &ConnectTarget) -> EcResult<TcpStream> {
-    match proxy.kind {
-        FallbackProxyKind::Socks5 => connect_via_socks5_proxy(&proxy.addr, target),
-        FallbackProxyKind::Http => connect_via_http_connect_proxy(&proxy.addr, target),
-    }
+    proxy.connect(target)
 }
 
 fn negotiate_method(client: &mut TcpStream) -> EcResult<()> {
@@ -503,47 +505,78 @@ fn format_socket_target(host: &str, port: impl std::fmt::Display) -> String {
 }
 
 fn parse_fallback_proxy(raw: Option<&str>) -> EcResult<Option<FallbackProxy>> {
-    let Some(raw) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
-        return Ok(None);
-    };
-    let (addr, url, kind) = if let Some(stripped) = raw.strip_prefix("socks5://") {
-        (stripped.trim(), raw.to_string(), FallbackProxyKind::Socks5)
-    } else if let Some(stripped) = raw.strip_prefix("socks5h://") {
-        (stripped.trim(), raw.to_string(), FallbackProxyKind::Socks5)
-    } else if let Some(stripped) = raw.strip_prefix("http://") {
-        (stripped.trim(), raw.to_string(), FallbackProxyKind::Http)
-    } else if raw.contains("://") {
-        return Err(EcError::InvalidConfig(
-            "fallback is invalid: only socks5://, socks5h:// and http:// are supported",
-        ));
-    } else {
-        (
-            raw.trim(),
-            format!("socks5h://{}", raw.trim()),
-            FallbackProxyKind::Socks5,
-        )
-    };
-    if addr.is_empty() {
-        return Err(EcError::InvalidConfig(
-            "fallback is invalid: empty proxy address",
-        ));
-    }
-    Ok(Some(FallbackProxy {
-        addr: addr.to_string(),
-        url,
-        kind,
-    }))
+    raw.map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(parse_fallback_proxy_value)
+        .transpose()
 }
 
 fn is_ip_host(host: &str) -> bool {
     host.trim().parse::<Ipv4Addr>().is_ok() || host.trim().parse::<Ipv6Addr>().is_ok()
 }
 
-fn connect_via_socks5_proxy(proxy_addr: &str, target: &ConnectTarget) -> EcResult<TcpStream> {
-    let mut stream = TcpStream::connect(proxy_addr).map_err(|e| {
-        EcError::Runtime(format!("connect fallback proxy {proxy_addr} failed: {e}"))
-    })?;
+fn parse_fallback_proxy_value(raw: &str) -> EcResult<FallbackProxy> {
+    let raw = raw.trim();
+    let parsed = if let Some((scheme, rest)) = raw.split_once("://") {
+        let kind = parse_fallback_proxy_scheme(scheme)?;
+        FallbackProxy {
+            addr: rest.trim().to_string(),
+            url: raw.to_string(),
+            kind,
+        }
+    } else {
+        FallbackProxy {
+            addr: raw.to_string(),
+            url: format!("{FALLBACK_SCHEME_SOCKS5H}://{raw}"),
+            kind: FallbackProxyKind::Socks5,
+        }
+    };
 
+    if parsed.addr.trim().is_empty() {
+        return Err(EcError::InvalidConfig(
+            "fallback is invalid: empty proxy address",
+        ));
+    }
+
+    Ok(parsed)
+}
+
+fn parse_fallback_proxy_scheme(scheme: &str) -> EcResult<FallbackProxyKind> {
+    match scheme {
+        FALLBACK_SCHEME_SOCKS5 | FALLBACK_SCHEME_SOCKS5H => Ok(FallbackProxyKind::Socks5),
+        FALLBACK_SCHEME_HTTP => Ok(FallbackProxyKind::Http),
+        _ => Err(EcError::InvalidConfig(FALLBACK_SCHEME_ERROR)),
+    }
+}
+
+fn connect_via_socks5_proxy(proxy_addr: &str, target: &ConnectTarget) -> EcResult<TcpStream> {
+    let mut stream = connect_tcp_stream(proxy_addr, "fallback proxy")?;
+    negotiate_socks5_proxy_no_auth(&mut stream)?;
+    write_socks5_connect_request(&mut stream, target)?;
+    read_socks5_connect_reply(&mut stream)?;
+    Ok(stream)
+}
+
+fn connect_via_http_connect_proxy(proxy_addr: &str, target: &ConnectTarget) -> EcResult<TcpStream> {
+    let mut stream = connect_tcp_stream(proxy_addr, "fallback http proxy")?;
+    let authority = target.to_socket_target();
+    let request = format!(
+        "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nConnection: keep-alive\r\nProxy-Connection: keep-alive\r\n\r\n"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| EcError::Runtime(format!("http proxy connect request write failed: {e}")))?;
+    let reply_head = read_http_proxy_head(&mut stream)?;
+    ensure_http_connect_success(reply_head.as_str())?;
+    Ok(stream)
+}
+
+fn connect_tcp_stream(addr: &str, label: &str) -> EcResult<TcpStream> {
+    TcpStream::connect(addr)
+        .map_err(|e| EcError::Runtime(format!("connect {label} {addr} failed: {e}")))
+}
+
+fn negotiate_socks5_proxy_no_auth(stream: &mut TcpStream) -> EcResult<()> {
     stream
         .write_all(&[SOCKS_VERSION_5, 0x01, SOCKS_METHOD_NO_AUTH])
         .map_err(|e| EcError::Runtime(format!("proxy greeting write failed: {e}")))?;
@@ -558,7 +591,10 @@ fn connect_via_socks5_proxy(proxy_addr: &str, target: &ConnectTarget) -> EcResul
             method_resp[0], method_resp[1]
         )));
     }
+    Ok(())
+}
 
+fn write_socks5_connect_request(stream: &mut TcpStream, target: &ConnectTarget) -> EcResult<()> {
     let mut req = Vec::with_capacity(300);
     req.push(SOCKS_VERSION_5);
     req.push(SOCKS_CMD_CONNECT);
@@ -567,8 +603,10 @@ fn connect_via_socks5_proxy(proxy_addr: &str, target: &ConnectTarget) -> EcResul
     req.extend_from_slice(&target.port().to_be_bytes());
     stream
         .write_all(&req)
-        .map_err(|e| EcError::Runtime(format!("proxy connect request write failed: {e}")))?;
+        .map_err(|e| EcError::Runtime(format!("proxy connect request write failed: {e}")))
+}
 
+fn read_socks5_connect_reply(stream: &mut TcpStream) -> EcResult<()> {
     let mut head = [0u8; 4];
     stream
         .read_exact(&mut head)
@@ -587,27 +625,7 @@ fn connect_via_socks5_proxy(proxy_addr: &str, target: &ConnectTarget) -> EcResul
             socks5_reply_name(head[1])
         )));
     }
-
-    consume_socks5_addr_and_port(&mut stream, head[3])?;
-    Ok(stream)
-}
-
-fn connect_via_http_connect_proxy(proxy_addr: &str, target: &ConnectTarget) -> EcResult<TcpStream> {
-    let mut stream = TcpStream::connect(proxy_addr).map_err(|e| {
-        EcError::Runtime(format!(
-            "connect fallback http proxy {proxy_addr} failed: {e}"
-        ))
-    })?;
-    let authority = target.to_socket_target();
-    let request = format!(
-        "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nConnection: keep-alive\r\nProxy-Connection: keep-alive\r\n\r\n"
-    );
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|e| EcError::Runtime(format!("http proxy connect request write failed: {e}")))?;
-    let reply_head = read_http_proxy_head(&mut stream)?;
-    ensure_http_connect_success(reply_head.as_str())?;
-    Ok(stream)
+    consume_socks5_addr_and_port(stream, head[3])
 }
 
 fn read_http_proxy_head(stream: &mut TcpStream) -> EcResult<String> {
@@ -759,6 +777,15 @@ impl ConnectTarget {
 impl std::fmt::Display for ConnectTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}:{}", self.host, self.port)
+    }
+}
+
+impl FallbackProxy {
+    fn connect(&self, target: &ConnectTarget) -> EcResult<TcpStream> {
+        match self.kind {
+            FallbackProxyKind::Socks5 => connect_via_socks5_proxy(&self.addr, target),
+            FallbackProxyKind::Http => connect_via_http_connect_proxy(&self.addr, target),
+        }
     }
 }
 
