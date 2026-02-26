@@ -24,37 +24,8 @@ pub fn serve(bind_addr: &str, fallback_proxy: Option<&str>) -> EcResult<()> {
     let fallback_proxy = parse_fallback_proxy(fallback_proxy)?;
     let listener = TcpListener::bind(&normalized)
         .map_err(|e| EcError::Runtime(format!("socks bind failed on {bind_addr}: {e}")))?;
-    if let Some(proxy) = fallback_proxy.as_ref() {
-        output::info(
-            Scope::App,
-            format_args!("fallback: proxy to {}", output::value(proxy.url.as_str())),
-        );
-    } else {
-        output::info(Scope::App, "fallback: direct");
-    }
-    output::info(
-        Scope::App,
-        format_args!("socks listening on {}", output::value(normalized.as_str())),
-    );
-
-    let accept_fallback = fallback_proxy.clone();
-    thread::spawn(move || {
-        loop {
-            let (stream, _peer) = match listener.accept() {
-                Ok(v) => v,
-                Err(err) => {
-                    output::warn(Scope::Rx, format_args!("accept failed: {err}"));
-                    continue;
-                }
-            };
-            let fallback_proxy = accept_fallback.clone();
-            thread::spawn(move || {
-                if let Err(err) = handle_client(stream, fallback_proxy.as_ref()) {
-                    output::error(Scope::Upstream, crate::error::concise_error(err));
-                }
-            });
-        }
-    });
+    log_socks_startup(normalized.as_str(), fallback_proxy.as_ref());
+    spawn_accept_loop(listener, fallback_proxy.clone());
 
     let reason = crate::protocol::wait_tunnel_fatal_reason();
     Err(EcError::Runtime(format!(
@@ -71,110 +42,190 @@ fn normalize_bind_addr(bind_addr: &str) -> String {
     }
 }
 
+fn log_socks_startup(bind_addr: &str, fallback_proxy: Option<&FallbackProxy>) {
+    if let Some(proxy) = fallback_proxy {
+        output::info(
+            Scope::App,
+            format_args!("fallback: proxy to {}", output::value(proxy.url.as_str())),
+        );
+    } else {
+        output::info(Scope::App, "fallback: direct");
+    }
+    output::info(
+        Scope::App,
+        format_args!("socks listening on {}", output::value(bind_addr)),
+    );
+}
+
+fn spawn_accept_loop(listener: TcpListener, fallback_proxy: Option<FallbackProxy>) {
+    thread::spawn(move || {
+        loop {
+            let (stream, _peer) = match listener.accept() {
+                Ok(v) => v,
+                Err(err) => {
+                    output::warn(Scope::Rx, format_args!("accept failed: {err}"));
+                    continue;
+                }
+            };
+            let fallback_proxy = fallback_proxy.clone();
+            thread::spawn(move || {
+                if let Err(err) = handle_client(stream, fallback_proxy.as_ref()) {
+                    output::error(Scope::Upstream, crate::error::concise_error(err));
+                }
+            });
+        }
+    });
+}
+
 fn handle_client(mut client: TcpStream, fallback_proxy: Option<&FallbackProxy>) -> EcResult<()> {
     negotiate_method(&mut client)?;
     let target = read_connect_request(&mut client)?;
     let target_display = target.to_string();
-    let target_is_ip = is_ip_host(target.host());
-    let arrow = output::weak(" -> ");
-    let lparen = output::weak("(");
-    let rparen = output::weak(")");
+    let route = decide_route(&target, fallback_proxy);
+    output::info(Scope::Rx, &route.line);
 
-    let route = match crate::routing::plan_target(target.host(), target.port()) {
+    execute_route(client, target_display.as_str(), route)
+}
+
+fn decide_route(target: &ConnectTarget, fallback_proxy: Option<&FallbackProxy>) -> RouteDecision {
+    let target_display = target.to_string();
+    let target_is_ip = is_ip_host(target.host());
+    match crate::routing::plan_target(target.host(), target.port()) {
         Ok(crate::routing::RoutePlan::Remote {
             dial,
             rc_id: _rc_id,
             rc_name,
             source: _source,
-        }) => {
-            let name = if rc_name.trim().is_empty() {
-                "unknown".to_string()
-            } else {
-                rc_name
-            };
-            let line = if target_is_ip {
-                format!(
-                    "{target_display}{arrow}{}{arrow}{name}",
-                    output::route_label(RouteKind::Remote),
-                )
-            } else {
-                format!(
-                    "{target_display}{arrow}{}{arrow}{name}{lparen}{dial}{rparen}",
-                    output::route_label(RouteKind::Remote),
-                )
-            };
-            RouteDecision {
-                line,
-                path: format!("remote -> {name}({dial})"),
-                transport: RouteTransport::Tunnel(dial),
-            }
-        }
+        }) => route_decision_remote(target_display.as_str(), target_is_ip, dial, rc_name),
         Ok(crate::routing::RoutePlan::Fallback {
             target: planned_target,
             reason,
-        }) => {
-            let dial = target_addr(&planned_target);
-            if let Some(proxy) = fallback_proxy {
-                RouteDecision {
-                    line: format!(
-                        "{target_display}{arrow}{}{arrow}{}",
-                        output::route_label(RouteKind::Fallback),
-                        output::value(proxy.url.as_str()),
-                    ),
-                    path: format!(
-                        "fallback -> {}; {}: {reason}",
-                        proxy.url,
-                        output::value("reason")
-                    ),
-                    transport: RouteTransport::Proxy(proxy.clone(), target.clone()),
-                }
-            } else {
-                RouteDecision {
-                    line: format!(
-                        "{target_display}{arrow}{}{arrow}{}",
-                        output::route_label(RouteKind::Fallback),
-                        output::route_label(RouteKind::Direct),
-                    ),
-                    path: format!(
-                        "fallback -> direct dial={dial}; {}: {reason}",
-                        output::value("reason")
-                    ),
-                    transport: RouteTransport::Direct(dial),
-                }
-            }
-        }
-        Err(err) => {
-            let legacy = target.to_socket_target();
-            RouteDecision {
-                line: format!(
-                    "{target_display}{arrow}{}{arrow}legacy{lparen}{legacy}{rparen}",
-                    output::route_label(RouteKind::Remote),
-                ),
-                path: format!("remote -> legacy({legacy}) planner-unavailable={err}"),
-                transport: RouteTransport::Tunnel(legacy),
-            }
-        }
-    };
-    output::info(Scope::Rx, &route.line);
+        }) => route_decision_fallback(
+            target.clone(),
+            target_display.as_str(),
+            target_addr(&planned_target),
+            reason,
+            fallback_proxy,
+        ),
+        Err(err) => route_decision_legacy(target, target_display.as_str(), err),
+    }
+}
 
-    let route_path = route.path.as_str();
-    match route.transport {
+fn route_decision_remote(
+    target_display: &str,
+    target_is_ip: bool,
+    dial: String,
+    rc_name: String,
+) -> RouteDecision {
+    let arrow = output::weak(" -> ");
+    let lparen = output::weak("(");
+    let rparen = output::weak(")");
+    let name = if rc_name.trim().is_empty() {
+        "unknown".to_string()
+    } else {
+        rc_name
+    };
+    let line = if target_is_ip {
+        format!(
+            "{target_display}{arrow}{}{arrow}{name}",
+            output::route_label(RouteKind::Remote),
+        )
+    } else {
+        format!(
+            "{target_display}{arrow}{}{arrow}{name}{lparen}{dial}{rparen}",
+            output::route_label(RouteKind::Remote),
+        )
+    };
+    RouteDecision {
+        line,
+        path: format!("remote -> {name}({dial})"),
+        transport: RouteTransport::Tunnel(dial),
+    }
+}
+
+fn route_decision_fallback(
+    target: ConnectTarget,
+    target_display: &str,
+    dial: String,
+    reason: String,
+    fallback_proxy: Option<&FallbackProxy>,
+) -> RouteDecision {
+    let arrow = output::weak(" -> ");
+    if let Some(proxy) = fallback_proxy {
+        return RouteDecision {
+            line: format!(
+                "{target_display}{arrow}{}{arrow}{}",
+                output::route_label(RouteKind::Fallback),
+                output::value(proxy.url.as_str()),
+            ),
+            path: format!(
+                "fallback -> {}; {}: {reason}",
+                proxy.url,
+                output::value("reason")
+            ),
+            transport: RouteTransport::Proxy(proxy.clone(), target),
+        };
+    }
+
+    RouteDecision {
+        line: format!(
+            "{target_display}{arrow}{}{arrow}{}",
+            output::route_label(RouteKind::Fallback),
+            output::route_label(RouteKind::Direct),
+        ),
+        path: format!(
+            "fallback -> direct dial={dial}; {}: {reason}",
+            output::value("reason")
+        ),
+        transport: RouteTransport::Direct(dial),
+    }
+}
+
+fn route_decision_legacy(
+    target: &ConnectTarget,
+    target_display: &str,
+    err: EcError,
+) -> RouteDecision {
+    let arrow = output::weak(" -> ");
+    let lparen = output::weak("(");
+    let rparen = output::weak(")");
+    let legacy = target.to_socket_target();
+    RouteDecision {
+        line: format!(
+            "{target_display}{arrow}{}{arrow}legacy{lparen}{legacy}{rparen}",
+            output::route_label(RouteKind::Remote),
+        ),
+        path: format!("remote -> legacy({legacy}) planner-unavailable={err}"),
+        transport: RouteTransport::Tunnel(legacy),
+    }
+}
+
+fn execute_route(client: TcpStream, target_display: &str, route: RouteDecision) -> EcResult<()> {
+    let RouteDecision {
+        line: _,
+        path,
+        transport,
+    } = route;
+    let route_path = path.as_str();
+
+    match transport {
         RouteTransport::Tunnel(dial_target) => {
             let conn = crate::netstack::open_tcp_connection(&dial_target)
-                .map_err(|e| route_runtime_error(target_display.as_str(), route_path, e))?;
-            write_connect_ok_reply(&mut client, target_display.as_str(), route_path)?;
+                .map_err(|e| route_runtime_error(target_display, route_path, e))?;
+            let mut client = client;
+            write_connect_ok_reply(&mut client, target_display, route_path)?;
             relay_tunnel(client, conn)
-                .map_err(|e| route_runtime_error(target_display.as_str(), route_path, e))
+                .map_err(|e| route_runtime_error(target_display, route_path, e))
         }
         RouteTransport::Direct(dial_target) => {
             let conn = TcpStream::connect(&dial_target)
-                .map_err(|e| route_runtime_error(target_display.as_str(), route_path, e))?;
-            relay_direct_with_reply(client, conn, target_display.as_str(), route_path)
+                .map_err(|e| route_runtime_error(target_display, route_path, e))?;
+            relay_direct_with_reply(client, conn, target_display, route_path)
         }
         RouteTransport::Proxy(proxy, target) => {
             let conn = connect_via_proxy(&proxy, &target)
-                .map_err(|e| route_runtime_error(target_display.as_str(), route_path, e))?;
-            relay_direct_with_reply(client, conn, target_display.as_str(), route_path)
+                .map_err(|e| route_runtime_error(target_display, route_path, e))?;
+            relay_direct_with_reply(client, conn, target_display, route_path)
         }
     }
 }
