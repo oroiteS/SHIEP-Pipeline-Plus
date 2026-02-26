@@ -43,14 +43,14 @@ pub fn serve(bind_addr: &str, fallback_proxy: Option<&str>) -> EcResult<()> {
             let (stream, _peer) = match listener.accept() {
                 Ok(v) => v,
                 Err(err) => {
-                    output::warn(Scope::Socks, format_args!("accept failed: {err}"));
+                    output::warn(Scope::Rx, format_args!("accept failed: {err}"));
                     continue;
                 }
             };
             let fallback_proxy = accept_fallback.clone();
             thread::spawn(move || {
                 if let Err(err) = handle_client(stream, fallback_proxy.as_ref()) {
-                    output::error(Scope::Socks, err.to_string());
+                    output::error(Scope::Upstream, err.to_string());
                 }
             });
         }
@@ -145,7 +145,7 @@ fn handle_client(mut client: TcpStream, fallback_proxy: Option<&FallbackProxy>) 
             }
         }
     };
-    output::info(Scope::Socks, &route.line);
+    output::info(Scope::Rx, &route.line);
 
     let route_path = route.path.as_str();
     match route.transport {
