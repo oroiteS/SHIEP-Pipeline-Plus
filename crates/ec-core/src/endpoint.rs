@@ -1,16 +1,14 @@
 use crate::error::{EcError, EcResult};
 
+const DEFAULT_TLS_PORT: u16 = 443;
+
 pub(crate) fn parse_server(server: &str) -> EcResult<(String, String)> {
     let trimmed = server.trim();
     if trimmed.is_empty() {
         return Err(EcError::InvalidConfig("server is required"));
     }
 
-    let no_scheme = trimmed
-        .strip_prefix("https://")
-        .or_else(|| trimmed.strip_prefix("http://"))
-        .unwrap_or(trimmed);
-    let authority_raw = no_scheme
+    let authority_raw = strip_http_scheme(trimmed)
         .split('/')
         .next()
         .ok_or_else(|| EcError::Runtime("invalid server address".to_string()))?;
@@ -23,6 +21,13 @@ pub(crate) fn parse_server(server: &str) -> EcResult<(String, String)> {
     Ok((authority, host))
 }
 
+fn strip_http_scheme(server: &str) -> &str {
+    server
+        .strip_prefix("https://")
+        .or_else(|| server.strip_prefix("http://"))
+        .unwrap_or(server)
+}
+
 fn normalize_authority(authority: &str) -> EcResult<String> {
     if has_explicit_port(authority) {
         return Ok(authority.to_string());
@@ -32,34 +37,26 @@ fn normalize_authority(authority: &str) -> EcResult<String> {
         return Err(EcError::InvalidConfig("invalid server port"));
     }
 
-    Ok(format!("{authority}:443"))
+    Ok(format!("{authority}:{DEFAULT_TLS_PORT}"))
 }
 
 fn has_explicit_port(authority: &str) -> bool {
-    if authority.starts_with('[') {
-        authority
-            .rsplit_once("]:")
-            .and_then(|(_, port)| port.parse::<u16>().ok())
-            .is_some()
-    } else {
-        authority
-            .rsplit_once(':')
-            .and_then(|(_, port)| port.parse::<u16>().ok())
-            .is_some()
-    }
+    authority_port_candidate(authority)
+        .and_then(|port| port.parse::<u16>().ok())
+        .is_some()
 }
 
 fn looks_like_malformed_port(authority: &str) -> bool {
-    if authority.starts_with('[') {
-        return authority
-            .rsplit_once("]:")
-            .map(|(_, port)| !port.is_empty())
-            .unwrap_or(false);
-    }
-    authority
-        .rsplit_once(':')
-        .map(|(_, port)| !port.is_empty())
+    authority_port_candidate(authority)
+        .map(|port| !port.is_empty())
         .unwrap_or(false)
+}
+
+fn authority_port_candidate(authority: &str) -> Option<&str> {
+    if authority.starts_with('[') {
+        return authority.rsplit_once("]:").map(|(_, port)| port);
+    }
+    authority.rsplit_once(':').map(|(_, port)| port)
 }
 
 fn extract_host(authority: &str) -> EcResult<String> {
