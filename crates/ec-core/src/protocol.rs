@@ -3,7 +3,7 @@ use crate::error::{EcError, EcResult};
 use crate::output::{self, Scope};
 use foreign_types::ForeignType;
 use openssl::error::ErrorStack;
-use openssl::ssl::{Ssl, SslConnector, SslMethod, SslOptions, SslStream, SslVerifyMode};
+use openssl::ssl::{Ssl, SslStream};
 use openssl_sys as ffi;
 use std::ffi::c_uint;
 use std::io::{ErrorKind, Read, Write};
@@ -454,35 +454,20 @@ fn open_data_stream(
 }
 
 fn connect_vpn_tls(authority: &str, host: &str) -> EcResult<SslStream<TcpStream>> {
-    let tcp = TcpStream::connect(authority)
-        .map_err(|e| EcError::Runtime(format!("vpn tcp connect failed: {e}")))?;
-    tcp.set_read_timeout(Some(Duration::from_secs(5)))
-        .map_err(|e| EcError::Runtime(format!("set read timeout failed: {e}")))?;
-    tcp.set_write_timeout(Some(Duration::from_secs(5)))
-        .map_err(|e| EcError::Runtime(format!("set write timeout failed: {e}")))?;
-
-    let mut builder = SslConnector::builder(SslMethod::tls_client())
-        .map_err(|e| EcError::Runtime(format!("vpn tls builder create failed: {e}")))?;
-    builder.set_verify(SslVerifyMode::NONE);
-    builder.set_options(SslOptions::NO_TICKET);
+    let tcp = crate::tls::connect_tcp_with_timeout(authority, Duration::from_secs(5), "vpn")?;
+    let mut builder = crate::tls::new_insecure_connector_builder("vpn")?;
     builder.set_security_level(0);
     builder
         .set_cipher_list("RC4-SHA:AES128-SHA:AES256-SHA")
         .map_err(|e| EcError::Runtime(format!("set cipher list failed: {e}")))?;
 
     let connector = builder.build();
-    let mut config = connector
-        .configure()
-        .map_err(|e| EcError::Runtime(format!("vpn tls configure failed: {e}")))?;
-    config.set_use_server_name_indication(false);
-    config.set_verify_hostname(false);
-    let mut ssl = config
-        .into_ssl(host)
-        .map_err(|e| EcError::Runtime(format!("vpn tls prepare failed: {e}")))?;
+    let mut ssl = crate::tls::into_insecure_ssl_with(&connector, host, "vpn", |config| {
+        config.set_use_server_name_indication(false);
+    })?;
     apply_l3ip_session_id(&mut ssl, 0x0303)?;
 
-    ssl.connect(tcp)
-        .map_err(|e| EcError::Runtime(format!("vpn tls handshake failed: {e}")))
+    crate::tls::handshake(ssl, tcp, "vpn")
 }
 
 fn keep_query_stream_alive(stream: SslStream<TcpStream>) -> EcResult<()> {

@@ -1,8 +1,6 @@
 use crate::endpoint::parse_server;
 use crate::error::{EcError, EcResult};
-use openssl::ssl::{SslConnector, SslMethod, SslOptions, SslVerifyMode};
 use std::io::{ErrorKind, Read, Write};
-use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
 const TOKEN_IO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -12,29 +10,10 @@ const TOKEN_SESSION_HEX_SLICE_LEN: usize = 31;
 pub fn fetch_agent_token(server: &str, twf_id: &str) -> EcResult<String> {
     let (authority, host) = parse_server(server)?;
 
-    let tcp = TcpStream::connect(&authority)
-        .map_err(|e| EcError::Runtime(format!("token tcp connect failed: {e}")))?;
-    tcp.set_read_timeout(Some(TOKEN_IO_TIMEOUT))
-        .map_err(|e| EcError::Runtime(format!("set read timeout failed: {e}")))?;
-    tcp.set_write_timeout(Some(TOKEN_IO_TIMEOUT))
-        .map_err(|e| EcError::Runtime(format!("set write timeout failed: {e}")))?;
-
-    let mut builder = SslConnector::builder(SslMethod::tls_client())
-        .map_err(|e| EcError::Runtime(format!("token tls builder create failed: {e}")))?;
-    builder.set_verify(SslVerifyMode::NONE);
-    builder.set_options(SslOptions::NO_TICKET);
-    let connector = builder.build();
-
-    let mut config = connector
-        .configure()
-        .map_err(|e| EcError::Runtime(format!("token tls configure failed: {e}")))?;
-    config.set_verify_hostname(false);
-    let ssl = config
-        .into_ssl(&host)
-        .map_err(|e| EcError::Runtime(format!("token tls prepare failed: {e}")))?;
-    let mut stream = ssl
-        .connect(tcp)
-        .map_err(|e| EcError::Runtime(format!("token tls handshake failed: {e}")))?;
+    let tcp = crate::tls::connect_tcp_with_timeout(&authority, TOKEN_IO_TIMEOUT, "token")?;
+    let connector = crate::tls::new_insecure_connector("token")?;
+    let ssl = crate::tls::into_insecure_ssl(&connector, &host, "token")?;
+    let mut stream = crate::tls::handshake(ssl, tcp, "token")?;
 
     let request = build_token_request(&authority, twf_id);
     stream

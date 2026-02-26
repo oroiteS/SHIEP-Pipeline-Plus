@@ -10,6 +10,7 @@ mod protocol;
 mod route_table;
 mod routing;
 mod socks;
+mod tls;
 mod token;
 mod transport;
 

@@ -1,6 +1,5 @@
 use crate::endpoint::parse_server;
 use crate::error::{EcError, EcResult};
-use openssl::ssl::{SslConnector, SslMethod, SslOptions, SslVerifyMode};
 use quick_xml::Reader;
 use quick_xml::events::attributes::Attribute;
 use quick_xml::events::{BytesStart, Event};
@@ -80,28 +79,10 @@ pub fn fetch_route_table(server: &str, twf_id: &str) -> EcResult<RouteTable> {
 }
 
 fn connect_tls(authority: &str, host: &str) -> EcResult<openssl::ssl::SslStream<TcpStream>> {
-    let tcp = TcpStream::connect(authority)
-        .map_err(|e| EcError::Runtime(format!("rclist tcp connect failed: {e}")))?;
-    tcp.set_read_timeout(Some(Duration::from_secs(5)))
-        .map_err(|e| EcError::Runtime(format!("set read timeout failed: {e}")))?;
-    tcp.set_write_timeout(Some(Duration::from_secs(5)))
-        .map_err(|e| EcError::Runtime(format!("set write timeout failed: {e}")))?;
-
-    let mut builder = SslConnector::builder(SslMethod::tls_client())
-        .map_err(|e| EcError::Runtime(format!("rclist tls builder create failed: {e}")))?;
-    builder.set_verify(SslVerifyMode::NONE);
-    builder.set_options(SslOptions::NO_TICKET);
-    let connector = builder.build();
-
-    let mut config = connector
-        .configure()
-        .map_err(|e| EcError::Runtime(format!("rclist tls configure failed: {e}")))?;
-    config.set_verify_hostname(false);
-    let ssl = config
-        .into_ssl(host)
-        .map_err(|e| EcError::Runtime(format!("rclist tls prepare failed: {e}")))?;
-    ssl.connect(tcp)
-        .map_err(|e| EcError::Runtime(format!("rclist tls handshake failed: {e}")))
+    let tcp = crate::tls::connect_tcp_with_timeout(authority, Duration::from_secs(5), "rclist")?;
+    let connector = crate::tls::new_insecure_connector("rclist")?;
+    let ssl = crate::tls::into_insecure_ssl(&connector, host, "rclist")?;
+    crate::tls::handshake(ssl, tcp, "rclist")
 }
 
 fn parse_route_table_xml(xml: &str) -> EcResult<RouteTable> {

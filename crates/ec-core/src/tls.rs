@@ -1,0 +1,65 @@
+use crate::error::{EcError, EcResult};
+use openssl::ssl::{
+    ConnectConfiguration, Ssl, SslConnector, SslConnectorBuilder, SslMethod, SslOptions, SslStream,
+    SslVerifyMode,
+};
+use std::net::TcpStream;
+use std::time::Duration;
+
+pub(crate) fn connect_tcp_with_timeout(
+    authority: &str,
+    timeout: Duration,
+    context: &str,
+) -> EcResult<TcpStream> {
+    let tcp = TcpStream::connect(authority)
+        .map_err(|e| EcError::Runtime(format!("{context} tcp connect failed: {e}")))?;
+    tcp.set_read_timeout(Some(timeout))
+        .map_err(|e| EcError::Runtime(format!("set read timeout failed: {e}")))?;
+    tcp.set_write_timeout(Some(timeout))
+        .map_err(|e| EcError::Runtime(format!("set write timeout failed: {e}")))?;
+    Ok(tcp)
+}
+
+pub(crate) fn new_insecure_connector_builder(context: &str) -> EcResult<SslConnectorBuilder> {
+    let mut builder = SslConnector::builder(SslMethod::tls_client())
+        .map_err(|e| EcError::Runtime(format!("{context} tls builder create failed: {e}")))?;
+    builder.set_verify(SslVerifyMode::NONE);
+    builder.set_options(SslOptions::NO_TICKET);
+    Ok(builder)
+}
+
+pub(crate) fn new_insecure_connector(context: &str) -> EcResult<SslConnector> {
+    Ok(new_insecure_connector_builder(context)?.build())
+}
+
+pub(crate) fn into_insecure_ssl(
+    connector: &SslConnector,
+    host: &str,
+    context: &str,
+) -> EcResult<Ssl> {
+    into_insecure_ssl_with(connector, host, context, |_| {})
+}
+
+pub(crate) fn into_insecure_ssl_with<F>(
+    connector: &SslConnector,
+    host: &str,
+    context: &str,
+    configure: F,
+) -> EcResult<Ssl>
+where
+    F: FnOnce(&mut ConnectConfiguration),
+{
+    let mut config = connector
+        .configure()
+        .map_err(|e| EcError::Runtime(format!("{context} tls configure failed: {e}")))?;
+    config.set_verify_hostname(false);
+    configure(&mut config);
+    config
+        .into_ssl(host)
+        .map_err(|e| EcError::Runtime(format!("{context} tls prepare failed: {e}")))
+}
+
+pub(crate) fn handshake(ssl: Ssl, tcp: TcpStream, context: &str) -> EcResult<SslStream<TcpStream>> {
+    ssl.connect(tcp)
+        .map_err(|e| EcError::Runtime(format!("{context} tls handshake failed: {e}")))
+}
