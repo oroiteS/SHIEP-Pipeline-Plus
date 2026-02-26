@@ -11,6 +11,7 @@ mod protocol_session;
 mod route_table;
 mod routing;
 mod socks;
+mod socks_proxy;
 mod tls;
 mod token;
 mod transport;
