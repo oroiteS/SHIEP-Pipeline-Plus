@@ -47,8 +47,9 @@ impl EasyConnectApp {
                 output::info(
                     Scope::App,
                     format_args!(
-                        "route table loaded: {} rules, {} dns records",
+                        "route table loaded: {} rules, {} dns servers, {} dns records",
                         output::value(install.rule_count),
+                        output::value(install.dns_server_count),
                         output::value(install.dns_record_count)
                     ),
                 );

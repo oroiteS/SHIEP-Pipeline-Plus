@@ -11,6 +11,7 @@ const ROUTER_NOT_INITIALIZED: &str = "route matcher is not initialized";
 #[derive(Debug, Clone)]
 pub struct RouteInstallSummary {
     pub rule_count: usize,
+    pub dns_server_count: usize,
     pub dns_record_count: usize,
 }
 
@@ -32,6 +33,7 @@ pub fn install_route_table(table: RouteTable) -> EcResult<RouteInstallSummary> {
     let matcher = RouteMatcher::from_table(table)?;
     let summary = RouteInstallSummary {
         rule_count: matcher.rules.len(),
+        dns_server_count: matcher.dns_servers,
         dns_record_count: matcher.dns_records,
     };
     let holder = ROUTER.get_or_init(|| Mutex::new(None));
@@ -59,6 +61,7 @@ pub fn plan_target(host: &str, port: u16) -> EcResult<RoutePlan> {
 struct RouteMatcher {
     rules: Vec<CompiledRule>,
     dns_map: HashMap<i32, HashMap<String, Vec<Ipv4Addr>>>,
+    dns_servers: usize,
     dns_records: usize,
 }
 
@@ -87,6 +90,7 @@ impl RouteMatcher {
     fn from_table(table: RouteTable) -> EcResult<Self> {
         let RouteTable {
             rules: raw_rules,
+            dns_servers,
             dns_records: raw_dns_records,
             ..
         } = table;
@@ -102,6 +106,7 @@ impl RouteMatcher {
         Ok(Self {
             rules,
             dns_map,
+            dns_servers: dns_servers.len(),
             dns_records,
         })
     }

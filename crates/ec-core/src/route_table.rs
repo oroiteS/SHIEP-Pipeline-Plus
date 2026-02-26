@@ -13,12 +13,10 @@ const ROUTE_TABLE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(8);
 #[derive(Debug, Clone)]
 pub struct RouteTable {
     pub rules: Vec<RouteRule>,
-    #[allow(dead_code)]
     pub dns_servers: Vec<String>,
     pub dns_records: Vec<DnsRecord>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct RouteRule {
     pub rc_id: i32,
@@ -27,14 +25,12 @@ pub struct RouteRule {
     pub port: PortRange,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct PortRange {
     pub start: u16,
     pub end: u16,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct DnsRecord {
     pub rc_id: i32,
