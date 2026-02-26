@@ -8,6 +8,7 @@ mod endpoint;
 mod netstack;
 mod protocol;
 mod protocol_session;
+mod protocol_wire;
 mod route_table;
 mod routing;
 mod socks;
