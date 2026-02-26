@@ -66,17 +66,35 @@ jobs:
             choco install openssl -y
           }
 
-          $LibSsl = Get-ChildItem -Path "$OpenSslRoot\lib" -Recurse -Filter "libssl.lib" -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $LibSsl) {
-            throw "libssl.lib not found under $OpenSslRoot\lib"
+          $LibRoot = "$OpenSslRoot\lib"
+          $LibPair = Get-ChildItem -Path $LibRoot -Recurse -Filter "libssl*.lib" -ErrorAction SilentlyContinue |
+            ForEach-Object {
+              $Dir = Split-Path -Parent $_.FullName
+              $Crypto = Get-ChildItem -Path $Dir -Filter "libcrypto*.lib" -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($Crypto) {
+                [PSCustomObject]@{
+                  Dir = $Dir
+                  SslBase = $_.BaseName
+                  CryptoBase = $Crypto.BaseName
+                }
+              }
+            } |
+            Sort-Object @{ Expression = { if ($_.Dir -like "*\VC\x64\MD*") { 0 } else { 1 } } }, @{ Expression = { $_.SslBase.Length } } |
+            Select-Object -First 1
+
+          if (-not $LibPair) {
+            $Detected = Get-ChildItem -Path $LibRoot -Recurse -Filter "*.lib" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+            throw "OpenSSL library pair not found under $LibRoot. Detected libs: $($Detected -join '; ')"
           }
 
-          $OpenSslLibDir = Split-Path -Parent $LibSsl.FullName
+          $OpenSslLibDir = $LibPair.Dir
+          $OpenSslLibs = "$($LibPair.SslBase):$($LibPair.CryptoBase)"
           $OpenSslIncludeDir = "$OpenSslRoot\include"
 
           "OPENSSL_DIR=$OpenSslRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "OPENSSL_LIB_DIR=$OpenSslLibDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "OPENSSL_INCLUDE_DIR=$OpenSslIncludeDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "OPENSSL_LIBS=$OpenSslLibs" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Build binary
         run: cargo +stable build --locked --release -p ec-cli --target ${{ matrix.target }}
