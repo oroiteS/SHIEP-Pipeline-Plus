@@ -7,6 +7,7 @@ mod auth;
 mod endpoint;
 mod netstack;
 mod protocol;
+mod protocol_session;
 mod route_table;
 mod routing;
 mod socks;
