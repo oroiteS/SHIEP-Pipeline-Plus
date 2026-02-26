@@ -45,7 +45,7 @@ impl AppConfig {
             return Err(EcError::InvalidConfig("password is required"));
         }
         if self.socks_bind.trim().is_empty() {
-            return Err(EcError::InvalidConfig("socks-bind is required"));
+            return Err(EcError::InvalidConfig("bind is required"));
         }
         Ok(())
     }

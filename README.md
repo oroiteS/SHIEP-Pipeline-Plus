@@ -19,20 +19,20 @@ The project focuses on minimal scope, clear structure, and maintainability, with
 - Route table based target decision (whitelist hit -> remote)
 - Configurable fallback routing (non-whitelist -> direct or upstream proxy via `--fallback`)
 - Structured, colorized logging that balances operational detail and visual clarity
-- Supported fallback proxy schemes:
-- `socks5://`
-- `socks5h://`
-- `http://`
-- Bare `host:port` (interpreted as `socks5h://`)
+- Supported fallback proxy input formats:
+
+| Input format | Interpreted as |
+| --- | --- |
+| `socks5://host:port` | SOCKS5 proxy |
+| `socks5h://host:port` | SOCKS5 proxy with remote DNS |
+| `http://host:port` | HTTP CONNECT proxy |
+| `host:port` | Plain host/port, interpreted as `socks5h://host:port` |
 
 ## Project Structure
 
-- `crates/ec-cli`
-- CLI entry and argument parsing
-- `crates/ec-core`
-- Core implementation: login, protocol, tunnel, netstack, route-table parsing, SOCKS forwarding
-- `.github/workflows/build-release.yml`
-- Builds and uploads multi-platform artifacts after a release is published
+- `crates/ec-cli`: CLI entry point and argument parsing
+- `crates/ec-core`: Core implementation (login, protocol, tunnel, netstack, route-table parsing, and forwarding)
+- `.github/workflows/build-release.yml`: Build and upload release artifacts on `release.published`
 
 ## Quick Start
 
@@ -66,13 +66,18 @@ Default listener address: `127.0.0.1:1080`.
 - `--server` required, VPN server address
 - `--username` required, username
 - `--password` required, password
-- `--socks-bind` optional, local bind address, default `127.0.0.1:1080`
+- `--bind` optional, local bind address, default `127.0.0.1:1080`
 - `--fallback` optional, fallback upstream proxy address
 
 Example:
 
 ```bash
-./SHIEP-Pipeline --server <VPN_SERVER> --username <USERNAME> --password <PASSWORD> --fallback socks5h://127.0.0.1:114514
+./SHIEP-Pipeline \
+  --server <VPN_SERVER> \
+  --username <USERNAME> \
+  --password <PASSWORD> \
+  --bind 127.0.0.1:1080 \
+  --fallback socks5h://127.0.0.1:114514
 ```
 
 ## Routing and Fallback
@@ -98,5 +103,5 @@ Please follow your institution and network usage policies.
 
 ## Acknowledgements
 
-- [NJUConnect](https://github.com/lyc8503/NJUConnect)
-- [EasierConnect](https://github.com/Yan233th/EasierConnect)
+- [NJUConnect](https://github.com/lyc8503/NJUConnect): the original upstream whose connection logic and behavior were referenced during this project's design.
+- [EasierConnect](https://github.com/Yan233th/EasierConnect): a strengthened fork with much better logging and critical bug fixes, but with no routing/split-routing support.

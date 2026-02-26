@@ -17,10 +17,11 @@ struct CliArgs {
     password: String,
 
     #[arg(
-        long,
+        long = "bind",
+        value_name = "BIND",
         default_value = "127.0.0.1:1080",
         help_heading = "Optional",
-        help = "Local bind address"
+        help = "Local listener bind address"
     )]
     socks_bind: String,
 
