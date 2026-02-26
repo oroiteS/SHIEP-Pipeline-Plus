@@ -182,39 +182,62 @@ fn run_netstack_loop(
             .poll_delay(now, &sockets)
             .map(|delay| Duration::from_millis(delay.total_millis()));
         if let Some(msg) = wait_control_message(&control_rx, wait)? {
-            handle_control_message(
+            process_control_batch(
                 msg,
+                &control_rx,
                 &mut device,
                 &mut iface,
                 &mut sockets,
                 &mut connections,
                 &mut next_conn_id,
                 &mut next_local_port,
-            );
-            for _ in 1..MAX_CONTROL_BATCH {
-                let msg = match control_rx.try_recv() {
-                    Ok(msg) => msg,
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        return Err(control_channel_disconnected_err());
-                    }
-                };
-                handle_control_message(
-                    msg,
-                    &mut device,
-                    &mut iface,
-                    &mut sockets,
-                    &mut connections,
-                    &mut next_conn_id,
-                    &mut next_local_port,
-                );
-            }
+            )?;
         }
 
         let now = smol_now(start);
         let _ = iface.poll(now, &mut device, &mut sockets);
         drive_connections(&mut sockets, &mut connections);
     }
+}
+
+fn process_control_batch(
+    first_msg: ControlMessage,
+    control_rx: &mpsc::Receiver<ControlMessage>,
+    device: &mut TunnelDevice,
+    iface: &mut Interface,
+    sockets: &mut SocketSet<'_>,
+    connections: &mut HashMap<u64, ConnectionState>,
+    next_conn_id: &mut u64,
+    next_local_port: &mut u16,
+) -> EcResult<()> {
+    handle_control_message(
+        first_msg,
+        device,
+        iface,
+        sockets,
+        connections,
+        next_conn_id,
+        next_local_port,
+    );
+    for _ in 1..MAX_CONTROL_BATCH {
+        let msg = match control_rx.try_recv() {
+            Ok(msg) => msg,
+            Err(mpsc::TryRecvError::Empty) => break,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(control_channel_disconnected_err());
+            }
+        };
+        handle_control_message(
+            msg,
+            device,
+            iface,
+            sockets,
+            connections,
+            next_conn_id,
+            next_local_port,
+        );
+    }
+    Ok(())
 }
 
 fn handle_control_message(
