@@ -40,16 +40,13 @@ The project focuses on minimal scope, clear structure, and maintainability, with
 
 1. Go to the latest release page on GitHub.
 2. Download the artifact for your platform:
-   - Linux: `ec-cli-<tag>-linux-x64`
-   - macOS (Apple Silicon): `ec-cli-<tag>-macos-arm64`
-   - Windows: `ec-cli-<tag>-windows-x64.exe`
+   - Linux: `SHIEP-Pipeline-<tag>-linux-x64`
+   - macOS (Apple Silicon): `SHIEP-Pipeline-<tag>-macos-arm64`
+   - Windows: `SHIEP-Pipeline-<tag>-windows-x64.exe`
 3. Run it with required arguments:
 
 ```bash
-./ec-cli \
-  --server <VPN_SERVER> \
-  --username <USERNAME> \
-  --password <PASSWORD>
+./SHIEP-Pipeline --server <VPN_SERVER> --username <USERNAME> --password <PASSWORD>
 ```
 
 ### Option B: Run From Source
@@ -59,10 +56,7 @@ The project focuses on minimal scope, clear structure, and maintainability, with
 3. Run with Cargo
 
 ```bash
-cargo run -p ec-cli -- \
-  --server <VPN_SERVER> \
-  --username <USERNAME> \
-  --password <PASSWORD>
+cargo run -p ec-cli -- --server <VPN_SERVER> --username <USERNAME> --password <PASSWORD>
 ```
 
 Default listener address: `127.0.0.1:1080`.
@@ -78,11 +72,7 @@ Default listener address: `127.0.0.1:1080`.
 Example:
 
 ```bash
-ec-cli \
-  --server <VPN_SERVER> \
-  --username <USERNAME> \
-  --password <PASSWORD> \
-  --fallback socks5h://127.0.0.1:114514
+./SHIEP-Pipeline --server <VPN_SERVER> --username <USERNAME> --password <PASSWORD> --fallback socks5h://127.0.0.1:114514
 ```
 
 ## Routing and Fallback
@@ -97,9 +87,9 @@ ec-cli \
 
 The workflow triggers on GitHub Release `published` and uploads:
 
-- Linux: `ec-cli-<tag>-linux-x64`
-- macOS (Apple Silicon): `ec-cli-<tag>-macos-arm64`
-- Windows: `ec-cli-<tag>-windows-x64.exe`
+- Linux: `SHIEP-Pipeline-<tag>-linux-x64`
+- macOS (Apple Silicon): `SHIEP-Pipeline-<tag>-macos-arm64`
+- Windows: `SHIEP-Pipeline-<tag>-windows-x64.exe`
 
 ## Disclaimer
 
