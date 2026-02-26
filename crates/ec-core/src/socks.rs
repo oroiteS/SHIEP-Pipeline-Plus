@@ -749,16 +749,16 @@ mod tests {
 
     #[test]
     fn parse_fallback_proxy_accepts_socks5_scheme() {
-        let parsed = parse_fallback_proxy(Some("socks5://127.0.0.1:7890")).unwrap();
-        assert_eq!(parsed.unwrap().addr, "127.0.0.1:7890");
+        let parsed = parse_fallback_proxy(Some("socks5://127.0.0.1:114514")).unwrap();
+        assert_eq!(parsed.unwrap().addr, "127.0.0.1:114514");
     }
 
     #[test]
     fn parse_fallback_proxy_accepts_plain_host_port() {
-        let parsed = parse_fallback_proxy(Some("127.0.0.1:7890")).unwrap();
+        let parsed = parse_fallback_proxy(Some("127.0.0.1:114514")).unwrap();
         let proxy = parsed.unwrap();
-        assert_eq!(proxy.addr, "127.0.0.1:7890");
-        assert_eq!(proxy.url, "socks5h://127.0.0.1:7890");
+        assert_eq!(proxy.addr, "127.0.0.1:114514");
+        assert_eq!(proxy.url, "socks5h://127.0.0.1:114514");
     }
 
     #[test]
