@@ -17,12 +17,10 @@ impl AppConfig {
         socks_bind: String,
         fallback_proxy: Option<String>,
     ) -> EcResult<Self> {
-        let server = server.trim().to_string();
-        let username = username.trim().to_string();
-        let socks_bind = socks_bind.trim().to_string();
-        let fallback_proxy = fallback_proxy
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty());
+        let server = trim_owned(server);
+        let username = trim_owned(username);
+        let socks_bind = trim_owned(socks_bind);
+        let fallback_proxy = normalize_optional_trimmed(fallback_proxy);
         let cfg = Self {
             server,
             username,
@@ -35,20 +33,29 @@ impl AppConfig {
     }
 
     pub fn validate(&self) -> EcResult<()> {
-        if self.server.trim().is_empty() {
-            return Err(EcError::InvalidConfig("server is required"));
-        }
-        if self.username.trim().is_empty() {
-            return Err(EcError::InvalidConfig("username is required"));
-        }
+        require_non_empty_trimmed(self.server.as_str(), "server is required")?;
+        require_non_empty_trimmed(self.username.as_str(), "username is required")?;
         if self.password.is_empty() {
             return Err(EcError::InvalidConfig("password is required"));
         }
-        if self.socks_bind.trim().is_empty() {
-            return Err(EcError::InvalidConfig("bind is required"));
-        }
+        require_non_empty_trimmed(self.socks_bind.as_str(), "bind is required")?;
         Ok(())
     }
+}
+
+fn trim_owned(value: String) -> String {
+    value.trim().to_string()
+}
+
+fn normalize_optional_trimmed(value: Option<String>) -> Option<String> {
+    value.map(trim_owned).filter(|v| !v.is_empty())
+}
+
+fn require_non_empty_trimmed(value: &str, error: &'static str) -> EcResult<()> {
+    if value.trim().is_empty() {
+        return Err(EcError::InvalidConfig(error));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
