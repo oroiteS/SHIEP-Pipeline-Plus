@@ -152,6 +152,15 @@ struct ConnectionState {
     close_requested: bool,
 }
 
+struct ControlDispatch<'a, 'b> {
+    device: &'a mut TunnelDevice,
+    iface: &'a mut Interface,
+    sockets: &'a mut SocketSet<'b>,
+    connections: &'a mut HashMap<u64, ConnectionState>,
+    next_conn_id: &'a mut u64,
+    next_local_port: &'a mut u16,
+}
+
 fn run_netstack_loop(
     assigned_ip: [u8; 4],
     control_rx: mpsc::Receiver<ControlMessage>,
@@ -182,16 +191,15 @@ fn run_netstack_loop(
             .poll_delay(now, &sockets)
             .map(|delay| Duration::from_millis(delay.total_millis()));
         if let Some(msg) = wait_control_message(&control_rx, wait)? {
-            process_control_batch(
-                msg,
-                &control_rx,
-                &mut device,
-                &mut iface,
-                &mut sockets,
-                &mut connections,
-                &mut next_conn_id,
-                &mut next_local_port,
-            )?;
+            let mut dispatch = ControlDispatch {
+                device: &mut device,
+                iface: &mut iface,
+                sockets: &mut sockets,
+                connections: &mut connections,
+                next_conn_id: &mut next_conn_id,
+                next_local_port: &mut next_local_port,
+            };
+            process_control_batch(msg, &control_rx, &mut dispatch)?;
         }
 
         let now = smol_now(start);
@@ -203,22 +211,9 @@ fn run_netstack_loop(
 fn process_control_batch(
     first_msg: ControlMessage,
     control_rx: &mpsc::Receiver<ControlMessage>,
-    device: &mut TunnelDevice,
-    iface: &mut Interface,
-    sockets: &mut SocketSet<'_>,
-    connections: &mut HashMap<u64, ConnectionState>,
-    next_conn_id: &mut u64,
-    next_local_port: &mut u16,
+    dispatch: &mut ControlDispatch<'_, '_>,
 ) -> EcResult<()> {
-    handle_control_message(
-        first_msg,
-        device,
-        iface,
-        sockets,
-        connections,
-        next_conn_id,
-        next_local_port,
-    );
+    handle_control_message(first_msg, dispatch);
     for _ in 1..MAX_CONTROL_BATCH {
         let msg = match control_rx.try_recv() {
             Ok(msg) => msg,
@@ -227,50 +222,34 @@ fn process_control_batch(
                 return Err(control_channel_disconnected_err());
             }
         };
-        handle_control_message(
-            msg,
-            device,
-            iface,
-            sockets,
-            connections,
-            next_conn_id,
-            next_local_port,
-        );
+        handle_control_message(msg, dispatch);
     }
     Ok(())
 }
 
-fn handle_control_message(
-    msg: ControlMessage,
-    device: &mut TunnelDevice,
-    iface: &mut Interface,
-    sockets: &mut SocketSet<'_>,
-    connections: &mut HashMap<u64, ConnectionState>,
-    next_conn_id: &mut u64,
-    next_local_port: &mut u16,
-) {
+fn handle_control_message(msg: ControlMessage, dispatch: &mut ControlDispatch<'_, '_>) {
     match msg {
         ControlMessage::TunnelPacket { packet } => {
-            device.push_rx(packet);
+            dispatch.device.push_rx(packet);
         }
         ControlMessage::Open { target, reply } => {
             let result = open_connection(
                 target,
-                iface,
-                sockets,
-                connections,
-                next_conn_id,
-                next_local_port,
+                dispatch.iface,
+                dispatch.sockets,
+                dispatch.connections,
+                dispatch.next_conn_id,
+                dispatch.next_local_port,
             );
             let _ = reply.send(result);
         }
         ControlMessage::Send { id, data } => {
-            if let Some(conn) = connections.get_mut(&id) {
+            if let Some(conn) = dispatch.connections.get_mut(&id) {
                 conn.pending_send.push_back(data);
             }
         }
         ControlMessage::Close { id } => {
-            if let Some(conn) = connections.get_mut(&id) {
+            if let Some(conn) = dispatch.connections.get_mut(&id) {
                 conn.close_requested = true;
             }
         }
