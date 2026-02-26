@@ -6,6 +6,7 @@ use std::str::FromStr;
 use std::sync::{Mutex, OnceLock};
 
 static ROUTER: OnceLock<Mutex<Option<RouteMatcher>>> = OnceLock::new();
+const ROUTER_NOT_INITIALIZED: &str = "route matcher is not initialized";
 
 #[derive(Debug, Clone)]
 pub struct RouteInstallSummary {
@@ -44,14 +45,12 @@ pub fn install_route_table(table: RouteTable) -> EcResult<RouteInstallSummary> {
 pub fn plan_target(host: &str, port: u16) -> EcResult<RoutePlan> {
     let holder = ROUTER
         .get()
-        .ok_or_else(|| EcError::Runtime("route matcher is not initialized".to_string()))?;
+        .ok_or_else(|| EcError::Runtime(ROUTER_NOT_INITIALIZED.to_string()))?;
     let guard = holder
         .lock()
         .map_err(|_| EcError::Runtime("route matcher mutex poisoned".to_string()))?;
     let Some(matcher) = guard.as_ref() else {
-        return Err(EcError::Runtime(
-            "route matcher is not initialized".to_string(),
-        ));
+        return Err(EcError::Runtime(ROUTER_NOT_INITIALIZED.to_string()));
     };
     Ok(matcher.plan(host, port))
 }
@@ -92,37 +91,8 @@ impl RouteMatcher {
             ..
         } = table;
 
-        let mut rules = Vec::with_capacity(raw_rules.len());
-        let mut seen_rules = HashSet::<RuleDedupKey>::with_capacity(raw_rules.len());
-        for rule in raw_rules {
-            if let Some(compiled) = compile_rule(rule) {
-                let key = compiled.dedup_key();
-                if seen_rules.insert(key) {
-                    rules.push(compiled);
-                }
-            }
-        }
-
-        let mut dns_map = HashMap::<i32, HashMap<String, Vec<Ipv4Addr>>>::new();
-        let mut seen_dns = HashSet::<(i32, String, Ipv4Addr)>::with_capacity(raw_dns_records.len());
-        for rec in raw_dns_records {
-            let host = normalize_domain(&rec.host);
-            if host.is_empty() {
-                continue;
-            }
-            let Ok(ip) = Ipv4Addr::from_str(rec.ip.trim()) else {
-                continue;
-            };
-            if !seen_dns.insert((rec.rc_id, host.clone(), ip)) {
-                continue;
-            }
-            dns_map
-                .entry(rec.rc_id)
-                .or_default()
-                .entry(host)
-                .or_default()
-                .push(ip);
-        }
+        let rules = compile_rules(raw_rules);
+        let dns_map = build_dns_map(raw_dns_records);
 
         let dns_records = dns_map
             .values()
@@ -185,6 +155,46 @@ impl RouteMatcher {
             reason: "no whitelist rule matched".to_string(),
         }
     }
+}
+
+fn compile_rules(raw_rules: Vec<RouteRule>) -> Vec<CompiledRule> {
+    let mut rules = Vec::with_capacity(raw_rules.len());
+    let mut seen_rules = HashSet::<RuleDedupKey>::with_capacity(raw_rules.len());
+    for rule in raw_rules {
+        if let Some(compiled) = compile_rule(rule) {
+            let key = compiled.dedup_key();
+            if seen_rules.insert(key) {
+                rules.push(compiled);
+            }
+        }
+    }
+    rules
+}
+
+fn build_dns_map(
+    raw_dns_records: Vec<crate::route_table::DnsRecord>,
+) -> HashMap<i32, HashMap<String, Vec<Ipv4Addr>>> {
+    let mut dns_map = HashMap::<i32, HashMap<String, Vec<Ipv4Addr>>>::new();
+    let mut seen_dns = HashSet::<(i32, String, Ipv4Addr)>::with_capacity(raw_dns_records.len());
+    for rec in raw_dns_records {
+        let host = normalize_domain(&rec.host);
+        if host.is_empty() {
+            continue;
+        }
+        let Ok(ip) = Ipv4Addr::from_str(rec.ip.trim()) else {
+            continue;
+        };
+        if !seen_dns.insert((rec.rc_id, host.clone(), ip)) {
+            continue;
+        }
+        dns_map
+            .entry(rec.rc_id)
+            .or_default()
+            .entry(host)
+            .or_default()
+            .push(ip);
+    }
+    dns_map
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

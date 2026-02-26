@@ -48,6 +48,60 @@ impl StreamProfile {
     }
 }
 
+#[derive(Clone)]
+struct TunnelRuntimeParams {
+    authority: String,
+    host: String,
+    token: [u8; PROTOCOL_TOKEN_LEN],
+    ip_rev: [u8; 4],
+}
+
+impl TunnelRuntimeParams {
+    fn new(
+        authority: String,
+        host: String,
+        token: [u8; PROTOCOL_TOKEN_LEN],
+        assigned_ip: [u8; 4],
+    ) -> Self {
+        Self {
+            authority,
+            host,
+            token,
+            ip_rev: [
+                assigned_ip[3],
+                assigned_ip[2],
+                assigned_ip[1],
+                assigned_ip[0],
+            ],
+        }
+    }
+
+    fn open_stream(&self, profile: StreamProfile) -> EcResult<SslStream<TcpStream>> {
+        open_data_stream(
+            &self.authority,
+            &self.host,
+            &self.token,
+            &self.ip_rev,
+            profile,
+        )
+    }
+
+    fn reopen_stream(
+        &self,
+        profile: StreamProfile,
+        retries: usize,
+    ) -> EcResult<SslStream<TcpStream>> {
+        reopen_data_stream(
+            &self.authority,
+            &self.host,
+            &self.token,
+            &self.ip_rev,
+            profile,
+            retries,
+        )
+    }
+}
+
 static TX_PACKET_SENDER: OnceLock<mpsc::Sender<Vec<u8>>> = OnceLock::new();
 static QUERY_KEEPALIVE: OnceLock<Mutex<Option<SslStream<TcpStream>>>> = OnceLock::new();
 static RX_PACKET_RECEIVER: OnceLock<Mutex<Option<mpsc::Receiver<Vec<u8>>>>> = OnceLock::new();
@@ -69,39 +123,26 @@ pub fn start_tunnel_runtime(server: &str, token: &str, assigned_ip: [u8; 4]) -> 
     clear_tunnel_fatal_reason();
 
     let (authority, host) = parse_server(server)?;
-    let token_arr = parse_protocol_token(token)?;
-    let ip_rev = [
-        assigned_ip[3],
-        assigned_ip[2],
-        assigned_ip[1],
-        assigned_ip[0],
-    ];
+    let runtime =
+        TunnelRuntimeParams::new(authority, host, parse_protocol_token(token)?, assigned_ip);
 
-    let rx_stream = open_data_stream(&authority, &host, &token_arr, &ip_rev, StreamProfile::Rx)?;
+    let rx_stream = runtime.open_stream(StreamProfile::Rx)?;
     output::success(Scope::Protocol, "RX handshake successful");
-    let tx_stream = open_data_stream(&authority, &host, &token_arr, &ip_rev, StreamProfile::Tx)?;
+    let tx_stream = runtime.open_stream(StreamProfile::Tx)?;
     output::success(Scope::Protocol, "TX handshake successful");
 
     let (tx_sender, tx_receiver) = mpsc::channel::<Vec<u8>>();
     let (rx_sender, rx_receiver) = mpsc::channel::<Vec<u8>>();
     install_runtime_channels(tx_sender, rx_receiver)?;
 
-    let rx_authority = authority.clone();
-    let rx_host = host.clone();
+    let rx_runtime = runtime.clone();
     thread::spawn(move || {
-        let result = rx_worker_loop(
-            rx_authority,
-            rx_host,
-            token_arr,
-            ip_rev,
-            rx_stream,
-            rx_sender,
-        );
+        let result = rx_worker_loop(rx_runtime, rx_stream, rx_sender);
         handle_worker_exit(StreamProfile::Rx, result);
     });
 
     thread::spawn(move || {
-        let result = tx_worker_loop(authority, host, token_arr, ip_rev, tx_stream, tx_receiver);
+        let result = tx_worker_loop(runtime, tx_stream, tx_receiver);
         handle_worker_exit(StreamProfile::Tx, result);
     });
 
@@ -257,9 +298,7 @@ fn query_assigned_ip_once(
                     break;
                 }
             }
-            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
-                continue;
-            }
+            Err(e) if is_wouldblock_or_timeout(&e) => continue,
             Err(e) => return Err(EcError::Runtime(format!("query-ip read failed: {e}"))),
         }
     }
@@ -282,10 +321,7 @@ fn query_assigned_ip_once(
 }
 
 fn rx_worker_loop(
-    authority: String,
-    host: String,
-    token: [u8; PROTOCOL_TOKEN_LEN],
-    ip_rev: [u8; 4],
+    runtime: TunnelRuntimeParams,
     mut stream: SslStream<TcpStream>,
     tx: mpsc::Sender<Vec<u8>>,
 ) -> EcResult<()> {
@@ -296,14 +332,7 @@ fn rx_worker_loop(
         match stream.read(&mut buf) {
             Ok(0) => {
                 retries += 1;
-                stream = reopen_data_stream(
-                    &authority,
-                    &host,
-                    &token,
-                    &ip_rev,
-                    StreamProfile::Rx,
-                    retries,
-                )?;
+                stream = runtime.reopen_stream(StreamProfile::Rx, retries)?;
             }
             Ok(n) => {
                 retries = 0;
@@ -311,29 +340,17 @@ fn rx_worker_loop(
                     return Ok(());
                 }
             }
-            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
-                continue;
-            }
+            Err(e) if is_wouldblock_or_timeout(&e) => continue,
             Err(_) => {
                 retries += 1;
-                stream = reopen_data_stream(
-                    &authority,
-                    &host,
-                    &token,
-                    &ip_rev,
-                    StreamProfile::Rx,
-                    retries,
-                )?;
+                stream = runtime.reopen_stream(StreamProfile::Rx, retries)?;
             }
         }
     }
 }
 
 fn tx_worker_loop(
-    authority: String,
-    host: String,
-    token: [u8; PROTOCOL_TOKEN_LEN],
-    ip_rev: [u8; 4],
+    runtime: TunnelRuntimeParams,
     mut stream: SslStream<TcpStream>,
     rx: mpsc::Receiver<Vec<u8>>,
 ) -> EcResult<()> {
@@ -350,14 +367,7 @@ fn tx_worker_loop(
         }
 
         retries += 1;
-        stream = reopen_data_stream(
-            &authority,
-            &host,
-            &token,
-            &ip_rev,
-            StreamProfile::Tx,
-            retries,
-        )?;
+        stream = runtime.reopen_stream(StreamProfile::Tx, retries)?;
         stream.write_all(&packet).map_err(|e| {
             EcError::Runtime(format!("tx stream write failed after reconnect: {e}"))
         })?;
@@ -497,12 +507,14 @@ fn read_stream_once<S: Read + Write>(
         match stream.read(buf) {
             Ok(0) => return Ok(0),
             Ok(n) => return Ok(n),
-            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
-                continue;
-            }
+            Err(e) if is_wouldblock_or_timeout(&e) => continue,
             Err(e) => return Err(EcError::Runtime(format!("stream read failed: {e}"))),
         }
     }
+}
+
+fn is_wouldblock_or_timeout(err: &std::io::Error) -> bool {
+    matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
 }
 
 fn apply_l3ip_session_id(ssl: &mut Ssl, session_version: i32) -> EcResult<()> {
