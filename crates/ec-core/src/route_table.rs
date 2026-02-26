@@ -9,6 +9,8 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
+const ROUTE_TABLE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(8);
+
 #[derive(Debug, Clone)]
 pub struct RouteTable {
     pub rules: Vec<RouteRule>,
@@ -53,14 +55,12 @@ pub fn fetch_route_table(server: &str, twf_id: &str) -> EcResult<RouteTable> {
 
     let mut buf = [0u8; 4096];
     let mut raw = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let deadline = Instant::now() + ROUTE_TABLE_RESPONSE_TIMEOUT;
     while Instant::now() < deadline {
         match stream.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => raw.extend_from_slice(&buf[..n]),
-            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
-                break;
-            }
+            Err(e) if is_timeout_or_wouldblock(&e) => break,
             Err(e) => {
                 return Err(EcError::Runtime(format!(
                     "rclist response read failed: {e}"
@@ -75,13 +75,8 @@ pub fn fetch_route_table(server: &str, twf_id: &str) -> EcResult<RouteTable> {
     }
 
     let text = String::from_utf8_lossy(&raw);
-    let xml_start = text.find("<?xml").or_else(|| text.find("<Resource>"));
-    let Some(start) = xml_start else {
-        return Err(EcError::Runtime(
-            "rclist response does not contain XML payload".to_string(),
-        ));
-    };
-    parse_route_table_xml(&text[start..])
+    let xml_payload = extract_xml_payload(&text)?;
+    parse_route_table_xml(xml_payload)
 }
 
 fn connect_tls(authority: &str, host: &str) -> EcResult<openssl::ssl::SslStream<TcpStream>> {
@@ -213,12 +208,7 @@ fn parse_dns(
     }
 
     if let Some(servers) = servers {
-        for token in servers.split(';') {
-            let s = token.trim();
-            if !s.is_empty() {
-                dns_servers.push(s.to_string());
-            }
-        }
+        push_dns_servers(dns_servers, &servers);
     }
     if let Some(data) = data {
         for token in data.split(';') {
@@ -232,6 +222,29 @@ fn parse_dns(
         }
     }
     Ok(())
+}
+
+fn is_timeout_or_wouldblock(err: &std::io::Error) -> bool {
+    matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
+}
+
+fn extract_xml_payload(response_text: &str) -> EcResult<&str> {
+    let xml_start = response_text
+        .find("<?xml")
+        .or_else(|| response_text.find("<Resource>"))
+        .ok_or_else(|| {
+            EcError::Runtime("rclist response does not contain XML payload".to_string())
+        })?;
+    Ok(&response_text[xml_start..])
+}
+
+fn push_dns_servers(dns_servers: &mut Vec<String>, servers: &str) {
+    for token in servers.split(';') {
+        let s = token.trim();
+        if !s.is_empty() {
+            dns_servers.push(s.to_string());
+        }
+    }
 }
 
 fn parse_dns_record_item(item: &str) -> Option<DnsRecord> {
@@ -297,7 +310,9 @@ fn split_ports(raw: &str) -> Vec<PortRange> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_dns_record_item, parse_route_table_xml, split_hosts, split_ports};
+    use super::{
+        extract_xml_payload, parse_dns_record_item, parse_route_table_xml, split_hosts, split_ports,
+    };
 
     #[test]
     fn split_hosts_normalizes_scheme_and_path() {
@@ -352,5 +367,18 @@ mod tests {
         assert!(parse_dns_record_item("bad").is_none());
         assert!(parse_dns_record_item("not-int:host:10.0.0.1").is_none());
         assert!(parse_dns_record_item("1::10.0.0.1").is_none());
+    }
+
+    #[test]
+    fn extract_xml_payload_finds_resource_start() {
+        let raw = "HTTP/1.1 200 OK\r\n\r\n<Resource><Rcs/></Resource>";
+        let xml = extract_xml_payload(raw).unwrap();
+        assert!(xml.starts_with("<Resource>"));
+    }
+
+    #[test]
+    fn extract_xml_payload_rejects_non_xml_text() {
+        let err = extract_xml_payload("HTTP/1.1 200 OK\r\n\r\nhello").unwrap_err();
+        assert!(err.to_string().contains("does not contain XML payload"));
     }
 }
