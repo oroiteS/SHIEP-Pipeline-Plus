@@ -1,0 +1,92 @@
+name: Build and Upload Release Assets
+
+on:
+  release:
+    types:
+      - published
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-upload:
+    name: Build and Upload (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_TERM_COLOR: always
+      BIN_NAME: ec-cli
+      VERSION: ${{ github.event.release.tag_name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            target_label: linux-x64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            target_label: macos-arm64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            target_label: windows-x64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust (official rustup)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update --target "${{ matrix.target }}"
+          rustup default stable
+          rustc -V
+          cargo -V
+
+      - name: Install Rust (official rustup, Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update --target "${{ matrix.target }}"
+          rustup default stable
+          rustc -V
+          cargo -V
+
+      - name: Build binary
+        run: cargo build --locked --release -p ec-cli --target ${{ matrix.target }}
+
+      - name: Prepare artifact (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          OUT="${BIN_NAME}-${VERSION}-${{ matrix.target_label }}"
+          cp "target/${{ matrix.target }}/release/${BIN_NAME}" "dist/${OUT}"
+          shasum -a 256 "dist/${OUT}" | awk '{print $1}' > "dist/${OUT}.sha256"
+
+      - name: Prepare artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $Out = "$env:BIN_NAME-$env:VERSION-${{ matrix.target_label }}.exe"
+          Copy-Item "target/${{ matrix.target }}/release/$env:BIN_NAME.exe" "dist/$Out"
+          $Hash = (Get-FileHash -Algorithm SHA256 "dist/$Out").Hash.ToLower()
+          Set-Content -NoNewline -Path "dist/$Out.sha256" -Value $Hash
+
+      - name: Upload to release (GitHub CLI)
+        if: runner.os != 'Windows'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" dist/* --clobber
+
+      - name: Upload to release (GitHub CLI, Windows)
+        if: runner.os == 'Windows'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" dist/* --clobber
