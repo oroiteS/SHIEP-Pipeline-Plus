@@ -108,7 +108,7 @@ struct CompiledRule {
 struct RuleIndex {
     domain: HashMap<String, Vec<usize>>,
     ipv4: HashMap<Ipv4Addr, Vec<usize>>,
-    ranges: Vec<usize>,
+    range_buckets: Vec<Vec<usize>>,
 }
 
 #[derive(Debug, Clone)]
@@ -256,7 +256,11 @@ impl RouteMatcher {
 
 impl RuleIndex {
     fn build(rules: &[CompiledRule]) -> Self {
-        let mut index = Self::default();
+        let mut index = Self {
+            domain: HashMap::new(),
+            ipv4: HashMap::new(),
+            range_buckets: vec![Vec::new(); 256],
+        };
         for (idx, rule) in rules.iter().enumerate() {
             match &rule.matcher {
                 HostMatcher::Domain(domain) => {
@@ -265,8 +269,12 @@ impl RuleIndex {
                 HostMatcher::Ipv4(ip) => {
                     index.ipv4.entry(*ip).or_default().push(idx);
                 }
-                HostMatcher::Ipv4Range(_, _) => {
-                    index.ranges.push(idx);
+                HostMatcher::Ipv4Range(start, end) => {
+                    let start_bucket = ((*start >> 24) & 0xff) as usize;
+                    let end_bucket = ((*end >> 24) & 0xff) as usize;
+                    for bucket in start_bucket..=end_bucket {
+                        index.range_buckets[bucket].push(idx);
+                    }
                 }
             }
         }
@@ -300,7 +308,8 @@ impl RuleIndex {
                     }
                 }
                 let needle = u32::from(*ip);
-                for &idx in &self.ranges {
+                let bucket = ((needle >> 24) & 0xff) as usize;
+                for &idx in &self.range_buckets[bucket] {
                     let rule = &rules[idx];
                     let HostMatcher::Ipv4Range(start, end) = &rule.matcher else {
                         continue;
