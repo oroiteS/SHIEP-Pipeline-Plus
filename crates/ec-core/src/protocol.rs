@@ -398,7 +398,7 @@ fn open_data_stream(
         return Err(EcError::Runtime(format!(
             "{} stream handshake reply is empty or timed out; op: {}",
             profile.label(),
-            output::value(op),
+            op,
         )));
     }
     if reply[0] != expected_reply {
@@ -408,9 +408,9 @@ fn open_data_stream(
         return Err(EcError::Runtime(format!(
             "unexpected {} stream handshake reply marker; expected: {}; got: {}; op: {}",
             profile.label(),
-            output::value(expected),
-            output::value(got),
-            output::value(op),
+            expected,
+            got,
+            op,
         )));
     }
 
