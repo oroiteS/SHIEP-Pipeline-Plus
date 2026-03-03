@@ -17,6 +17,18 @@ const DNS_TCP_MAX_PAYLOAD: usize = 65535;
 static DNS_QUERY_ID: AtomicU16 = AtomicU16::new(1);
 static DNS_CACHE: OnceLock<Mutex<HashMap<CacheKey, CacheEntry>>> = OnceLock::new();
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResolveSource {
+    Cache,
+    Server(SocketAddr),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResolveResult {
+    pub ip: Ipv4Addr,
+    pub source: ResolveSource,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CacheKey {
     rc_id: i32,
@@ -46,13 +58,16 @@ pub(crate) fn resolve_first_ipv4(
     rc_id: i32,
     host: &str,
     dns_servers: &[String],
-) -> EcResult<Ipv4Addr> {
+) -> EcResult<ResolveResult> {
     let key = CacheKey {
         rc_id,
         host: host.to_string(),
     };
     if let Some(ip) = cache_get(&key) {
-        return Ok(ip);
+        return Ok(ResolveResult {
+            ip,
+            source: ResolveSource::Cache,
+        });
     }
 
     let mut tried = 0usize;
@@ -65,7 +80,10 @@ pub(crate) fn resolve_first_ipv4(
         match query_server(host, server) {
             Ok(ip) => {
                 cache_put(key, ip);
-                return Ok(ip);
+                return Ok(ResolveResult {
+                    ip,
+                    source: ResolveSource::Server(server),
+                });
             }
             Err(err) => {
                 last_error = Some(format!("{server}: {}", crate::error::concise_error(err)));

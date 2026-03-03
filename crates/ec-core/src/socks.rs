@@ -97,15 +97,29 @@ fn decide_route(target: &ConnectTarget, fallback_proxy: Option<&FallbackProxy>) 
             rc_name,
             source,
         }) => {
-            if source == crate::routing::RouteSource::DnsServer {
-                output::info(
-                    Scope::Upstream,
-                    format_args!(
-                        "dnsserver resolved {} for rc_id={}",
-                        output::value(format!("{} -> {}", target.host(), dial)),
-                        output::value(rc_id)
-                    ),
-                );
+            match source {
+                crate::routing::RouteSource::DnsServerQuery(server) => {
+                    output::info(
+                        Scope::Upstream,
+                        format_args!(
+                            "dnsserver resolved {} via {} for rc_id={}",
+                            output::value(format!("{} -> {}", target.host(), dial)),
+                            output::value(server),
+                            output::value(rc_id)
+                        ),
+                    );
+                }
+                crate::routing::RouteSource::DnsServerCache => {
+                    output::info(
+                        Scope::Upstream,
+                        format_args!(
+                            "dns cache hit {} for rc_id={}",
+                            output::value(format!("{} -> {}", target.host(), dial)),
+                            output::value(rc_id)
+                        ),
+                    );
+                }
+                _ => {}
             }
             route_decision_remote(target_display.as_str(), target_is_ip, dial, rc_name, source)
         }
@@ -151,7 +165,7 @@ fn route_decision_remote(
     };
     RouteDecision {
         line,
-        path: format!("remote -> {name}({dial}); source={}", source.label()),
+        path: format!("remote -> {name}({dial}); source={}", source.describe()),
         transport: RouteTransport::Tunnel(dial),
     }
 }

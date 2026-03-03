@@ -1,7 +1,7 @@
 use crate::error::{EcError, EcResult};
 use crate::route_table::{PortRange, RouteRule, RouteTable};
 use std::collections::{HashMap, HashSet};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -33,7 +33,8 @@ pub enum RoutePlan {
 pub enum RouteSource {
     RuleIp,
     DnsMap,
-    DnsServer,
+    DnsServerCache,
+    DnsServerQuery(SocketAddr),
 }
 
 impl RouteSource {
@@ -41,7 +42,15 @@ impl RouteSource {
         match self {
             RouteSource::RuleIp => "rule-ip",
             RouteSource::DnsMap => "dns-map",
-            RouteSource::DnsServer => "dns-server",
+            RouteSource::DnsServerCache => "dns-cache",
+            RouteSource::DnsServerQuery(_) => "dns-server",
+        }
+    }
+
+    pub fn describe(self) -> String {
+        match self {
+            RouteSource::DnsServerQuery(server) => format!("dns-server({server})"),
+            _ => self.label().to_string(),
         }
     }
 }
@@ -178,12 +187,20 @@ impl RouteMatcher {
                         domain,
                         &self.dns_servers,
                     ) {
-                        Ok(ip) => {
+                        Ok(resolved) => {
+                            let source = match resolved.source {
+                                crate::dns_resolver::ResolveSource::Cache => {
+                                    RouteSource::DnsServerCache
+                                }
+                                crate::dns_resolver::ResolveSource::Server(server) => {
+                                    RouteSource::DnsServerQuery(server)
+                                }
+                            };
                             return RoutePlan::Remote {
-                                dial: format!("{ip}:{port}"),
+                                dial: format!("{}:{port}", resolved.ip),
                                 rc_id: rule.rc_id,
                                 rc_name: rule.rc_name.clone(),
-                                source: RouteSource::DnsServer,
+                                source,
                             };
                         }
                         Err(err) => {
