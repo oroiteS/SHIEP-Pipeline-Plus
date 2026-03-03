@@ -97,13 +97,20 @@ fn decide_route(target: &ConnectTarget, fallback_proxy: Option<&FallbackProxy>) 
             rc_name,
             source,
         }) => {
+            let resolved_ip = dial
+                .rsplit_once(':')
+                .map(|(ip, _)| ip)
+                .unwrap_or(dial.as_str());
+            let arrow = output::weak(" -> ");
             match source {
                 crate::routing::RouteSource::DnsServerQuery(server) => {
                     output::info(
                         Scope::Upstream,
                         format_args!(
-                            "dnsserver resolved {} via {} for rc_id={}",
-                            output::value(format!("{} -> {}", target.host(), dial)),
+                            "dnsserver resolved {}{}{} via {} for rc_id={}",
+                            output::value(target.host()),
+                            arrow,
+                            output::value(resolved_ip),
                             output::value(server),
                             output::value(rc_id)
                         ),
@@ -113,8 +120,10 @@ fn decide_route(target: &ConnectTarget, fallback_proxy: Option<&FallbackProxy>) 
                     output::info(
                         Scope::Upstream,
                         format_args!(
-                            "dns cache hit {} for rc_id={}",
-                            output::value(format!("{} -> {}", target.host(), dial)),
+                            "dns cache hit {}{}{} for rc_id={}",
+                            output::value(target.host()),
+                            arrow,
+                            output::value(resolved_ip),
                             output::value(rc_id)
                         ),
                     );
@@ -126,13 +135,25 @@ fn decide_route(target: &ConnectTarget, fallback_proxy: Option<&FallbackProxy>) 
         Ok(crate::routing::RoutePlan::Fallback {
             target: planned_target,
             reason,
-        }) => route_decision_fallback(
-            target.clone(),
-            target_display.as_str(),
-            target_addr(&planned_target),
-            reason,
-            fallback_proxy,
-        ),
+        }) => {
+            if reason.starts_with("matched reserved proto=1 rule") {
+                output::warn(
+                    Scope::Upstream,
+                    format_args!(
+                        "{} hit reserved proto=1 route (separated from normal routing); forcing {}",
+                        output::value(target_display.as_str()),
+                        output::route_label(RouteKind::Fallback),
+                    ),
+                );
+            }
+            route_decision_fallback(
+                target.clone(),
+                target_display.as_str(),
+                target_addr(&planned_target),
+                reason,
+                fallback_proxy,
+            )
+        }
         Err(err) => route_decision_legacy(target, target_display.as_str(), err),
     }
 }

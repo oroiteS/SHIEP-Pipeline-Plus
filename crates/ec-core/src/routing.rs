@@ -87,6 +87,7 @@ pub fn plan_target(host: &str, port: u16) -> EcResult<RoutePlan> {
 #[derive(Debug, Clone)]
 struct RouteMatcher {
     rules: Vec<CompiledRule>,
+    proto1_rules: Vec<CompiledRule>,
     dns_map: HashMap<i32, HashMap<String, Vec<Ipv4Addr>>>,
     dns_servers: Vec<String>,
     dns_records: usize,
@@ -122,7 +123,7 @@ impl RouteMatcher {
             ..
         } = table;
 
-        let rules = compile_rules(raw_rules);
+        let (rules, proto1_rules) = compile_rules(raw_rules);
         let dns_map = build_dns_map(raw_dns_records);
         let dns_servers = normalize_dns_servers(dns_servers);
 
@@ -133,6 +134,7 @@ impl RouteMatcher {
             .sum();
         Ok(Self {
             rules,
+            proto1_rules,
             dns_map,
             dns_servers,
             dns_records,
@@ -218,6 +220,22 @@ impl RouteMatcher {
             }
         }
 
+        for rule in &self.proto1_rules {
+            if !port_matches(rule.port, port) {
+                continue;
+            }
+            if !host_matches(&rule.matcher, &target) {
+                continue;
+            }
+            return RoutePlan::Fallback {
+                target: format!("{host}:{port}"),
+                reason: format!(
+                    "matched reserved proto=1 rule rc_id={} name={}; proto=1 is separated from normal routing and forced to fallback",
+                    rule.rc_id, rule.rc_name
+                ),
+            };
+        }
+
         RoutePlan::Fallback {
             target: format!("{host}:{port}"),
             reason: "no whitelist rule matched".to_string(),
@@ -241,11 +259,19 @@ fn normalize_dns_servers(servers: Vec<String>) -> Vec<String> {
     out
 }
 
-fn compile_rules(raw_rules: Vec<RouteRule>) -> Vec<CompiledRule> {
+fn compile_rules(raw_rules: Vec<RouteRule>) -> (Vec<CompiledRule>, Vec<CompiledRule>) {
     let mut rules = Vec::with_capacity(raw_rules.len());
+    let mut proto1_rules = Vec::new();
     let mut seen_rules = HashSet::<RuleDedupKey>::with_capacity(raw_rules.len());
+    let mut seen_proto1_rules = HashSet::<RuleDedupKey>::new();
     for rule in raw_rules {
         if rule.proto == 1 {
+            if let Some(compiled) = compile_rule(rule) {
+                let key = compiled.dedup_key();
+                if seen_proto1_rules.insert(key) {
+                    proto1_rules.push(compiled);
+                }
+            }
             continue;
         }
         if let Some(compiled) = compile_rule(rule) {
@@ -255,7 +281,7 @@ fn compile_rules(raw_rules: Vec<RouteRule>) -> Vec<CompiledRule> {
             }
         }
     }
-    rules
+    (rules, proto1_rules)
 }
 
 fn build_dns_map(
@@ -597,7 +623,7 @@ mod tests {
         let plan = matcher.plan("210.35.88.5", 53);
         match plan {
             RoutePlan::Fallback { reason, .. } => {
-                assert_eq!(reason, "no whitelist rule matched");
+                assert!(reason.contains("matched reserved proto=1 rule"));
             }
             _ => panic!("expected fallback plan"),
         }
