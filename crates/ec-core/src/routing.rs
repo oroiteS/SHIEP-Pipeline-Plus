@@ -1,7 +1,7 @@
 use crate::error::{EcError, EcResult};
 use crate::route_table::{PortRange, RouteRule, RouteTable};
 use std::collections::{HashMap, HashSet};
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -92,7 +92,7 @@ struct RouteMatcher {
     proto1_rules: Vec<CompiledRule>,
     proto1_index: RuleIndex,
     dns_map: HashMap<i32, HashMap<String, Vec<Ipv4Addr>>>,
-    dns_servers: Vec<String>,
+    dns_servers: Vec<SocketAddr>,
     dns_records: usize,
 }
 
@@ -319,17 +319,28 @@ impl RuleIndex {
     }
 }
 
-fn normalize_dns_servers(servers: Vec<String>) -> Vec<String> {
+fn normalize_dns_servers(servers: Vec<String>) -> Vec<SocketAddr> {
+    const DNS_DEFAULT_PORT: u16 = 53;
+
     let mut out = Vec::with_capacity(servers.len());
-    let mut seen = HashSet::<String>::with_capacity(servers.len());
+    let mut seen = HashSet::<SocketAddr>::with_capacity(servers.len());
     for raw in servers {
         let token = raw.trim();
         if token.is_empty() {
             continue;
         }
-        let key = token.to_ascii_lowercase();
-        if seen.insert(key) {
-            out.push(token.to_string());
+        let addr = if let Ok(addr) = token.parse::<SocketAddr>() {
+            Some(addr)
+        } else if let Ok(ip) = token.parse::<IpAddr>() {
+            Some(SocketAddr::new(ip, DNS_DEFAULT_PORT))
+        } else {
+            None
+        };
+        let Some(addr) = addr else {
+            continue;
+        };
+        if seen.insert(addr) {
+            out.push(addr);
         }
     }
     out
@@ -632,16 +643,34 @@ mod tests {
             rules: vec![],
             dns_servers: vec![
                 " 210.35.88.5 ".to_string(),
-                "114.114.114.114".to_string(),
-                "210.35.88.5".to_string(),
+                "114.114.114.114:53".to_string(),
+                "210.35.88.5:53".to_string(),
             ],
             dns_records: vec![],
         };
         let matcher = RouteMatcher::from_table(table).unwrap();
         assert_eq!(
             matcher.dns_servers,
-            vec!["210.35.88.5".to_string(), "114.114.114.114".to_string()]
+            vec![
+                "210.35.88.5:53".parse().unwrap(),
+                "114.114.114.114:53".parse().unwrap()
+            ]
         );
+    }
+
+    #[test]
+    fn dns_servers_accept_ipv6_and_drop_invalid_entries() {
+        let table = RouteTable {
+            rules: vec![],
+            dns_servers: vec![
+                "::1".to_string(),
+                "[::1]:53".to_string(),
+                "not-a-server".to_string(),
+            ],
+            dns_records: vec![],
+        };
+        let matcher = RouteMatcher::from_table(table).unwrap();
+        assert_eq!(matcher.dns_servers, vec!["[::1]:53".parse().unwrap()]);
     }
 
     #[test]
@@ -657,7 +686,7 @@ mod tests {
                     end: 65535,
                 },
             }],
-            dns_servers: vec!["bad-server".to_string()],
+            dns_servers: vec!["127.0.0.1:1".to_string()],
             dns_records: vec![],
         };
         let matcher = RouteMatcher::from_table(table).unwrap();

@@ -3,12 +3,11 @@ use hickory_proto::op::{Message, MessageType, Query, ResponseCode};
 use hickory_proto::rr::{Name, RecordType};
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-const DNS_DEFAULT_PORT: u16 = 53;
 const DNS_IO_TIMEOUT: Duration = Duration::from_millis(1200);
 const DNS_CACHE_TTL: Duration = Duration::from_secs(300);
 const DNS_UDP_BUFFER_SIZE: usize = 4096;
@@ -57,7 +56,7 @@ pub(crate) fn clear_cache() {
 pub(crate) fn resolve_first_ipv4(
     rc_id: i32,
     host: &str,
-    dns_servers: &[String],
+    dns_servers: &[SocketAddr],
 ) -> EcResult<ResolveResult> {
     let key = CacheKey {
         rc_id,
@@ -72,10 +71,7 @@ pub(crate) fn resolve_first_ipv4(
 
     let mut tried = 0usize;
     let mut last_error: Option<String> = None;
-    for raw_server in dns_servers {
-        let Some(server) = parse_dns_server(raw_server) else {
-            continue;
-        };
+    for &server in dns_servers {
         tried += 1;
         match query_server(host, server) {
             Ok(ip) => {
@@ -246,20 +242,6 @@ fn bind_udp_socket(server: SocketAddr) -> EcResult<UdpSocket> {
     Ok(socket)
 }
 
-fn parse_dns_server(raw: &str) -> Option<SocketAddr> {
-    let token = raw.trim();
-    if token.is_empty() {
-        return None;
-    }
-    if let Ok(addr) = token.parse::<SocketAddr>() {
-        return Some(addr);
-    }
-    token
-        .parse::<IpAddr>()
-        .ok()
-        .map(|ip| SocketAddr::new(ip, DNS_DEFAULT_PORT))
-}
-
 fn next_query_id() -> u16 {
     DNS_QUERY_ID.fetch_add(1, Ordering::Relaxed)
 }
@@ -291,41 +273,5 @@ fn cache_put(key: CacheKey, ip: Ipv4Addr) {
                 expires_at: Instant::now() + DNS_CACHE_TTL,
             },
         );
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::parse_dns_server;
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-
-    #[test]
-    fn parse_dns_server_accepts_plain_ipv4() {
-        let addr = parse_dns_server("210.35.88.5").unwrap();
-        assert_eq!(
-            addr,
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(210, 35, 88, 5)), 53)
-        );
-    }
-
-    #[test]
-    fn parse_dns_server_accepts_socket_addr() {
-        let addr = parse_dns_server("114.114.114.114:5353").unwrap();
-        assert_eq!(
-            addr,
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(114, 114, 114, 114)), 5353)
-        );
-    }
-
-    #[test]
-    fn parse_dns_server_accepts_plain_ipv6() {
-        let addr = parse_dns_server("::1").unwrap();
-        assert_eq!(addr, SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 53));
-    }
-
-    #[test]
-    fn parse_dns_server_rejects_invalid_value() {
-        assert!(parse_dns_server("not-a-server").is_none());
-        assert!(parse_dns_server("").is_none());
     }
 }
