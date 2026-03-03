@@ -21,12 +21,29 @@ pub enum RoutePlan {
         dial: String,
         rc_id: i32,
         rc_name: String,
-        source: &'static str,
+        source: RouteSource,
     },
     Fallback {
         target: String,
         reason: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteSource {
+    RuleIp,
+    DnsMap,
+    DnsServer,
+}
+
+impl RouteSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            RouteSource::RuleIp => "rule-ip",
+            RouteSource::DnsMap => "dns-map",
+            RouteSource::DnsServer => "dns-server",
+        }
+    }
 }
 
 pub fn install_route_table(table: RouteTable) -> EcResult<RouteInstallSummary> {
@@ -129,7 +146,7 @@ impl RouteMatcher {
                         dial: format!("{ip}:{port}"),
                         rc_id: rule.rc_id,
                         rc_name: rule.rc_name.clone(),
-                        source: "rule-ip",
+                        source: RouteSource::RuleIp,
                     };
                 }
                 TargetKind::Domain(domain) => {
@@ -143,7 +160,7 @@ impl RouteMatcher {
                             dial: format!("{ip}:{port}"),
                             rc_id: rule.rc_id,
                             rc_name: rule.rc_name.clone(),
-                            source: "dns-map",
+                            source: RouteSource::DnsMap,
                         };
                     }
                     if self.dns_servers.is_empty() {
@@ -166,7 +183,7 @@ impl RouteMatcher {
                                 dial: format!("{ip}:{port}"),
                                 rc_id: rule.rc_id,
                                 rc_name: rule.rc_name.clone(),
-                                source: "dns-server",
+                                source: RouteSource::DnsServer,
                             };
                         }
                         Err(err) => {
@@ -340,7 +357,7 @@ fn host_matches(rule: &HostMatcher, target: &TargetKind) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{RouteMatcher, RoutePlan};
+    use super::{RouteMatcher, RoutePlan, RouteSource};
     use crate::route_table::{DnsRecord, PortRange, RouteRule, RouteTable};
 
     #[test]
@@ -373,7 +390,7 @@ mod tests {
             } => {
                 assert_eq!(dial, "10.166.35.11:443");
                 assert_eq!(rc_id, 205);
-                assert_eq!(source, "dns-map");
+                assert_eq!(source, RouteSource::DnsMap);
             }
             _ => panic!("expected remote plan"),
         }
@@ -396,7 +413,7 @@ mod tests {
         match plan {
             RoutePlan::Remote { dial, source, .. } => {
                 assert_eq!(dial, "10.50.2.206:80");
-                assert_eq!(source, "rule-ip");
+                assert_eq!(source, RouteSource::RuleIp);
             }
             _ => panic!("expected remote plan"),
         }

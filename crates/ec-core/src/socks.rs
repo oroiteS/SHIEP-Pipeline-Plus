@@ -97,7 +97,7 @@ fn decide_route(target: &ConnectTarget, fallback_proxy: Option<&FallbackProxy>) 
             rc_name,
             source,
         }) => {
-            if source == "dns-server" {
+            if source == crate::routing::RouteSource::DnsServer {
                 output::info(
                     Scope::Upstream,
                     format_args!(
@@ -128,7 +128,7 @@ fn route_decision_remote(
     target_is_ip: bool,
     dial: String,
     rc_name: String,
-    source: &str,
+    source: crate::routing::RouteSource,
 ) -> RouteDecision {
     let arrow = output::weak(" -> ");
     let lparen = output::weak("(");
@@ -151,7 +151,7 @@ fn route_decision_remote(
     };
     RouteDecision {
         line,
-        path: format!("remote -> {name}({dial}); source={source}"),
+        path: format!("remote -> {name}({dial}); source={}", source.label()),
         transport: RouteTransport::Tunnel(dial),
     }
 }
