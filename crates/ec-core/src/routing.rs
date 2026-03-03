@@ -245,6 +245,9 @@ fn compile_rules(raw_rules: Vec<RouteRule>) -> Vec<CompiledRule> {
     let mut rules = Vec::with_capacity(raw_rules.len());
     let mut seen_rules = HashSet::<RuleDedupKey>::with_capacity(raw_rules.len());
     for rule in raw_rules {
+        if rule.proto == 1 {
+            continue;
+        }
         if let Some(compiled) = compile_rule(rule) {
             let key = compiled.dedup_key();
             if seen_rules.insert(key) {
@@ -382,6 +385,7 @@ mod tests {
         let table = RouteTable {
             rules: vec![RouteRule {
                 rc_id: 205,
+                proto: 0,
                 name: "ids".to_string(),
                 host: "ids.shiep.edu.cn".to_string(),
                 port: PortRange {
@@ -418,6 +422,7 @@ mod tests {
         let table = RouteTable {
             rules: vec![RouteRule {
                 rc_id: 334,
+                proto: 0,
                 name: "fee".to_string(),
                 host: "10.50.2.1~10.50.2.254".to_string(),
                 port: PortRange { start: 80, end: 80 },
@@ -456,6 +461,7 @@ mod tests {
         let table = RouteTable {
             rules: vec![RouteRule {
                 rc_id: 205,
+                proto: 0,
                 name: "ids".to_string(),
                 host: "ids.shiep.edu.cn".to_string(),
                 port: PortRange {
@@ -500,18 +506,21 @@ mod tests {
             rules: vec![
                 RouteRule {
                     rc_id: 115,
+                    proto: 0,
                     name: "qikan".to_string(),
                     host: "qikan.chaoxing.com".to_string(),
                     port: PortRange { start: 80, end: 80 },
                 },
                 RouteRule {
                     rc_id: 115,
+                    proto: 0,
                     name: "qikan".to_string(),
                     host: "qikan.chaoxing.com".to_string(),
                     port: PortRange { start: 80, end: 80 },
                 },
                 RouteRule {
                     rc_id: 115,
+                    proto: 0,
                     name: "qikan".to_string(),
                     host: "qikan.chaoxing.com".to_string(),
                     port: PortRange {
@@ -550,6 +559,7 @@ mod tests {
         let table = RouteTable {
             rules: vec![RouteRule {
                 rc_id: 205,
+                proto: 0,
                 name: "ids".to_string(),
                 host: "ids.shiep.edu.cn".to_string(),
                 port: PortRange {
@@ -565,6 +575,29 @@ mod tests {
         match plan {
             RoutePlan::Fallback { reason, .. } => {
                 assert!(reason.contains("dnsserver lookup failed"));
+            }
+            _ => panic!("expected fallback plan"),
+        }
+    }
+
+    #[test]
+    fn proto1_rules_are_excluded_from_matching() {
+        let table = RouteTable {
+            rules: vec![RouteRule {
+                rc_id: -98,
+                proto: 1,
+                name: "__DNS_HIDE_RC1".to_string(),
+                host: "210.35.88.5".to_string(),
+                port: PortRange { start: 53, end: 53 },
+            }],
+            dns_servers: vec![],
+            dns_records: vec![],
+        };
+        let matcher = RouteMatcher::from_table(table).unwrap();
+        let plan = matcher.plan("210.35.88.5", 53);
+        match plan {
+            RoutePlan::Fallback { reason, .. } => {
+                assert_eq!(reason, "no whitelist rule matched");
             }
             _ => panic!("expected fallback plan"),
         }

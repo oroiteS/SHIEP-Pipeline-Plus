@@ -20,6 +20,7 @@ pub struct RouteTable {
 #[derive(Debug, Clone)]
 pub struct RouteRule {
     pub rc_id: i32,
+    pub proto: i32,
     pub name: String,
     pub host: String,
     pub port: PortRange,
@@ -117,6 +118,7 @@ fn parse_rc(
     rules: &mut Vec<RouteRule>,
 ) -> EcResult<()> {
     let mut id_raw: Option<String> = None;
+    let mut proto_raw: Option<String> = None;
     let mut host_raw: Option<String> = None;
     let mut port_raw: Option<String> = None;
     let mut name: Option<String> = None;
@@ -126,6 +128,7 @@ fn parse_rc(
         let value = decode_attr_value(&attr, reader)?;
         match attr.key.as_ref() {
             b"id" => id_raw = Some(value),
+            b"proto" => proto_raw = Some(value),
             b"host" => host_raw = Some(value),
             b"port" => port_raw = Some(value),
             b"name" => name = Some(value),
@@ -145,6 +148,10 @@ fn parse_rc(
     let rc_id = id_raw
         .parse::<i32>()
         .map_err(|e| EcError::Runtime(format!("invalid rc id '{id_raw}': {e}")))?;
+    let proto = proto_raw
+        .as_deref()
+        .and_then(|v| v.parse::<i32>().ok())
+        .unwrap_or(0);
     let name = name.unwrap_or_default();
     let hosts = split_hosts(&host_raw);
     let ports = split_ports(&port_raw);
@@ -158,6 +165,7 @@ fn parse_rc(
         let port = ports[idx.min(ports.len() - 1)];
         rules.push(RouteRule {
             rc_id,
+            proto,
             name: name.clone(),
             host,
             port,
@@ -319,12 +327,14 @@ mod tests {
         let xml = r#"<?xml version="1.0" encoding="utf-8"?>
 <Resource>
   <Rcs>
-    <Rc id="205" name="IDS" host="ids.shiep.edu.cn;10.1.2.3" port="443~443;80~80" />
+    <Rc id="205" proto="1" name="IDS" host="ids.shiep.edu.cn;10.1.2.3" port="443~443;80~80" />
   </Rcs>
   <Dns dnsserver="210.35.88.5;114.114.114.114" data="205:ids.shiep.edu.cn:10.166.35.11;" />
 </Resource>"#;
         let table = parse_route_table_xml(xml).unwrap();
         assert_eq!(table.rules.len(), 2);
+        assert_eq!(table.rules[0].proto, 1);
+        assert_eq!(table.rules[1].proto, 1);
         assert_eq!(table.dns_servers.len(), 2);
         assert_eq!(table.dns_records.len(), 1);
         assert_eq!(table.dns_records[0].host, "ids.shiep.edu.cn");
