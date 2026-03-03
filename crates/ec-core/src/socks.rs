@@ -207,11 +207,7 @@ fn route_decision_fallback(
                 output::route_label(RouteKind::Fallback),
                 output::value(proxy.url.as_str()),
             ),
-            path: format!(
-                "fallback -> {}; {}: {reason}",
-                proxy.url,
-                output::value("reason")
-            ),
+            path: format!("fallback -> {}; reason: {reason}", proxy.url),
             transport: RouteTransport::Proxy(proxy.clone(), target),
         };
     }
@@ -222,10 +218,7 @@ fn route_decision_fallback(
             output::route_label(RouteKind::Fallback),
             output::route_label(RouteKind::Direct),
         ),
-        path: format!(
-            "fallback -> direct dial={dial}; {}: {reason}",
-            output::value("reason")
-        ),
+        path: format!("fallback -> direct dial={dial}; reason: {reason}"),
         transport: RouteTransport::Direct(dial),
     }
 }
@@ -285,10 +278,7 @@ fn route_runtime_error(
     err: impl std::fmt::Display,
 ) -> EcError {
     let cause = crate::error::concise_error(err);
-    EcError::Runtime(format!(
-        "{target_display} -> {route_path}; {}: {cause}",
-        output::value("failed")
-    ))
+    EcError::Runtime(format!("{target_display} -> {route_path}; failed: {cause}"))
 }
 
 fn write_connect_ok_reply(

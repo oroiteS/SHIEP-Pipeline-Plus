@@ -144,7 +144,8 @@ fn query_udp(id: u16, request: &[u8], server: SocketAddr) -> EcResult<UdpQueryRe
 
     let mut buf = [0u8; DNS_UDP_BUFFER_SIZE];
     // Ignore packets from unexpected peers and only accept responses from the queried server.
-    for _ in 0..16 {
+    let deadline = Instant::now() + DNS_IO_TIMEOUT;
+    while Instant::now() < deadline {
         let (n, peer) = socket
             .recv_from(&mut buf)
             .map_err(|e| EcError::Runtime(format!("dns udp recv failed: {e}")))?;
