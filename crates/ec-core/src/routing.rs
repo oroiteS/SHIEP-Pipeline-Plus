@@ -88,7 +88,9 @@ pub fn plan_target(host: &str, port: u16) -> EcResult<RoutePlan> {
 #[derive(Debug, Clone)]
 struct RouteMatcher {
     rules: Vec<CompiledRule>,
+    rule_index: RuleIndex,
     proto1_rules: Vec<CompiledRule>,
+    proto1_index: RuleIndex,
     dns_map: HashMap<i32, HashMap<String, Vec<Ipv4Addr>>>,
     dns_servers: Vec<String>,
     dns_records: usize,
@@ -100,6 +102,13 @@ struct CompiledRule {
     rc_name: String,
     matcher: HostMatcher,
     port: PortRange,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RuleIndex {
+    domain: HashMap<String, Vec<usize>>,
+    ipv4: HashMap<Ipv4Addr, Vec<usize>>,
+    ranges: Vec<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -125,6 +134,8 @@ impl RouteMatcher {
         } = table;
 
         let (rules, proto1_rules) = compile_rules(raw_rules);
+        let rule_index = RuleIndex::build(&rules);
+        let proto1_index = RuleIndex::build(&proto1_rules);
         let dns_map = build_dns_map(raw_dns_records);
         let dns_servers = normalize_dns_servers(dns_servers);
 
@@ -135,7 +146,9 @@ impl RouteMatcher {
             .sum();
         Ok(Self {
             rules,
+            rule_index,
             proto1_rules,
+            proto1_index,
             dns_map,
             dns_servers,
             dns_records,
@@ -144,92 +157,14 @@ impl RouteMatcher {
 
     fn plan(&self, host: &str, port: u16) -> RoutePlan {
         let target = parse_target(host);
-        for rule in &self.rules {
-            if !port_matches(rule.port, port) {
-                continue;
-            }
-            if !host_matches(&rule.matcher, &target) {
-                continue;
-            }
-
-            match &target {
-                TargetKind::Ipv4(ip) => {
-                    return RoutePlan::Remote {
-                        dial: format!("{ip}:{port}"),
-                        rc_id: rule.rc_id,
-                        rc_name: rule.rc_name.clone(),
-                        source: RouteSource::RuleIp,
-                    };
-                }
-                TargetKind::Domain(domain) => {
-                    if let Some(ipv4s) = self
-                        .dns_map
-                        .get(&rule.rc_id)
-                        .and_then(|domains| domains.get(domain))
-                        && let Some(ip) = ipv4s.first()
-                    {
-                        return RoutePlan::Remote {
-                            dial: format!("{ip}:{port}"),
-                            rc_id: rule.rc_id,
-                            rc_name: rule.rc_name.clone(),
-                            source: RouteSource::DnsMap,
-                        };
-                    }
-                    if self.dns_servers.is_empty() {
-                        return RoutePlan::Fallback {
-                            target: format!("{host}:{port}"),
-                            reason: format!(
-                                "hostname matched rc_id={} but dns map is missing and dnsserver is unavailable",
-                                rule.rc_id
-                            ),
-                            reserved_proto1: false,
-                        };
-                    }
-
-                    match crate::dns_resolver::resolve_first_ipv4(
-                        rule.rc_id,
-                        domain,
-                        &self.dns_servers,
-                    ) {
-                        Ok(resolved) => {
-                            let source = match resolved.source {
-                                crate::dns_resolver::ResolveSource::Cache => {
-                                    RouteSource::DnsServerCache
-                                }
-                                crate::dns_resolver::ResolveSource::Server(server) => {
-                                    RouteSource::DnsServerQuery(server)
-                                }
-                            };
-                            return RoutePlan::Remote {
-                                dial: format!("{}:{port}", resolved.ip),
-                                rc_id: rule.rc_id,
-                                rc_name: rule.rc_name.clone(),
-                                source,
-                            };
-                        }
-                        Err(err) => {
-                            return RoutePlan::Fallback {
-                                target: format!("{host}:{port}"),
-                                reason: format!(
-                                    "hostname matched rc_id={} but dns map is missing and dnsserver lookup failed: {}",
-                                    rule.rc_id,
-                                    crate::error::concise_error(err)
-                                ),
-                                reserved_proto1: false,
-                            };
-                        }
-                    }
-                }
-            }
+        if let Some(rule) = self.rule_index.find_first_match(&self.rules, &target, port) {
+            return self.plan_remote_with_rule(rule, host, port, &target);
         }
 
-        for rule in &self.proto1_rules {
-            if !port_matches(rule.port, port) {
-                continue;
-            }
-            if !host_matches(&rule.matcher, &target) {
-                continue;
-            }
+        if let Some(rule) = self
+            .proto1_index
+            .find_first_match(&self.proto1_rules, &target, port)
+        {
             return RoutePlan::Fallback {
                 target: format!("{host}:{port}"),
                 reason: format!(
@@ -244,6 +179,142 @@ impl RouteMatcher {
             target: format!("{host}:{port}"),
             reason: "no whitelist rule matched".to_string(),
             reserved_proto1: false,
+        }
+    }
+
+    fn plan_remote_with_rule(
+        &self,
+        rule: &CompiledRule,
+        host: &str,
+        port: u16,
+        target: &TargetKind,
+    ) -> RoutePlan {
+        match target {
+            TargetKind::Ipv4(ip) => RoutePlan::Remote {
+                dial: format!("{ip}:{port}"),
+                rc_id: rule.rc_id,
+                rc_name: rule.rc_name.clone(),
+                source: RouteSource::RuleIp,
+            },
+            TargetKind::Domain(domain) => {
+                if let Some(ipv4s) = self
+                    .dns_map
+                    .get(&rule.rc_id)
+                    .and_then(|domains| domains.get(domain))
+                    && let Some(ip) = ipv4s.first()
+                {
+                    return RoutePlan::Remote {
+                        dial: format!("{ip}:{port}"),
+                        rc_id: rule.rc_id,
+                        rc_name: rule.rc_name.clone(),
+                        source: RouteSource::DnsMap,
+                    };
+                }
+                if self.dns_servers.is_empty() {
+                    return RoutePlan::Fallback {
+                        target: format!("{host}:{port}"),
+                        reason: format!(
+                            "hostname matched rc_id={} but dns map is missing and dnsserver is unavailable",
+                            rule.rc_id
+                        ),
+                        reserved_proto1: false,
+                    };
+                }
+
+                match crate::dns_resolver::resolve_first_ipv4(rule.rc_id, domain, &self.dns_servers)
+                {
+                    Ok(resolved) => {
+                        let source = match resolved.source {
+                            crate::dns_resolver::ResolveSource::Cache => {
+                                RouteSource::DnsServerCache
+                            }
+                            crate::dns_resolver::ResolveSource::Server(server) => {
+                                RouteSource::DnsServerQuery(server)
+                            }
+                        };
+                        RoutePlan::Remote {
+                            dial: format!("{}:{port}", resolved.ip),
+                            rc_id: rule.rc_id,
+                            rc_name: rule.rc_name.clone(),
+                            source,
+                        }
+                    }
+                    Err(err) => RoutePlan::Fallback {
+                        target: format!("{host}:{port}"),
+                        reason: format!(
+                            "hostname matched rc_id={} but dns map is missing and dnsserver lookup failed: {}",
+                            rule.rc_id,
+                            crate::error::concise_error(err)
+                        ),
+                        reserved_proto1: false,
+                    },
+                }
+            }
+        }
+    }
+}
+
+impl RuleIndex {
+    fn build(rules: &[CompiledRule]) -> Self {
+        let mut index = Self::default();
+        for (idx, rule) in rules.iter().enumerate() {
+            match &rule.matcher {
+                HostMatcher::Domain(domain) => {
+                    index.domain.entry(domain.clone()).or_default().push(idx);
+                }
+                HostMatcher::Ipv4(ip) => {
+                    index.ipv4.entry(*ip).or_default().push(idx);
+                }
+                HostMatcher::Ipv4Range(_, _) => {
+                    index.ranges.push(idx);
+                }
+            }
+        }
+        index
+    }
+
+    fn find_first_match<'a>(
+        &self,
+        rules: &'a [CompiledRule],
+        target: &TargetKind,
+        port: u16,
+    ) -> Option<&'a CompiledRule> {
+        match target {
+            TargetKind::Domain(domain) => self
+                .domain
+                .get(domain)
+                .and_then(|ids| {
+                    ids.iter()
+                        .find_map(|&idx| port_matches(rules[idx].port, port).then_some(idx))
+                })
+                .map(|idx| &rules[idx]),
+            TargetKind::Ipv4(ip) => {
+                let mut best_idx: Option<usize> = None;
+                if let Some(ids) = self.ipv4.get(ip) {
+                    for &idx in ids {
+                        if port_matches(rules[idx].port, port)
+                            && best_idx.is_none_or(|best| idx < best)
+                        {
+                            best_idx = Some(idx);
+                        }
+                    }
+                }
+                let needle = u32::from(*ip);
+                for &idx in &self.ranges {
+                    let rule = &rules[idx];
+                    let HostMatcher::Ipv4Range(start, end) = &rule.matcher else {
+                        continue;
+                    };
+                    if *start <= needle
+                        && needle <= *end
+                        && port_matches(rule.port, port)
+                        && best_idx.is_none_or(|best| idx < best)
+                    {
+                        best_idx = Some(idx);
+                    }
+                }
+                best_idx.map(|idx| &rules[idx])
+            }
         }
     }
 }
@@ -392,18 +463,6 @@ fn normalize_domain(host: &str) -> String {
 
 fn port_matches(range: PortRange, port: u16) -> bool {
     range.start <= port && port <= range.end
-}
-
-fn host_matches(rule: &HostMatcher, target: &TargetKind) -> bool {
-    match (rule, target) {
-        (HostMatcher::Domain(a), TargetKind::Domain(b)) => a == b,
-        (HostMatcher::Ipv4(a), TargetKind::Ipv4(b)) => a == b,
-        (HostMatcher::Ipv4Range(a, b), TargetKind::Ipv4(ip)) => {
-            let n = u32::from(*ip);
-            *a <= n && n <= *b
-        }
-        _ => false,
-    }
 }
 
 #[cfg(test)]
@@ -631,6 +690,39 @@ mod tests {
                 assert!(reason.contains("matched reserved proto=1 rule"));
             }
             _ => panic!("expected fallback plan"),
+        }
+    }
+
+    #[test]
+    fn ip_match_preserves_original_rule_order_between_exact_and_range() {
+        let table = RouteTable {
+            rules: vec![
+                RouteRule {
+                    rc_id: 1,
+                    proto: 0,
+                    name: "range-first".to_string(),
+                    host: "10.50.2.1~10.50.2.254".to_string(),
+                    port: PortRange { start: 80, end: 80 },
+                },
+                RouteRule {
+                    rc_id: 2,
+                    proto: 0,
+                    name: "exact-second".to_string(),
+                    host: "10.50.2.206".to_string(),
+                    port: PortRange { start: 80, end: 80 },
+                },
+            ],
+            dns_servers: vec![],
+            dns_records: vec![],
+        };
+        let matcher = RouteMatcher::from_table(table).unwrap();
+        let plan = matcher.plan("10.50.2.206", 80);
+        match plan {
+            RoutePlan::Remote { rc_id, dial, .. } => {
+                assert_eq!(rc_id, 1);
+                assert_eq!(dial, "10.50.2.206:80");
+            }
+            _ => panic!("expected remote plan"),
         }
     }
 }
