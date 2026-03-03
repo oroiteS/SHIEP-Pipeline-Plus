@@ -26,6 +26,7 @@ pub enum RoutePlan {
     Fallback {
         target: String,
         reason: String,
+        reserved_proto1: bool,
     },
 }
 
@@ -181,6 +182,7 @@ impl RouteMatcher {
                                 "hostname matched rc_id={} but dns map is missing and dnsserver is unavailable",
                                 rule.rc_id
                             ),
+                            reserved_proto1: false,
                         };
                     }
 
@@ -213,6 +215,7 @@ impl RouteMatcher {
                                     rule.rc_id,
                                     crate::error::concise_error(err)
                                 ),
+                                reserved_proto1: false,
                             };
                         }
                     }
@@ -233,12 +236,14 @@ impl RouteMatcher {
                     "matched reserved proto=1 rule rc_id={} name={}; proto=1 is separated from normal routing and forced to fallback",
                     rule.rc_id, rule.rc_name
                 ),
+                reserved_proto1: true,
             };
         }
 
         RoutePlan::Fallback {
             target: format!("{host}:{port}"),
             reason: "no whitelist rule matched".to_string(),
+            reserved_proto1: false,
         }
     }
 }
@@ -261,9 +266,9 @@ fn normalize_dns_servers(servers: Vec<String>) -> Vec<String> {
 
 fn compile_rules(raw_rules: Vec<RouteRule>) -> (Vec<CompiledRule>, Vec<CompiledRule>) {
     let mut rules = Vec::with_capacity(raw_rules.len());
-    let mut proto1_rules = Vec::new();
+    let mut proto1_rules = Vec::with_capacity(raw_rules.len());
     let mut seen_rules = HashSet::<RuleDedupKey>::with_capacity(raw_rules.len());
-    let mut seen_proto1_rules = HashSet::<RuleDedupKey>::new();
+    let mut seen_proto1_rules = HashSet::<RuleDedupKey>::with_capacity(raw_rules.len());
     for rule in raw_rules {
         if rule.proto == 1 {
             if let Some(compiled) = compile_rule(rule) {

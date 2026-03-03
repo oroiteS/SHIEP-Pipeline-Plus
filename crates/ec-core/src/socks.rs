@@ -135,8 +135,9 @@ fn decide_route(target: &ConnectTarget, fallback_proxy: Option<&FallbackProxy>) 
         Ok(crate::routing::RoutePlan::Fallback {
             target: planned_target,
             reason,
+            reserved_proto1,
         }) => {
-            if reason.starts_with("matched reserved proto=1 rule") {
+            if reserved_proto1 {
                 output::warn(
                     Scope::Upstream,
                     format_args!(
