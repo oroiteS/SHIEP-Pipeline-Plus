@@ -4,6 +4,7 @@ pub mod error;
 pub mod output;
 
 mod auth;
+mod dns_resolver;
 mod endpoint;
 mod netstack;
 mod netstack_device;

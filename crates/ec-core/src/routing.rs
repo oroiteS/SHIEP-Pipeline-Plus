@@ -3,9 +3,9 @@ use crate::route_table::{PortRange, RouteRule, RouteTable};
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::str::FromStr;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
-static ROUTER: OnceLock<Mutex<Option<RouteMatcher>>> = OnceLock::new();
+static ROUTER: OnceLock<Mutex<Option<Arc<RouteMatcher>>>> = OnceLock::new();
 const ROUTER_NOT_INITIALIZED: &str = "route matcher is not initialized";
 
 #[derive(Debug, Clone)]
@@ -33,14 +33,15 @@ pub fn install_route_table(table: RouteTable) -> EcResult<RouteInstallSummary> {
     let matcher = RouteMatcher::from_table(table)?;
     let summary = RouteInstallSummary {
         rule_count: matcher.rules.len(),
-        dns_server_count: matcher.dns_servers,
+        dns_server_count: matcher.dns_servers.len(),
         dns_record_count: matcher.dns_records,
     };
     let holder = ROUTER.get_or_init(|| Mutex::new(None));
     let mut guard = holder
         .lock()
         .map_err(|_| EcError::Runtime("route matcher mutex poisoned".to_string()))?;
-    *guard = Some(matcher);
+    crate::dns_resolver::clear_cache();
+    *guard = Some(Arc::new(matcher));
     Ok(summary)
 }
 
@@ -48,10 +49,10 @@ pub fn plan_target(host: &str, port: u16) -> EcResult<RoutePlan> {
     let holder = ROUTER
         .get()
         .ok_or_else(|| EcError::Runtime(ROUTER_NOT_INITIALIZED.to_string()))?;
-    let guard = holder
+    let matcher = holder
         .lock()
         .map_err(|_| EcError::Runtime("route matcher mutex poisoned".to_string()))?;
-    let Some(matcher) = guard.as_ref() else {
+    let Some(matcher) = matcher.as_ref().cloned() else {
         return Err(EcError::Runtime(ROUTER_NOT_INITIALIZED.to_string()));
     };
     Ok(matcher.plan(host, port))
@@ -61,7 +62,7 @@ pub fn plan_target(host: &str, port: u16) -> EcResult<RoutePlan> {
 struct RouteMatcher {
     rules: Vec<CompiledRule>,
     dns_map: HashMap<i32, HashMap<String, Vec<Ipv4Addr>>>,
-    dns_servers: usize,
+    dns_servers: Vec<String>,
     dns_records: usize,
 }
 
@@ -97,6 +98,7 @@ impl RouteMatcher {
 
         let rules = compile_rules(raw_rules);
         let dns_map = build_dns_map(raw_dns_records);
+        let dns_servers = normalize_dns_servers(dns_servers);
 
         let dns_records = dns_map
             .values()
@@ -106,7 +108,7 @@ impl RouteMatcher {
         Ok(Self {
             rules,
             dns_map,
-            dns_servers: dns_servers.len(),
+            dns_servers,
             dns_records,
         })
     }
@@ -144,13 +146,40 @@ impl RouteMatcher {
                             source: "dns-map",
                         };
                     }
-                    return RoutePlan::Fallback {
-                        target: format!("{host}:{port}"),
-                        reason: format!(
-                            "hostname matched rc_id={} but dns map is missing",
-                            rule.rc_id
-                        ),
-                    };
+                    if self.dns_servers.is_empty() {
+                        return RoutePlan::Fallback {
+                            target: format!("{host}:{port}"),
+                            reason: format!(
+                                "hostname matched rc_id={} but dns map is missing and dnsserver is unavailable",
+                                rule.rc_id
+                            ),
+                        };
+                    }
+
+                    match crate::dns_resolver::resolve_first_ipv4(
+                        rule.rc_id,
+                        domain,
+                        &self.dns_servers,
+                    ) {
+                        Ok(ip) => {
+                            return RoutePlan::Remote {
+                                dial: format!("{ip}:{port}"),
+                                rc_id: rule.rc_id,
+                                rc_name: rule.rc_name.clone(),
+                                source: "dns-server",
+                            };
+                        }
+                        Err(err) => {
+                            return RoutePlan::Fallback {
+                                target: format!("{host}:{port}"),
+                                reason: format!(
+                                    "hostname matched rc_id={} but dns map is missing and dnsserver lookup failed: {}",
+                                    rule.rc_id,
+                                    crate::error::concise_error(err)
+                                ),
+                            };
+                        }
+                    }
                 }
             }
         }
@@ -160,6 +189,22 @@ impl RouteMatcher {
             reason: "no whitelist rule matched".to_string(),
         }
     }
+}
+
+fn normalize_dns_servers(servers: Vec<String>) -> Vec<String> {
+    let mut out = Vec::with_capacity(servers.len());
+    let mut seen = HashSet::<String>::with_capacity(servers.len());
+    for raw in servers {
+        let token = raw.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let key = token.to_ascii_lowercase();
+        if seen.insert(key) {
+            out.push(token.to_string());
+        }
+    }
+    out
 }
 
 fn compile_rules(raw_rules: Vec<RouteRule>) -> Vec<CompiledRule> {
@@ -446,5 +491,48 @@ mod tests {
         };
         let matcher = RouteMatcher::from_table(table).unwrap();
         assert_eq!(matcher.rules.len(), 2);
+    }
+
+    #[test]
+    fn dns_servers_are_deduped_and_trimmed() {
+        let table = RouteTable {
+            rules: vec![],
+            dns_servers: vec![
+                " 210.35.88.5 ".to_string(),
+                "114.114.114.114".to_string(),
+                "210.35.88.5".to_string(),
+            ],
+            dns_records: vec![],
+        };
+        let matcher = RouteMatcher::from_table(table).unwrap();
+        assert_eq!(
+            matcher.dns_servers,
+            vec!["210.35.88.5".to_string(), "114.114.114.114".to_string()]
+        );
+    }
+
+    #[test]
+    fn domain_hit_without_dns_map_uses_dnsserver_fallback_reason() {
+        let table = RouteTable {
+            rules: vec![RouteRule {
+                rc_id: 205,
+                name: "ids".to_string(),
+                host: "ids.shiep.edu.cn".to_string(),
+                port: PortRange {
+                    start: 1,
+                    end: 65535,
+                },
+            }],
+            dns_servers: vec!["bad-server".to_string()],
+            dns_records: vec![],
+        };
+        let matcher = RouteMatcher::from_table(table).unwrap();
+        let plan = matcher.plan("ids.shiep.edu.cn", 443);
+        match plan {
+            RoutePlan::Fallback { reason, .. } => {
+                assert!(reason.contains("dnsserver lookup failed"));
+            }
+            _ => panic!("expected fallback plan"),
+        }
     }
 }
