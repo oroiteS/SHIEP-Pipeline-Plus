@@ -93,10 +93,22 @@ fn decide_route(target: &ConnectTarget, fallback_proxy: Option<&FallbackProxy>) 
     match crate::routing::plan_target(target.host(), target.port()) {
         Ok(crate::routing::RoutePlan::Remote {
             dial,
-            rc_id: _rc_id,
+            rc_id,
             rc_name,
-            source: _source,
-        }) => route_decision_remote(target_display.as_str(), target_is_ip, dial, rc_name),
+            source,
+        }) => {
+            if source == "dns-server" {
+                output::info(
+                    Scope::Upstream,
+                    format_args!(
+                        "dnsserver resolved {} for rc_id={}",
+                        output::value(format!("{} -> {}", target.host(), dial)),
+                        output::value(rc_id)
+                    ),
+                );
+            }
+            route_decision_remote(target_display.as_str(), target_is_ip, dial, rc_name, source)
+        }
         Ok(crate::routing::RoutePlan::Fallback {
             target: planned_target,
             reason,
@@ -116,6 +128,7 @@ fn route_decision_remote(
     target_is_ip: bool,
     dial: String,
     rc_name: String,
+    source: &str,
 ) -> RouteDecision {
     let arrow = output::weak(" -> ");
     let lparen = output::weak("(");
@@ -138,7 +151,7 @@ fn route_decision_remote(
     };
     RouteDecision {
         line,
-        path: format!("remote -> {name}({dial})"),
+        path: format!("remote -> {name}({dial}); source={source}"),
         transport: RouteTransport::Tunnel(dial),
     }
 }
