@@ -4,7 +4,7 @@ use ec_core::{AppConfig, EasyConnectApp};
 use std::path::Path;
 
 #[derive(Debug, Parser)]
-#[command(name = "shiep-pipeline")]
+#[command(name = "SHIEP-Pipeline")]
 #[command(about = "Minimal CLI-only EasyConnect pipeline")]
 struct CliArgs {
     #[arg(long, help_heading = "Required", help = "VPN server address")]
@@ -35,6 +35,14 @@ struct CliArgs {
 
 fn main() {
     let args = parse_args();
+    output::info(
+        Scope::App,
+        format_args!(
+            "{} {}",
+            output::value("SHIEP-Pipeline"),
+            output::value(app_version())
+        ),
+    );
 
     let config = match AppConfig::new(
         args.server,
@@ -61,13 +69,17 @@ fn main() {
     }
 }
 
+fn app_version() -> &'static str {
+    option_env!("SHIEP_PIPELINE_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
+}
+
 fn parse_args() -> CliArgs {
     let mut cmd = CliArgs::command();
     let bin = current_bin_name().unwrap_or_else(|| cmd.get_name().to_string());
 
     let usage =
         format!("{bin} [OPTIONS] --server <SERVER> --username <USERNAME> --password <PASSWORD>");
-    cmd = cmd.override_usage(usage);
+    cmd = cmd.version(app_version()).override_usage(usage);
 
     let matches = cmd.get_matches();
     CliArgs::from_arg_matches(&matches).unwrap_or_else(|e| e.exit())
