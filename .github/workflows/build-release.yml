@@ -15,7 +15,8 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       BIN_NAME: SHIEP-Pipeline
-      VERSION: ${{ github.event.release.tag_name }}
+      VERSION: ${{ github.ref_name }}
+      SHIEP_PIPELINE_VERSION: ${{ github.ref_name }}
     strategy:
       fail-fast: false
       matrix:
