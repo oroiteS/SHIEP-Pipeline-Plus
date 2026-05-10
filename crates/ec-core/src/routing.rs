@@ -37,6 +37,9 @@ pub enum RouteSource {
     DnsData,
     DnsServerCache,
     DnsServerQuery(SocketAddr),
+    CnameDnsMap,
+    CnameDnsServerCache,
+    CnameDnsServerQuery(SocketAddr),
 }
 
 impl RouteSource {
@@ -47,12 +50,16 @@ impl RouteSource {
             RouteSource::DnsData => "dns-data",
             RouteSource::DnsServerCache => "dns-cache",
             RouteSource::DnsServerQuery(_) => "dns-server",
+            RouteSource::CnameDnsMap => "cname-dns-map",
+            RouteSource::CnameDnsServerCache => "cname-dns-cache",
+            RouteSource::CnameDnsServerQuery(_) => "cname-dns-server",
         }
     }
 
     pub fn describe(self) -> String {
         match self {
             RouteSource::DnsServerQuery(server) => format!("dns-server({server})"),
+            RouteSource::CnameDnsServerQuery(server) => format!("cname-dns-server({server})"),
             _ => self.label().to_string(),
         }
     }
@@ -192,6 +199,12 @@ impl RouteMatcher {
             };
         }
 
+        if let TargetKind::Domain(domain) = &target
+            && let Some(plan) = self.plan_cname_aliases(host, port, domain)
+        {
+            return plan;
+        }
+
         RoutePlan::Fallback {
             target: format!("{host}:{port}"),
             reason: "no whitelist rule matched".to_string(),
@@ -268,6 +281,78 @@ impl RouteMatcher {
                 }
             }
         }
+    }
+
+    fn plan_cname_aliases(&self, host: &str, port: u16, domain: &str) -> Option<RoutePlan> {
+        if self.dns_servers.is_empty() {
+            return None;
+        }
+        let resolved = crate::dns_resolver::resolve_cname_chain(domain, &self.dns_servers).ok()?;
+        self.plan_from_cname_aliases(host, port, &resolved.aliases)
+    }
+
+    fn plan_from_cname_aliases(
+        &self,
+        host: &str,
+        port: u16,
+        aliases: &[String],
+    ) -> Option<RoutePlan> {
+        for alias in aliases {
+            let alias = normalize_domain(alias);
+            if alias.is_empty() || Ipv4Addr::from_str(&alias).is_ok() {
+                continue;
+            }
+            let target = TargetKind::Domain(alias);
+            if let Some(rule) = self.rule_index.find_first_match(&self.rules, &target, port) {
+                return Some(self.plan_remote_with_cname_rule(rule, host, port, &target));
+            }
+            if let Some(rule) =
+                self.proto1_index
+                    .find_first_match(&self.proto1_rules, &target, port)
+            {
+                return Some(RoutePlan::Fallback {
+                    target: format!("{host}:{port}"),
+                    reason: format!(
+                        "cname matched reserved proto=1 rule rc_id={} name={}; proto=1 is separated from normal routing and forced to fallback",
+                        rule.rc_id, rule.rc_name
+                    ),
+                    reserved_proto1: true,
+                });
+            }
+        }
+        None
+    }
+
+    fn plan_remote_with_cname_rule(
+        &self,
+        rule: &CompiledRule,
+        host: &str,
+        port: u16,
+        target: &TargetKind,
+    ) -> RoutePlan {
+        match self.plan_remote_with_rule(rule, host, port, target) {
+            RoutePlan::Remote {
+                dial,
+                rc_id,
+                rc_name,
+                source,
+            } => RoutePlan::Remote {
+                dial,
+                rc_id,
+                rc_name,
+                source: cname_route_source(source),
+            },
+            other => other,
+        }
+    }
+}
+
+fn cname_route_source(source: RouteSource) -> RouteSource {
+    match source {
+        RouteSource::DnsMap => RouteSource::CnameDnsMap,
+        RouteSource::DnsServerCache => RouteSource::CnameDnsServerCache,
+        RouteSource::DnsServerQuery(server) => RouteSource::CnameDnsServerQuery(server),
+        other => other,
     }
 }
 
@@ -612,6 +697,74 @@ mod tests {
             }
             _ => panic!("expected fallback plan"),
         }
+    }
+
+    #[test]
+    fn cname_alias_can_rematch_domain_rule() {
+        let table = RouteTable {
+            rules: vec![RouteRule {
+                rc_id: 150,
+                proto: 0,
+                name: "SUEP-WAF".to_string(),
+                host: "lgwf0-46.shiep.edu.cn".to_string(),
+                port: PortRange {
+                    start: 1,
+                    end: 65535,
+                },
+            }],
+            dns_servers: vec![],
+            dns_records: vec![DnsRecord {
+                rc_id: 150,
+                host: "lgwf0-46.shiep.edu.cn".to_string(),
+                ip: "10.166.64.6".to_string(),
+            }],
+        };
+        let matcher = RouteMatcher::from_table(table).unwrap();
+        let plan = matcher
+            .plan_from_cname_aliases(
+                "estudent.shiep.edu.cn",
+                443,
+                &["lgwf0-46.shiep.edu.cn".to_string()],
+            )
+            .unwrap();
+        match plan {
+            RoutePlan::Remote {
+                dial,
+                rc_id,
+                source,
+                ..
+            } => {
+                assert_eq!(dial, "10.166.64.6:443");
+                assert_eq!(rc_id, 150);
+                assert_eq!(source, RouteSource::CnameDnsMap);
+            }
+            _ => panic!("expected remote plan"),
+        }
+    }
+
+    #[test]
+    fn cname_alias_rematch_never_promotes_ip_to_rule_match() {
+        let table = RouteTable {
+            rules: vec![RouteRule {
+                rc_id: 150,
+                proto: 0,
+                name: "private-ip".to_string(),
+                host: "10.166.64.6".to_string(),
+                port: PortRange {
+                    start: 1,
+                    end: 65535,
+                },
+            }],
+            dns_servers: vec![],
+            dns_records: vec![],
+        };
+        let matcher = RouteMatcher::from_table(table).unwrap();
+        let plan = matcher.plan_from_cname_aliases(
+            "estudent.shiep.edu.cn",
+            443,
+            &["10.166.64.6".to_string()],
+        );
+        assert!(plan.is_none());
     }
 
     #[test]

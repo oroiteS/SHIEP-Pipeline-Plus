@@ -103,7 +103,8 @@ fn decide_route(target: &ConnectTarget, fallback_proxy: Option<&FallbackProxy>) 
                 .unwrap_or(dial.as_str());
             let arrow = output::weak(" -> ");
             match source {
-                crate::routing::RouteSource::DnsServerQuery(server) => {
+                crate::routing::RouteSource::DnsServerQuery(server)
+                | crate::routing::RouteSource::CnameDnsServerQuery(server) => {
                     output::info(
                         Scope::Upstream,
                         format_args!(
@@ -116,7 +117,8 @@ fn decide_route(target: &ConnectTarget, fallback_proxy: Option<&FallbackProxy>) 
                         ),
                     );
                 }
-                crate::routing::RouteSource::DnsServerCache => {
+                crate::routing::RouteSource::DnsServerCache
+                | crate::routing::RouteSource::CnameDnsServerCache => {
                     output::info(
                         Scope::Upstream,
                         format_args!(

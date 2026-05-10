@@ -1,6 +1,6 @@
 use crate::error::{EcError, EcResult};
 use hickory_proto::op::{Message, MessageType, Query, ResponseCode};
-use hickory_proto::rr::{Name, RecordType};
+use hickory_proto::rr::{Name, RData, RecordType};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
@@ -15,6 +15,7 @@ const DNS_TCP_MAX_PAYLOAD: usize = 65535;
 
 static DNS_QUERY_ID: AtomicU16 = AtomicU16::new(1);
 static DNS_CACHE: OnceLock<Mutex<HashMap<CacheKey, CacheEntry>>> = OnceLock::new();
+static DNS_CNAME_CACHE: OnceLock<Mutex<HashMap<String, CnameCacheEntry>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResolveSource {
@@ -25,6 +26,12 @@ pub(crate) enum ResolveSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ResolveResult {
     pub ip: Ipv4Addr,
+    pub source: ResolveSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CnameResolveResult {
+    pub aliases: Vec<String>,
     pub source: ResolveSource,
 }
 
@@ -40,6 +47,12 @@ struct CacheEntry {
     expires_at: Instant,
 }
 
+#[derive(Debug, Clone)]
+struct CnameCacheEntry {
+    aliases: Vec<String>,
+    expires_at: Instant,
+}
+
 enum UdpQueryResult {
     Complete(Message),
     Truncated,
@@ -47,6 +60,11 @@ enum UdpQueryResult {
 
 pub(crate) fn clear_cache() {
     if let Some(cache) = DNS_CACHE.get()
+        && let Ok(mut guard) = cache.lock()
+    {
+        guard.clear();
+    }
+    if let Some(cache) = DNS_CNAME_CACHE.get()
         && let Ok(mut guard) = cache.lock()
     {
         guard.clear();
@@ -99,14 +117,59 @@ pub(crate) fn resolve_first_ipv4(
     )))
 }
 
+pub(crate) fn resolve_cname_chain(
+    host: &str,
+    dns_servers: &[SocketAddr],
+) -> EcResult<CnameResolveResult> {
+    let key = normalize_dns_name(host);
+    if let Some(aliases) = cname_cache_get(&key) {
+        return Ok(CnameResolveResult {
+            aliases,
+            source: ResolveSource::Cache,
+        });
+    }
+
+    let mut tried = 0usize;
+    let mut last_error: Option<String> = None;
+    for &server in dns_servers {
+        tried += 1;
+        match query_server_message(host, server) {
+            Ok(message) => {
+                let aliases = extract_cname_aliases(&message);
+                cname_cache_put(key, aliases.clone());
+                return Ok(CnameResolveResult {
+                    aliases,
+                    source: ResolveSource::Server(server),
+                });
+            }
+            Err(err) => {
+                last_error = Some(format!("{server}: {}", crate::error::concise_error(err)));
+            }
+        }
+    }
+
+    if tried == 0 {
+        return Err(EcError::Runtime(
+            "dnsserver lookup has no valid server address".to_string(),
+        ));
+    }
+
+    Err(EcError::Runtime(format!(
+        "dnsserver lookup failed for {host}; {}",
+        last_error.unwrap_or_else(|| "no response".to_string())
+    )))
+}
+
 fn query_server(host: &str, server: SocketAddr) -> EcResult<Ipv4Addr> {
+    let message = query_server_message(host, server)?;
+    extract_first_ipv4(&message, server)
+}
+
+fn query_server_message(host: &str, server: SocketAddr) -> EcResult<Message> {
     let (id, request) = build_a_query(host)?;
     match query_udp(id, &request, server)? {
-        UdpQueryResult::Complete(message) => extract_first_ipv4(&message, server),
-        UdpQueryResult::Truncated => {
-            let message = query_tcp(id, &request, server)?;
-            extract_first_ipv4(&message, server)
-        }
+        UdpQueryResult::Complete(message) => Ok(message),
+        UdpQueryResult::Truncated => query_tcp(id, &request, server),
     }
 }
 
@@ -226,6 +289,24 @@ fn extract_first_ipv4(message: &Message, server: SocketAddr) -> EcResult<Ipv4Add
     Err(EcError::Runtime(format!("dns no A answer from {server}")))
 }
 
+fn extract_cname_aliases(message: &Message) -> Vec<String> {
+    let mut aliases = Vec::<String>::new();
+    for answer in message.answers() {
+        let RData::CNAME(cname) = answer.data() else {
+            continue;
+        };
+        let alias = normalize_dns_name(cname.to_string().as_str());
+        if !alias.is_empty() && !aliases.contains(&alias) {
+            aliases.push(alias);
+        }
+    }
+    aliases
+}
+
+fn normalize_dns_name(host: &str) -> String {
+    host.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
 fn bind_udp_socket(server: SocketAddr) -> EcResult<UdpSocket> {
     let bind_addr = match server {
         SocketAddr::V4(_) => "0.0.0.0:0",
@@ -270,6 +351,36 @@ fn cache_put(key: CacheKey, ip: Ipv4Addr) {
             key,
             CacheEntry {
                 ip,
+                expires_at: Instant::now() + DNS_CACHE_TTL,
+            },
+        );
+    }
+}
+
+fn cname_cache_get(key: &str) -> Option<Vec<String>> {
+    let cache = DNS_CNAME_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = match cache.lock() {
+        Ok(guard) => guard,
+        Err(_) => return None,
+    };
+    let now = Instant::now();
+    match guard.get(key).cloned() {
+        Some(entry) if entry.expires_at > now => Some(entry.aliases),
+        Some(_) => {
+            guard.remove(key);
+            None
+        }
+        None => None,
+    }
+}
+
+fn cname_cache_put(key: String, aliases: Vec<String>) {
+    let cache = DNS_CNAME_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(
+            key,
+            CnameCacheEntry {
+                aliases,
                 expires_at: Instant::now() + DNS_CACHE_TTL,
             },
         );
