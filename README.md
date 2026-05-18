@@ -8,13 +8,13 @@
 
 本 fork 新增 `--extra <IP>` 参数，允许手动将额外 IP 加入隧道路由白名单，支持三种格式：
 
-| 格式 | 示例 |
-|------|------|
-| 单个 IP | `--extra 10.50.2.206` |
-| IP 范围 | `--extra 10.50.2.1~10.50.2.254` |
-| CIDR 网段 | `--extra 10.50.2.0/24` |
+| 格式      | 示例                      |
+| --------- | ------------------------- |
+| 单个 IP   | `--extra 1.1.1.1`         |
+| IP 范围   | `--extra 1.1.1.1~1.1.1.2` |
+| CIDR 网段 | `--extra 1.1.1.0/24`      |
 
-可多次指定：`--extra 10.50.2.206 --extra 192.168.1.0/24`
+可多次指定：`--extra 1.1.1.1 --extra 192.168.1.0/24`
 
 ## 使用
 
@@ -24,7 +24,7 @@ cargo run -p ec-cli -- \
   --server <VPN_SERVER> \
   --username <USERNAME> \
   --password <PASSWORD> \
-  --extra 10.50.2.206
+  --extra <IP>
 
 # 完整参数
 ./SHIEP-Pipeline \
@@ -33,7 +33,7 @@ cargo run -p ec-cli -- \
   --password <PASSWORD> \
   --bind 127.0.0.1:1080 \
   --fallback socks5h://127.0.0.1:114514 \
-  --extra 10.50.2.0/24
+  --extra <IP>
 ```
 
 默认 SOCKS5 监听地址：`127.0.0.1:1080`。
