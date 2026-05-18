@@ -1,107 +1,50 @@
 # SHIEP-Pipeline
 
-SHIEP-Pipeline is a **Rust CLI-only** EasyConnect implementation for SHIEP.
-The project focuses on minimal scope, clear structure, and maintainability, with no GUI.
+[SHIEP-Pipeline](https://github.com/Yan233th/SHIEP-Pipeline) 的 fork，在原版基础上增加了 `--extra` 功能。
 
-## Design Goal
+## 与原版的区别
 
-- Minimal CLI-only
-- Reproduce the core connection flow first
-- Refactor and organize code without adding unrelated features
+原版的 split-routing 完全依赖服务端下发的 route table。如果某个 IP 不在表中（例如学校内网的非标端口服务），流量会被 fallback 到直连或上游代理，导致无法通过 VPN 隧道访问。
 
-## Current Capabilities
+本 fork 新增 `--extra <IP>` 参数，允许手动将额外 IP 加入隧道路由白名单，支持三种格式：
 
-- Username/password login (RSA-encrypted password flow)
-- Session and agent token acquisition
-- VPN tunnel setup with RX/TX runtime
-- Local SOCKS5 listener (CONNECT only, no auth)
-- Automatic route-table fetch and parse (`/por/rclist.csp`) for split-routing decisions
-- Route table based target decision (whitelist hit -> remote)
-- Configurable fallback routing (non-whitelist -> direct or upstream proxy via `--fallback`)
-- Structured, colorized logging that balances operational detail and visual clarity
-- Supported fallback proxy input formats:
+| 格式 | 示例 |
+|------|------|
+| 单个 IP | `--extra 10.50.2.206` |
+| IP 范围 | `--extra 10.50.2.1~10.50.2.254` |
+| CIDR 网段 | `--extra 10.50.2.0/24` |
 
-| Input format | Interpreted as |
-| --- | --- |
-| `socks5://host:port` | SOCKS5 proxy |
-| `socks5h://host:port` | SOCKS5 proxy with remote DNS |
-| `http://host:port` | HTTP CONNECT proxy |
-| `host:port` | Plain host/port, interpreted as `socks5h://host:port` |
+可多次指定：`--extra 10.50.2.206 --extra 192.168.1.0/24`
 
-## Project Structure
-
-- `crates/ec-cli`: CLI entry point and argument parsing
-- `crates/ec-core`: Core implementation (login, protocol, tunnel, netstack, route-table parsing, and forwarding)
-- `.github/workflows/build-release.yml`: Build and upload release artifacts on `release.published`
-
-## Quick Start
-
-### Option A: Download From Release
-
-1. Go to the latest release page on GitHub.
-2. Download the artifact for your platform:
-   - Linux: `SHIEP-Pipeline-<tag>-linux-x64`
-   - macOS (Apple Silicon): `SHIEP-Pipeline-<tag>-macos-arm64`
-   - Windows: `SHIEP-Pipeline-<tag>-windows-x64.exe`
-3. Run it with required arguments:
+## 使用
 
 ```bash
-./SHIEP-Pipeline --server <VPN_SERVER> --username <USERNAME> --password <PASSWORD>
-```
+# 从源码运行
+cargo run -p ec-cli -- \
+  --server <VPN_SERVER> \
+  --username <USERNAME> \
+  --password <PASSWORD> \
+  --extra 10.50.2.206
 
-### Option B: Run From Source
-
-1. Install Rust stable
-2. Install OpenSSL development dependencies (your system may already have them)
-3. Run with Cargo
-
-```bash
-cargo run -p ec-cli -- --server <VPN_SERVER> --username <USERNAME> --password <PASSWORD>
-```
-
-Default listener address: `127.0.0.1:1080`.
-
-## CLI Arguments
-
-- `--server` required, VPN server address
-- `--username` required, username
-- `--password` required, password
-- `--bind` optional, local bind address, default `127.0.0.1:1080`
-- `--fallback` optional, fallback upstream proxy address
-
-Example:
-
-```bash
+# 完整参数
 ./SHIEP-Pipeline \
   --server <VPN_SERVER> \
   --username <USERNAME> \
   --password <PASSWORD> \
   --bind 127.0.0.1:1080 \
-  --fallback socks5h://127.0.0.1:114514
+  --fallback socks5h://127.0.0.1:114514 \
+  --extra 10.50.2.0/24
 ```
 
-## Routing and Fallback
+默认 SOCKS5 监听地址：`127.0.0.1:1080`。
 
-- The app fetches and parses route rules from `/por/rclist.csp`.
-- If a whitelist rule matches, traffic goes remote (preferring mapped DNS IP).
-- If no whitelist rule matches, traffic goes fallback.
-- With `--fallback`, traffic goes through the upstream proxy.
-- Without `--fallback`, traffic goes direct.
+所有参数的详细说明见原版 README。
 
-## Release Artifacts
+## 致谢
 
-The workflow triggers on GitHub Release `published` and uploads:
+- [SHIEP-Pipeline](https://github.com/Yan233th/SHIEP-Pipeline) — 原版项目作者
+- [NJUConnect](https://github.com/lyc8503/NJUConnect) / [EasierConnect](https://github.com/Yan233th/EasierConnect) — 上游参考项目
 
-- Linux: `SHIEP-Pipeline-<tag>-linux-x64`
-- macOS (Apple Silicon): `SHIEP-Pipeline-<tag>-macos-arm64`
-- Windows: `SHIEP-Pipeline-<tag>-windows-x64.exe`
+## Issues
 
-## Disclaimer
-
-This project is for learning and research in authorized environments only.
-Please follow your institution and network usage policies.
-
-## Acknowledgements
-
-- [NJUConnect](https://github.com/lyc8503/NJUConnect): the original upstream whose connection logic and behavior were referenced during this project's design.
-- [EasierConnect](https://github.com/Yan233th/EasierConnect): a strengthened fork with much better logging and critical bug fixes, but with no routing/split-routing support.
+本 fork 仅做增量修改，不计划长期维护。如遇 bug，建议先去[原版仓库](https://github.com/Yan233th/SHIEP-Pipeline/issues)提交 issue。

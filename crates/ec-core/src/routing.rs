@@ -39,6 +39,7 @@ pub enum RouteSource {
     CnameDnsMap,
     CnameDnsServerCache,
     CnameDnsServerQuery(SocketAddr),
+    ExtraIp,
 }
 
 impl RouteSource {
@@ -51,6 +52,7 @@ impl RouteSource {
             RouteSource::CnameDnsMap => "cname-dns-map",
             RouteSource::CnameDnsServerCache => "cname-dns-cache",
             RouteSource::CnameDnsServerQuery(_) => "cname-dns-server",
+            RouteSource::ExtraIp => "extra-ip",
         }
     }
 
@@ -63,8 +65,11 @@ impl RouteSource {
     }
 }
 
-pub fn install_route_table(table: RouteTable) -> EcResult<RouteInstallSummary> {
-    let matcher = RouteMatcher::from_table(table)?;
+pub fn install_route_table(
+    table: RouteTable,
+    extra_ips: &[String],
+) -> EcResult<RouteInstallSummary> {
+    let matcher = RouteMatcher::from_table(table, extra_ips)?;
     let summary = RouteInstallSummary {
         rule_count: matcher.rules.len(),
         dns_server_count: matcher.dns_servers.len(),
@@ -101,6 +106,7 @@ struct RouteMatcher {
     dns_map: HashMap<i32, HashMap<String, Vec<Ipv4Addr>>>,
     dns_servers: Vec<SocketAddr>,
     dns_records: usize,
+    extra_matchers: Vec<HostMatcher>,
 }
 
 #[derive(Debug, Clone)]
@@ -132,7 +138,7 @@ enum TargetKind {
 }
 
 impl RouteMatcher {
-    fn from_table(table: RouteTable) -> EcResult<Self> {
+    fn from_table(table: RouteTable, extra_ips: &[String]) -> EcResult<Self> {
         let RouteTable {
             rules: raw_rules,
             dns_servers,
@@ -145,6 +151,7 @@ impl RouteMatcher {
         let proto1_index = RuleIndex::build(&proto1_rules);
         let dns_map = build_dns_map(raw_dns_records);
         let dns_servers = normalize_dns_servers(dns_servers);
+        let extra_matchers = extra_ips.iter().filter_map(|ip| parse_extra_ip(ip)).collect();
 
         let dns_records = dns_map
             .values()
@@ -159,6 +166,7 @@ impl RouteMatcher {
             dns_map,
             dns_servers,
             dns_records,
+            extra_matchers,
         })
     }
 
@@ -180,6 +188,10 @@ impl RouteMatcher {
                 ),
                 reserved_proto1: true,
             };
+        }
+
+        if let Some(plan) = self.plan_extra_ip(host, port, &target) {
+            return plan;
         }
 
         if let TargetKind::Domain(domain) = &target
@@ -264,6 +276,30 @@ impl RouteMatcher {
                 }
             }
         }
+    }
+
+    fn plan_extra_ip(&self, host: &str, port: u16, target: &TargetKind) -> Option<RoutePlan> {
+        let ip = match target {
+            TargetKind::Ipv4(ip) => *ip,
+            TargetKind::Domain(_) => return None,
+        };
+        let needle = u32::from(ip);
+        for matcher in &self.extra_matchers {
+            let hit = match matcher {
+                HostMatcher::Ipv4(matched_ip) => *matched_ip == ip,
+                HostMatcher::Ipv4Range(start, end) => *start <= needle && needle <= *end,
+                HostMatcher::Domain(_) => false,
+            };
+            if hit {
+                return Some(RoutePlan::Remote {
+                    dial: format!("{host}:{port}"),
+                    rc_id: 0,
+                    rc_name: "--extra".to_string(),
+                    source: RouteSource::ExtraIp,
+                });
+            }
+        }
+        None
     }
 
     fn plan_cname_aliases(&self, host: &str, port: u16, domain: &str) -> Option<RoutePlan> {
@@ -554,6 +590,44 @@ fn compile_rule(rule: RouteRule) -> Option<CompiledRule> {
     })
 }
 
+fn parse_extra_ip(input: &str) -> Option<HostMatcher> {
+    let input = input.trim();
+    if input.is_empty() {
+        return None;
+    }
+    if let Some((cidr_ip, bits)) = input.split_once('/') {
+        let ip = Ipv4Addr::from_str(cidr_ip.trim()).ok()?;
+        let prefix_len: u8 = bits.trim().parse().ok()?;
+        if prefix_len > 32 {
+            return None;
+        }
+        let mask = if prefix_len == 0 {
+            0u32
+        } else {
+            (!0u32) << (32 - prefix_len)
+        };
+        let ip_u32 = u32::from(ip);
+        let start = ip_u32 & mask;
+        let end = ip_u32 | (!mask);
+        return Some(HostMatcher::Ipv4Range(start, end));
+    }
+    if let Some((start, end)) = input.split_once('~') {
+        let a = Ipv4Addr::from_str(start.trim()).ok()?;
+        let b = Ipv4Addr::from_str(end.trim()).ok()?;
+        let ai = u32::from(a);
+        let bi = u32::from(b);
+        if ai <= bi {
+            return Some(HostMatcher::Ipv4Range(ai, bi));
+        } else {
+            return Some(HostMatcher::Ipv4Range(bi, ai));
+        }
+    }
+    if let Ok(ip) = Ipv4Addr::from_str(input) {
+        return Some(HostMatcher::Ipv4(ip));
+    }
+    None
+}
+
 fn parse_target(host: &str) -> TargetKind {
     if let Ok(ip) = Ipv4Addr::from_str(host.trim()) {
         TargetKind::Ipv4(ip)
@@ -595,7 +669,7 @@ mod tests {
                 ip: "10.166.35.11".to_string(),
             }],
         };
-        let matcher = RouteMatcher::from_table(table).unwrap();
+        let matcher = RouteMatcher::from_table(table, &[]).unwrap();
         let plan = matcher.plan("ids.shiep.edu.cn", 443);
         match plan {
             RoutePlan::Remote {
@@ -623,7 +697,7 @@ mod tests {
                 ip: "10.168.103.76".to_string(),
             }],
         };
-        let matcher = RouteMatcher::from_table(table).unwrap();
+        let matcher = RouteMatcher::from_table(table, &[]).unwrap();
         let plan = matcher.plan("ecard.shiep.edu.cn", 80);
         match plan {
             RoutePlan::Fallback { reason, .. } => {
@@ -650,7 +724,7 @@ mod tests {
                 ip: "210.35.88.5".to_string(),
             }],
         };
-        let matcher = RouteMatcher::from_table(table).unwrap();
+        let matcher = RouteMatcher::from_table(table, &[]).unwrap();
         let plan = matcher.plan("210.35.88.5", 53);
         match plan {
             RoutePlan::Fallback { reason, .. } => {
@@ -680,7 +754,7 @@ mod tests {
                 ip: "10.166.64.6".to_string(),
             }],
         };
-        let matcher = RouteMatcher::from_table(table).unwrap();
+        let matcher = RouteMatcher::from_table(table, &[]).unwrap();
         let plan = matcher
             .plan_from_cname_aliases(
                 "estudent.shiep.edu.cn",
@@ -719,7 +793,7 @@ mod tests {
             dns_servers: vec![],
             dns_records: vec![],
         };
-        let matcher = RouteMatcher::from_table(table).unwrap();
+        let matcher = RouteMatcher::from_table(table, &[]).unwrap();
         let plan = matcher.plan_from_cname_aliases(
             "estudent.shiep.edu.cn",
             443,
@@ -741,7 +815,7 @@ mod tests {
             dns_servers: vec![],
             dns_records: vec![],
         };
-        let matcher = RouteMatcher::from_table(table).unwrap();
+        let matcher = RouteMatcher::from_table(table, &[]).unwrap();
         let plan = matcher.plan("10.50.2.206", 80);
         match plan {
             RoutePlan::Remote { dial, source, .. } => {
@@ -759,7 +833,7 @@ mod tests {
             dns_servers: vec![],
             dns_records: vec![],
         };
-        let matcher = RouteMatcher::from_table(table).unwrap();
+        let matcher = RouteMatcher::from_table(table, &[]).unwrap();
         let plan = matcher.plan("example.com", 443);
         match plan {
             RoutePlan::Fallback { .. } => {}
@@ -799,7 +873,7 @@ mod tests {
                 },
             ],
         };
-        let matcher = RouteMatcher::from_table(table).unwrap();
+        let matcher = RouteMatcher::from_table(table, &[]).unwrap();
         assert_eq!(matcher.dns_records, 2);
         let ips = matcher
             .dns_map
@@ -843,7 +917,7 @@ mod tests {
             dns_servers: vec![],
             dns_records: vec![],
         };
-        let matcher = RouteMatcher::from_table(table).unwrap();
+        let matcher = RouteMatcher::from_table(table, &[]).unwrap();
         assert_eq!(matcher.rules.len(), 2);
     }
 
@@ -858,7 +932,7 @@ mod tests {
             ],
             dns_records: vec![],
         };
-        let matcher = RouteMatcher::from_table(table).unwrap();
+        let matcher = RouteMatcher::from_table(table, &[]).unwrap();
         assert_eq!(
             matcher.dns_servers,
             vec![
@@ -879,7 +953,7 @@ mod tests {
             ],
             dns_records: vec![],
         };
-        let matcher = RouteMatcher::from_table(table).unwrap();
+        let matcher = RouteMatcher::from_table(table, &[]).unwrap();
         assert_eq!(matcher.dns_servers, vec!["[::1]:53".parse().unwrap()]);
     }
 
@@ -899,7 +973,7 @@ mod tests {
             dns_servers: vec!["127.0.0.1:1".to_string()],
             dns_records: vec![],
         };
-        let matcher = RouteMatcher::from_table(table).unwrap();
+        let matcher = RouteMatcher::from_table(table, &[]).unwrap();
         let plan = matcher.plan("ids.shiep.edu.cn", 443);
         match plan {
             RoutePlan::Fallback { reason, .. } => {
@@ -922,7 +996,7 @@ mod tests {
             dns_servers: vec![],
             dns_records: vec![],
         };
-        let matcher = RouteMatcher::from_table(table).unwrap();
+        let matcher = RouteMatcher::from_table(table, &[]).unwrap();
         let plan = matcher.plan("210.35.88.5", 53);
         match plan {
             RoutePlan::Fallback { reason, .. } => {
@@ -954,7 +1028,7 @@ mod tests {
             dns_servers: vec![],
             dns_records: vec![],
         };
-        let matcher = RouteMatcher::from_table(table).unwrap();
+        let matcher = RouteMatcher::from_table(table, &[]).unwrap();
         let plan = matcher.plan("10.50.2.206", 80);
         match plan {
             RoutePlan::Remote { rc_id, dial, .. } => {
@@ -962,6 +1036,131 @@ mod tests {
                 assert_eq!(dial, "10.50.2.206:80");
             }
             _ => panic!("expected remote plan"),
+        }
+    }
+
+    #[test]
+    fn extra_ip_single_match() {
+        let table = RouteTable {
+            rules: vec![],
+            dns_servers: vec![],
+            dns_records: vec![],
+        };
+        let matcher =
+            RouteMatcher::from_table(table, &["10.50.2.206".to_string()]).unwrap();
+        let plan = matcher.plan("10.50.2.206", 443);
+        match plan {
+            RoutePlan::Remote {
+                dial,
+                rc_name,
+                source,
+                ..
+            } => {
+                assert_eq!(dial, "10.50.2.206:443");
+                assert_eq!(rc_name, "--extra");
+                assert_eq!(source, RouteSource::ExtraIp);
+            }
+            _ => panic!("expected remote plan"),
+        }
+    }
+
+    #[test]
+    fn extra_ip_range_match() {
+        let table = RouteTable {
+            rules: vec![],
+            dns_servers: vec![],
+            dns_records: vec![],
+        };
+        let matcher =
+            RouteMatcher::from_table(table, &["10.50.2.1~10.50.2.254".to_string()]).unwrap();
+        let plan = matcher.plan("10.50.2.100", 80);
+        match plan {
+            RoutePlan::Remote { source, .. } => {
+                assert_eq!(source, RouteSource::ExtraIp);
+            }
+            _ => panic!("expected remote plan"),
+        }
+    }
+
+    #[test]
+    fn extra_ip_cidr_match() {
+        let table = RouteTable {
+            rules: vec![],
+            dns_servers: vec![],
+            dns_records: vec![],
+        };
+        let matcher =
+            RouteMatcher::from_table(table, &["10.50.2.0/24".to_string()]).unwrap();
+        let plan = matcher.plan("10.50.2.42", 8080);
+        match plan {
+            RoutePlan::Remote { source, .. } => {
+                assert_eq!(source, RouteSource::ExtraIp);
+            }
+            _ => panic!("expected remote plan"),
+        }
+    }
+
+    #[test]
+    fn extra_ip_no_match() {
+        let table = RouteTable {
+            rules: vec![],
+            dns_servers: vec![],
+            dns_records: vec![],
+        };
+        let matcher =
+            RouteMatcher::from_table(table, &["10.50.2.206".to_string()]).unwrap();
+        let plan = matcher.plan("10.50.2.207", 443);
+        match plan {
+            RoutePlan::Fallback { reason, .. } => {
+                assert_eq!(reason, "no whitelist rule matched");
+            }
+            _ => panic!("expected fallback plan"),
+        }
+    }
+
+    #[test]
+    fn extra_ip_domain_target_not_matched() {
+        let table = RouteTable {
+            rules: vec![],
+            dns_servers: vec![],
+            dns_records: vec![],
+        };
+        let matcher =
+            RouteMatcher::from_table(table, &["10.50.2.206".to_string()]).unwrap();
+        let plan = matcher.plan("example.com", 443);
+        match plan {
+            RoutePlan::Fallback { .. } => {}
+            _ => panic!("expected fallback plan"),
+        }
+    }
+
+    #[test]
+    fn extra_ip_rule_checked_before_cname() {
+        let table = RouteTable {
+            rules: vec![RouteRule {
+                rc_id: 150,
+                proto: 0,
+                name: "SUEP-WAF".to_string(),
+                host: "lgwf0-46.shiep.edu.cn".to_string(),
+                port: PortRange {
+                    start: 1,
+                    end: 65535,
+                },
+            }],
+            dns_servers: vec!["10.0.0.1:53".to_string()],
+            dns_records: vec![],
+        };
+        let matcher = RouteMatcher::from_table(
+            table,
+            &["10.166.64.6".to_string()],
+        )
+        .unwrap();
+        let plan = matcher.plan("10.166.64.6", 443);
+        match plan {
+            RoutePlan::Remote { source, .. } => {
+                assert_eq!(source, RouteSource::ExtraIp);
+            }
+            _ => panic!("expected extra-ip plan, extra IP should match before CNAME resolution"),
         }
     }
 }

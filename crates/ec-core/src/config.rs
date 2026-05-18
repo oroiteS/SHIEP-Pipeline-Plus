@@ -7,6 +7,7 @@ pub struct AppConfig {
     pub password: String,
     pub socks_bind: String,
     pub fallback_proxy: Option<String>,
+    pub extra_ips: Vec<String>,
 }
 
 impl AppConfig {
@@ -16,17 +17,24 @@ impl AppConfig {
         password: String,
         socks_bind: String,
         fallback_proxy: Option<String>,
+        extra_ips: Vec<String>,
     ) -> EcResult<Self> {
         let server = trim_owned(server);
         let username = trim_owned(username);
         let socks_bind = trim_owned(socks_bind);
         let fallback_proxy = normalize_optional_trimmed(fallback_proxy);
+        let extra_ips = extra_ips
+            .into_iter()
+            .map(trim_owned)
+            .filter(|v| !v.is_empty())
+            .collect();
         let cfg = Self {
             server,
             username,
             password,
             socks_bind,
             fallback_proxy,
+            extra_ips,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -70,6 +78,7 @@ mod tests {
             "secret".to_string(),
             "127.0.0.1:1080".to_string(),
             None,
+            vec![],
         );
         assert!(result.is_ok());
     }
@@ -82,6 +91,7 @@ mod tests {
             "secret".to_string(),
             "127.0.0.1:1080".to_string(),
             None,
+            vec![],
         );
         assert!(result.is_err());
     }
@@ -94,6 +104,7 @@ mod tests {
             "secret".to_string(),
             "127.0.0.1:1080".to_string(),
             Some("   ".to_string()),
+            vec![],
         )
         .unwrap();
         assert!(cfg.fallback_proxy.is_none());
@@ -107,10 +118,29 @@ mod tests {
             "secret".to_string(),
             " 127.0.0.1:1080 ".to_string(),
             None,
+            vec![],
         )
         .unwrap();
         assert_eq!(cfg.server, "vpn.example.com:443");
         assert_eq!(cfg.username, "alice");
         assert_eq!(cfg.socks_bind, "127.0.0.1:1080");
+    }
+
+    #[test]
+    fn trims_and_filters_empty_extra_ips() {
+        let cfg = AppConfig::new(
+            "vpn.example.com:443".to_string(),
+            "alice".to_string(),
+            "secret".to_string(),
+            "127.0.0.1:1080".to_string(),
+            None,
+            vec![
+                " 10.50.2.206 ".to_string(),
+                "   ".to_string(),
+                "10.50.2.0/24".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(cfg.extra_ips, vec!["10.50.2.206", "10.50.2.0/24"]);
     }
 }

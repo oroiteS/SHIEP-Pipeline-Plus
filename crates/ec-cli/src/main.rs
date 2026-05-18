@@ -31,6 +31,14 @@ struct CliArgs {
         help = "Fallback upstream proxy address"
     )]
     fallback_proxy: Option<String>,
+
+    #[arg(
+        long = "extra",
+        value_name = "IP",
+        help_heading = "Optional",
+        help = "Extra IP address, CIDR, or range to route through the VPN tunnel (can be specified multiple times)"
+    )]
+    extra: Vec<String>,
 }
 
 fn main() {
@@ -50,6 +58,7 @@ fn main() {
         args.password,
         args.socks_bind,
         args.fallback_proxy,
+        args.extra,
     ) {
         Ok(cfg) => cfg,
         Err(err) => {
