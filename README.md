@@ -1,4 +1,4 @@
-# SHIEP-Pipeline
+# SHIEP-Pipeline-Plus
 
 [SHIEP-Pipeline](https://github.com/Yan233th/SHIEP-Pipeline) 的 fork，在原版基础上增加了 `--extra` 功能。
 
