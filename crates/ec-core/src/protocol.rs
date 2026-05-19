@@ -350,6 +350,13 @@ fn tx_worker_loop(
         }
 
         retries += 1;
+        output::warn(
+            Scope::Protocol,
+            format_args!(
+                "tx stream write failed (reconnect attempt {retries}/{STREAM_RETRY_LIMIT}); \
+                 server may have closed the connection",
+            ),
+        );
         stream = runtime.reopen_stream(StreamProfile::Tx, retries)?;
         stream.write_all(&packet).map_err(|e| {
             EcError::Runtime(format!("tx stream write failed after reconnect: {e}"))
