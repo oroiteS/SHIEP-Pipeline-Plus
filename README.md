@@ -1,6 +1,6 @@
 # SHIEP-Pipeline-Plus
 
-[SHIEP-Pipeline](https://github.com/Yan233th/SHIEP-Pipeline) 的 fork，在原版基础上增加了 `--extra` 功能。
+[SHIEP-Pipeline](https://github.com/Yan233th/SHIEP-Pipeline) 的 fork，在路由逻辑上做了一些功能扩展。
 
 ## 与原版的区别
 
@@ -8,7 +8,7 @@
 
 本 fork 新增以下功能：
 
-### `--extra <IP>`：手动白名单 IP
+**`--extra <IP>`：手动白名单 IP**
 
 允许手动将额外 IP 加入隧道路由白名单，支持三种格式。
 
@@ -22,12 +22,12 @@
 
 可多次指定：`--extra 1.1.1.1 --extra 192.168.1.0/24`
 
-### `--details`：输出路由表详情
+**`--details`：输出路由表详情**
 
-启用后，将服务端下发的路由表（IP 规则、域名规则、DNS 记录、Extra IP）写入当前目录的 `route-details.txt`。终端仅显示一行简要提示，不会占用过多缓冲区。
+启用后，将服务端下发的路由表（IP 规则、域名规则、DNS 记录、Extra IP）写入当前目录的 `route-details.txt`。终端仅显示一行简要提示。
 
 ```bash
-SHIEP-Pipeline --server ... --username ... --password ... --extra ... --details
+SHIEP-Pipeline --server ... --username ... --password ... --details
 ```
 
 ## 使用
