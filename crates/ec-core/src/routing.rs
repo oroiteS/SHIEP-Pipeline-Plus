@@ -65,6 +65,99 @@ impl RouteSource {
     }
 }
 
+pub fn log_table_details(table: &RouteTable, extra_ips: &[String]) {
+    use crate::output::{self, Scope};
+
+    let mut ip_exact: Vec<&str> = Vec::new();
+    let mut ip_range: Vec<(&str, &str)> = Vec::new();
+    let mut domains: Vec<&str> = Vec::new();
+    let mut seen_hosts = HashSet::new();
+    let mut seen_dns = HashSet::new();
+
+    for rule in &table.rules {
+        if rule.proto == 1 {
+            continue;
+        }
+        let host = rule.host.trim();
+        if host.is_empty() || !seen_hosts.insert(host.to_ascii_lowercase()) {
+            continue;
+        }
+        if host.contains('~') {
+            if let Some((start, end)) = host.split_once('~') {
+                ip_range.push((start.trim(), end.trim()));
+            }
+        } else if Ipv4Addr::from_str(host).is_ok() {
+            ip_exact.push(host);
+        } else {
+            let domain = host.trim_end_matches('.').to_ascii_lowercase();
+            if !domain.is_empty() {
+                domains.push(host);
+            }
+        }
+    }
+
+    let mut dns_lines: Vec<String> = Vec::new();
+    for rec in &table.dns_records {
+        let host = rec.host.trim().trim_end_matches('.').to_ascii_lowercase();
+        let ip = rec.ip.trim();
+        if host.is_empty() || ip.is_empty() {
+            continue;
+        }
+        if seen_dns.insert((host.clone(), ip.to_string())) {
+            dns_lines.push(format!("{host} → {ip}"));
+        }
+    }
+
+    let mut lines = Vec::new();
+
+    if !ip_exact.is_empty() {
+        lines.push(format!("── IP rules ({}) ──", ip_exact.len()));
+        for ip in &ip_exact {
+            lines.push(format!("  {ip}"));
+        }
+    }
+    if !ip_range.is_empty() {
+        lines.push(format!("── IP range rules ({}) ──", ip_range.len()));
+        for (start, end) in &ip_range {
+            lines.push(format!("  {start} ~ {end}"));
+        }
+    }
+    if !domains.is_empty() {
+        lines.push(format!("── Domain rules ({}) ──", domains.len()));
+        for d in &domains {
+            lines.push(format!("  {d}"));
+        }
+    }
+    if !dns_lines.is_empty() {
+        lines.push(format!("── DNS records ({}) ──", dns_lines.len()));
+        for line in &dns_lines {
+            lines.push(format!("  {line}"));
+        }
+    }
+    if !extra_ips.is_empty() {
+        lines.push(format!("── Extra IPs ({}) ──", extra_ips.len()));
+        for ip in extra_ips {
+            lines.push(format!("  {ip}"));
+        }
+    }
+
+    if lines.is_empty() {
+        return;
+    }
+
+    let body = lines.join("\n");
+    match std::fs::write("route-details.txt", &body) {
+        Ok(()) => output::info(
+            Scope::App,
+            format_args!("route table details written to route-details.txt"),
+        ),
+        Err(e) => output::warn(
+            Scope::App,
+            format_args!("failed to write route-details.txt: {e}"),
+        ),
+    }
+}
+
 pub fn install_route_table(
     table: RouteTable,
     extra_ips: &[String],

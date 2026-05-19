@@ -8,6 +8,7 @@ pub struct AppConfig {
     pub socks_bind: String,
     pub fallback_proxy: Option<String>,
     pub extra_ips: Vec<String>,
+    pub details: bool,
 }
 
 impl AppConfig {
@@ -18,6 +19,7 @@ impl AppConfig {
         socks_bind: String,
         fallback_proxy: Option<String>,
         extra_ips: Vec<String>,
+        details: bool,
     ) -> EcResult<Self> {
         let server = trim_owned(server);
         let username = trim_owned(username);
@@ -35,6 +37,7 @@ impl AppConfig {
             socks_bind,
             fallback_proxy,
             extra_ips,
+            details,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -79,6 +82,7 @@ mod tests {
             "127.0.0.1:1080".to_string(),
             None,
             vec![],
+            false,
         );
         assert!(result.is_ok());
     }
@@ -92,6 +96,7 @@ mod tests {
             "127.0.0.1:1080".to_string(),
             None,
             vec![],
+            false,
         );
         assert!(result.is_err());
     }
@@ -105,6 +110,7 @@ mod tests {
             "127.0.0.1:1080".to_string(),
             Some("   ".to_string()),
             vec![],
+            false,
         )
         .unwrap();
         assert!(cfg.fallback_proxy.is_none());
@@ -119,6 +125,7 @@ mod tests {
             " 127.0.0.1:1080 ".to_string(),
             None,
             vec![],
+            false,
         )
         .unwrap();
         assert_eq!(cfg.server, "vpn.example.com:443");
@@ -139,6 +146,7 @@ mod tests {
                 "   ".to_string(),
                 "10.50.2.0/24".to_string(),
             ],
+            false,
         )
         .unwrap();
         assert_eq!(cfg.extra_ips, vec!["10.50.2.206", "10.50.2.0/24"]);

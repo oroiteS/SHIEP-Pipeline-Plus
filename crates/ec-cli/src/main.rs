@@ -39,6 +39,13 @@ struct CliArgs {
         help = "Extra IP address, CIDR, or range to route through the VPN tunnel (can be specified multiple times)"
     )]
     extra: Vec<String>,
+
+    #[arg(
+        long = "details",
+        help_heading = "Optional",
+        help = "Print full route table details (rules and DNS records) after fetching"
+    )]
+    details: bool,
 }
 
 fn main() {
@@ -59,6 +66,7 @@ fn main() {
         args.socks_bind,
         args.fallback_proxy,
         args.extra,
+        args.details,
     ) {
         Ok(cfg) => cfg,
         Err(err) => {

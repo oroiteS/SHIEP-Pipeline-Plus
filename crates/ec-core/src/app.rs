@@ -43,6 +43,9 @@ impl EasyConnectApp {
     fn try_install_route_table(&self, twf_id: &str) -> EcResult<()> {
         match crate::route_table::fetch_route_table(&self.config.server, twf_id) {
             Ok(table) => {
+                if self.config.details {
+                    crate::routing::log_table_details(&table, &self.config.extra_ips);
+                }
                 let install =
                     crate::routing::install_route_table(table, &self.config.extra_ips)?;
                 output::info(
