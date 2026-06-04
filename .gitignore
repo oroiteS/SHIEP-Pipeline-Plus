@@ -23,5 +23,6 @@ target
 .claude
 
 route-details.txt
+remembered.json
 docs/
 
