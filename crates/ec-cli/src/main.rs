@@ -8,10 +8,10 @@ use std::path::Path;
 #[command(about = "Minimal CLI-only EasyConnect pipeline")]
 struct CliArgs {
     #[arg(long, help_heading = "Required", help = "VPN server address")]
-    server: String,
+    server: Option<String>,
 
     #[arg(long, help_heading = "Required", help = "VPN username")]
-    username: String,
+    username: Option<String>,
 
     #[arg(long, help_heading = "Required", help = "VPN password")]
     password: String,
@@ -46,6 +46,13 @@ struct CliArgs {
         help = "Print full route table details (rules and DNS records) after fetching"
     )]
     details: bool,
+
+    #[arg(
+        long = "remember",
+        help_heading = "Optional",
+        help = "Remember server and username for future use (password is never saved)"
+    )]
+    remember: bool,
 }
 
 fn main() {
@@ -59,7 +66,7 @@ fn main() {
         ),
     );
 
-    let config = match AppConfig::new(
+    let config = match AppConfig::resolve(
         args.server,
         args.username,
         args.password,
@@ -67,6 +74,7 @@ fn main() {
         args.fallback_proxy,
         args.extra,
         args.details,
+        args.remember,
     ) {
         Ok(cfg) => cfg,
         Err(err) => {
@@ -94,8 +102,9 @@ fn parse_args() -> CliArgs {
     let mut cmd = CliArgs::command();
     let bin = current_bin_name().unwrap_or_else(|| cmd.get_name().to_string());
 
-    let usage =
-        format!("{bin} [OPTIONS] --server <SERVER> --username <USERNAME> --password <PASSWORD>");
+    let usage = format!(
+        "{bin} [OPTIONS] --password <PASSWORD> [--remember] | {bin} [OPTIONS] --server <SERVER> --username <USERNAME> --password <PASSWORD>"
+    );
     cmd = cmd.version(app_version()).override_usage(usage);
 
     let matches = cmd.get_matches();
