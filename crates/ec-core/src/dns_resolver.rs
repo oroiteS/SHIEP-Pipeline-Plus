@@ -15,7 +15,7 @@ const DNS_TCP_MAX_PAYLOAD: usize = 65535;
 
 static DNS_QUERY_ID: AtomicU16 = AtomicU16::new(1);
 static DNS_CACHE: OnceLock<Mutex<HashMap<CacheKey, CacheEntry>>> = OnceLock::new();
-static DNS_CNAME_CACHE: OnceLock<Mutex<HashMap<String, CnameCacheEntry>>> = OnceLock::new();
+static DNS_LOOKUP_CACHE: OnceLock<Mutex<HashMap<String, LookupCacheEntry>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResolveSource {
@@ -30,8 +30,9 @@ pub(crate) struct ResolveResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CnameResolveResult {
+pub(crate) struct LookupResolveResult {
     pub aliases: Vec<String>,
+    pub ips: Vec<Ipv4Addr>,
     pub source: ResolveSource,
 }
 
@@ -48,8 +49,9 @@ struct CacheEntry {
 }
 
 #[derive(Debug, Clone)]
-struct CnameCacheEntry {
+struct LookupCacheEntry {
     aliases: Vec<String>,
+    ips: Vec<Ipv4Addr>,
     expires_at: Instant,
 }
 
@@ -64,7 +66,7 @@ pub(crate) fn clear_cache() {
     {
         guard.clear();
     }
-    if let Some(cache) = DNS_CNAME_CACHE.get()
+    if let Some(cache) = DNS_LOOKUP_CACHE.get()
         && let Ok(mut guard) = cache.lock()
     {
         guard.clear();
@@ -117,14 +119,15 @@ pub(crate) fn resolve_first_ipv4(
     )))
 }
 
-pub(crate) fn resolve_cname_chain(
+pub(crate) fn resolve_lookup(
     host: &str,
     dns_servers: &[SocketAddr],
-) -> EcResult<CnameResolveResult> {
+) -> EcResult<LookupResolveResult> {
     let key = normalize_dns_name(host);
-    if let Some(aliases) = cname_cache_get(&key) {
-        return Ok(CnameResolveResult {
+    if let Some((aliases, ips)) = lookup_cache_get(&key) {
+        return Ok(LookupResolveResult {
             aliases,
+            ips,
             source: ResolveSource::Cache,
         });
     }
@@ -136,9 +139,11 @@ pub(crate) fn resolve_cname_chain(
         match query_server_message(host, server) {
             Ok(message) => {
                 let aliases = extract_cname_aliases(&message);
-                cname_cache_put(key, aliases.clone());
-                return Ok(CnameResolveResult {
+                let ips = extract_ipv4s(&message);
+                lookup_cache_put(key, aliases.clone(), ips.clone());
+                return Ok(LookupResolveResult {
                     aliases,
+                    ips,
                     source: ResolveSource::Server(server),
                 });
             }
@@ -281,12 +286,24 @@ fn decode_dns_response(payload: &[u8], expected_id: u16, server: SocketAddr) -> 
 }
 
 fn extract_first_ipv4(message: &Message, server: SocketAddr) -> EcResult<Ipv4Addr> {
-    for answer in message.answers() {
-        if let Some(ip) = answer.data().as_a() {
-            return Ok(**ip);
-        }
+    if let Some(ip) = extract_ipv4s(message).into_iter().next() {
+        return Ok(ip);
     }
     Err(EcError::Runtime(format!("dns no A answer from {server}")))
+}
+
+fn extract_ipv4s(message: &Message) -> Vec<Ipv4Addr> {
+    let mut ips = Vec::<Ipv4Addr>::new();
+    for answer in message.answers() {
+        let Some(ip) = answer.data().as_a() else {
+            continue;
+        };
+        let ip = **ip;
+        if !ips.contains(&ip) {
+            ips.push(ip);
+        }
+    }
+    ips
 }
 
 fn extract_cname_aliases(message: &Message) -> Vec<String> {
@@ -357,15 +374,15 @@ fn cache_put(key: CacheKey, ip: Ipv4Addr) {
     }
 }
 
-fn cname_cache_get(key: &str) -> Option<Vec<String>> {
-    let cache = DNS_CNAME_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+fn lookup_cache_get(key: &str) -> Option<(Vec<String>, Vec<Ipv4Addr>)> {
+    let cache = DNS_LOOKUP_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = match cache.lock() {
         Ok(guard) => guard,
         Err(_) => return None,
     };
     let now = Instant::now();
     match guard.get(key).cloned() {
-        Some(entry) if entry.expires_at > now => Some(entry.aliases),
+        Some(entry) if entry.expires_at > now => Some((entry.aliases, entry.ips)),
         Some(_) => {
             guard.remove(key);
             None
@@ -374,13 +391,14 @@ fn cname_cache_get(key: &str) -> Option<Vec<String>> {
     }
 }
 
-fn cname_cache_put(key: String, aliases: Vec<String>) {
-    let cache = DNS_CNAME_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+fn lookup_cache_put(key: String, aliases: Vec<String>, ips: Vec<Ipv4Addr>) {
+    let cache = DNS_LOOKUP_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(mut guard) = cache.lock() {
         guard.insert(
             key,
-            CnameCacheEntry {
+            LookupCacheEntry {
                 aliases,
+                ips,
                 expires_at: Instant::now() + DNS_CACHE_TTL,
             },
         );

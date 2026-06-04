@@ -34,11 +34,14 @@ pub enum RoutePlan {
 pub enum RouteSource {
     RuleIp,
     DnsMap,
+    DnsDataIpRule,
     DnsServerCache,
     DnsServerQuery(SocketAddr),
     CnameDnsMap,
     CnameDnsServerCache,
     CnameDnsServerQuery(SocketAddr),
+    DnsServerIpRuleCache,
+    DnsServerIpRuleQuery(SocketAddr),
 }
 
 impl RouteSource {
@@ -46,11 +49,14 @@ impl RouteSource {
         match self {
             RouteSource::RuleIp => "rule-ip",
             RouteSource::DnsMap => "dns-map",
+            RouteSource::DnsDataIpRule => "dns-data-ip-rule",
             RouteSource::DnsServerCache => "dns-cache",
             RouteSource::DnsServerQuery(_) => "dns-server",
             RouteSource::CnameDnsMap => "cname-dns-map",
             RouteSource::CnameDnsServerCache => "cname-dns-cache",
             RouteSource::CnameDnsServerQuery(_) => "cname-dns-server",
+            RouteSource::DnsServerIpRuleCache => "dns-server-ip-rule-cache",
+            RouteSource::DnsServerIpRuleQuery(_) => "dns-server-ip-rule",
         }
     }
 
@@ -58,6 +64,7 @@ impl RouteSource {
         match self {
             RouteSource::DnsServerQuery(server) => format!("dns-server({server})"),
             RouteSource::CnameDnsServerQuery(server) => format!("cname-dns-server({server})"),
+            RouteSource::DnsServerIpRuleQuery(server) => format!("dns-server-ip-rule({server})"),
             _ => self.label().to_string(),
         }
     }
@@ -99,6 +106,7 @@ struct RouteMatcher {
     proto1_rules: Vec<CompiledRule>,
     proto1_index: RuleIndex,
     dns_map: HashMap<i32, HashMap<String, Vec<Ipv4Addr>>>,
+    dns_exact: HashMap<String, Vec<Ipv4Addr>>,
     dns_servers: Vec<SocketAddr>,
     dns_records: usize,
 }
@@ -143,22 +151,18 @@ impl RouteMatcher {
         let (rules, proto1_rules) = compile_rules(raw_rules);
         let rule_index = RuleIndex::build(&rules);
         let proto1_index = RuleIndex::build(&proto1_rules);
-        let dns_map = build_dns_map(raw_dns_records);
+        let dns_indexes = build_dns_indexes(raw_dns_records);
         let dns_servers = normalize_dns_servers(dns_servers);
 
-        let dns_records = dns_map
-            .values()
-            .flat_map(HashMap::values)
-            .map(Vec::len)
-            .sum();
         Ok(Self {
             rules,
             rule_index,
             proto1_rules,
             proto1_index,
-            dns_map,
+            dns_map: dns_indexes.scoped,
+            dns_exact: dns_indexes.exact,
             dns_servers,
-            dns_records,
+            dns_records: dns_indexes.record_count,
         })
     }
 
@@ -183,7 +187,13 @@ impl RouteMatcher {
         }
 
         if let TargetKind::Domain(domain) = &target
-            && let Some(plan) = self.plan_cname_aliases(host, port, domain)
+            && let Some(plan) = self.plan_dns_data_ip_rule(host, port, domain)
+        {
+            return plan;
+        }
+
+        if let TargetKind::Domain(domain) = &target
+            && let Some(plan) = self.plan_dnsserver_derived_rules(host, port, domain)
         {
             return plan;
         }
@@ -266,12 +276,31 @@ impl RouteMatcher {
         }
     }
 
-    fn plan_cname_aliases(&self, host: &str, port: u16, domain: &str) -> Option<RoutePlan> {
+    fn plan_dns_data_ip_rule(&self, host: &str, port: u16, domain: &str) -> Option<RoutePlan> {
+        let ips = self.dns_exact.get(domain)?;
+        self.plan_from_resolved_ips(host, port, ips, RouteSource::DnsDataIpRule)
+    }
+
+    fn plan_dnsserver_derived_rules(
+        &self,
+        host: &str,
+        port: u16,
+        domain: &str,
+    ) -> Option<RoutePlan> {
         if self.dns_servers.is_empty() {
             return None;
         }
-        let resolved = crate::dns_resolver::resolve_cname_chain(domain, &self.dns_servers).ok()?;
-        self.plan_from_cname_aliases(host, port, &resolved.aliases)
+        let resolved = crate::dns_resolver::resolve_lookup(domain, &self.dns_servers).ok()?;
+        if let Some(plan) = self.plan_from_cname_aliases(host, port, &resolved.aliases) {
+            return Some(plan);
+        }
+        let source = match resolved.source {
+            crate::dns_resolver::ResolveSource::Cache => RouteSource::DnsServerIpRuleCache,
+            crate::dns_resolver::ResolveSource::Server(server) => {
+                RouteSource::DnsServerIpRuleQuery(server)
+            }
+        };
+        self.plan_from_resolved_ips(host, port, &resolved.ips, source)
     }
 
     fn plan_from_cname_aliases(
@@ -297,6 +326,40 @@ impl RouteMatcher {
                     target: format!("{host}:{port}"),
                     reason: format!(
                         "cname matched reserved proto=1 rule rc_id={} name={}; proto=1 is separated from normal routing and forced to fallback",
+                        rule.rc_id, rule.rc_name
+                    ),
+                    reserved_proto1: true,
+                });
+            }
+        }
+        None
+    }
+
+    fn plan_from_resolved_ips(
+        &self,
+        host: &str,
+        port: u16,
+        ips: &[Ipv4Addr],
+        source: RouteSource,
+    ) -> Option<RoutePlan> {
+        for ip in ips {
+            let target = TargetKind::Ipv4(*ip);
+            if let Some(rule) = self.rule_index.find_first_match(&self.rules, &target, port) {
+                return Some(RoutePlan::Remote {
+                    dial: format!("{ip}:{port}"),
+                    rc_id: rule.rc_id,
+                    rc_name: rule.rc_name.clone(),
+                    source,
+                });
+            }
+            if let Some(rule) =
+                self.proto1_index
+                    .find_first_match(&self.proto1_rules, &target, port)
+            {
+                return Some(RoutePlan::Fallback {
+                    target: format!("{host}:{port}"),
+                    reason: format!(
+                        "resolved ip matched reserved proto=1 rule rc_id={} name={}; proto=1 is separated from normal routing and forced to fallback",
                         rule.rc_id, rule.rc_name
                     ),
                     reserved_proto1: true,
@@ -465,11 +528,18 @@ fn compile_rules(raw_rules: Vec<RouteRule>) -> (Vec<CompiledRule>, Vec<CompiledR
     (rules, proto1_rules)
 }
 
-fn build_dns_map(
-    raw_dns_records: Vec<crate::route_table::DnsRecord>,
-) -> HashMap<i32, HashMap<String, Vec<Ipv4Addr>>> {
-    let mut dns_map = HashMap::<i32, HashMap<String, Vec<Ipv4Addr>>>::new();
+#[derive(Debug, Clone)]
+struct DnsIndexes {
+    scoped: HashMap<i32, HashMap<String, Vec<Ipv4Addr>>>,
+    exact: HashMap<String, Vec<Ipv4Addr>>,
+    record_count: usize,
+}
+
+fn build_dns_indexes(raw_dns_records: Vec<crate::route_table::DnsRecord>) -> DnsIndexes {
+    let mut scoped = HashMap::<i32, HashMap<String, Vec<Ipv4Addr>>>::new();
+    let mut exact = HashMap::<String, Vec<Ipv4Addr>>::new();
     let mut seen_dns = HashSet::<(i32, String, Ipv4Addr)>::with_capacity(raw_dns_records.len());
+    let mut seen_exact = HashSet::<(String, Ipv4Addr)>::with_capacity(raw_dns_records.len());
     for rec in raw_dns_records {
         let host = normalize_domain(&rec.host);
         if host.is_empty() {
@@ -481,14 +551,21 @@ fn build_dns_map(
         if !seen_dns.insert((rec.rc_id, host.clone(), ip)) {
             continue;
         }
-        dns_map
+        scoped
             .entry(rec.rc_id)
             .or_default()
-            .entry(host)
+            .entry(host.clone())
             .or_default()
             .push(ip);
+        if seen_exact.insert((host.clone(), ip)) {
+            exact.entry(host).or_default().push(ip);
+        }
     }
-    dns_map
+    DnsIndexes {
+        scoped,
+        exact,
+        record_count: seen_dns.len(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -613,7 +690,7 @@ mod tests {
     }
 
     #[test]
-    fn dns_data_exact_host_without_rc_rule_falls_back() {
+    fn dns_data_exact_host_without_ip_rule_falls_back() {
         let table = RouteTable {
             rules: vec![],
             dns_servers: vec![],
@@ -634,7 +711,71 @@ mod tests {
     }
 
     #[test]
-    fn dns_data_exact_host_does_not_override_reserved_proto1_rule() {
+    fn dns_data_exact_host_can_route_through_ip_range_rule() {
+        let table = RouteTable {
+            rules: vec![RouteRule {
+                rc_id: 301,
+                proto: 0,
+                name: "ip-range".to_string(),
+                host: "10.166.0.1~10.166.255.254".to_string(),
+                port: PortRange {
+                    start: 10002,
+                    end: 10002,
+                },
+            }],
+            dns_servers: vec![],
+            dns_records: vec![DnsRecord {
+                rc_id: 244,
+                host: "pan2.shiep.edu.cn".to_string(),
+                ip: "10.166.64.9".to_string(),
+            }],
+        };
+        let matcher = RouteMatcher::from_table(table).unwrap();
+        let plan = matcher.plan("pan2.shiep.edu.cn", 10002);
+        match plan {
+            RoutePlan::Remote {
+                dial,
+                rc_id,
+                source,
+                ..
+            } => {
+                assert_eq!(dial, "10.166.64.9:10002");
+                assert_eq!(rc_id, 301);
+                assert_eq!(source, RouteSource::DnsDataIpRule);
+            }
+            _ => panic!("expected remote plan"),
+        }
+    }
+
+    #[test]
+    fn dns_data_exact_host_never_matches_domain_rule_by_ip_text() {
+        let table = RouteTable {
+            rules: vec![RouteRule {
+                rc_id: 302,
+                proto: 0,
+                name: "domain-text-ip".to_string(),
+                host: "resolved.example".to_string(),
+                port: PortRange { start: 80, end: 80 },
+            }],
+            dns_servers: vec![],
+            dns_records: vec![DnsRecord {
+                rc_id: 244,
+                host: "pan2.shiep.edu.cn".to_string(),
+                ip: "10.166.64.9".to_string(),
+            }],
+        };
+        let matcher = RouteMatcher::from_table(table).unwrap();
+        let plan = matcher.plan("pan2.shiep.edu.cn", 80);
+        match plan {
+            RoutePlan::Fallback { reason, .. } => {
+                assert_eq!(reason, "no whitelist rule matched");
+            }
+            _ => panic!("expected fallback plan"),
+        }
+    }
+
+    #[test]
+    fn dns_data_exact_host_respects_reserved_proto1_ip_rule() {
         let table = RouteTable {
             rules: vec![RouteRule {
                 rc_id: -98,
@@ -646,15 +787,15 @@ mod tests {
             dns_servers: vec![],
             dns_records: vec![DnsRecord {
                 rc_id: -98,
-                host: "210.35.88.5".to_string(),
+                host: "dns-hide.example".to_string(),
                 ip: "210.35.88.5".to_string(),
             }],
         };
         let matcher = RouteMatcher::from_table(table).unwrap();
-        let plan = matcher.plan("210.35.88.5", 53);
+        let plan = matcher.plan("dns-hide.example", 53);
         match plan {
             RoutePlan::Fallback { reason, .. } => {
-                assert!(reason.contains("matched reserved proto=1 rule"));
+                assert!(reason.contains("resolved ip matched reserved proto=1 rule"));
             }
             _ => panic!("expected fallback plan"),
         }
@@ -729,6 +870,44 @@ mod tests {
     }
 
     #[test]
+    fn dnsserver_a_ip_can_route_through_ip_range_rule() {
+        let table = RouteTable {
+            rules: vec![RouteRule {
+                rc_id: 302,
+                proto: 0,
+                name: "resolved-range".to_string(),
+                host: "10.50.2.1~10.50.2.254".to_string(),
+                port: PortRange { start: 80, end: 80 },
+            }],
+            dns_servers: vec![],
+            dns_records: vec![],
+        };
+        let matcher = RouteMatcher::from_table(table).unwrap();
+        let ips = vec!["10.50.2.206".parse().unwrap()];
+        let plan = matcher
+            .plan_from_resolved_ips(
+                "pan2.shiep.edu.cn",
+                80,
+                &ips,
+                RouteSource::DnsServerIpRuleCache,
+            )
+            .unwrap();
+        match plan {
+            RoutePlan::Remote {
+                dial,
+                rc_id,
+                source,
+                ..
+            } => {
+                assert_eq!(dial, "10.50.2.206:80");
+                assert_eq!(rc_id, 302);
+                assert_eq!(source, RouteSource::DnsServerIpRuleCache);
+            }
+            _ => panic!("expected remote plan"),
+        }
+    }
+
+    #[test]
     fn ip_range_hit_goes_remote() {
         let table = RouteTable {
             rules: vec![RouteRule {
@@ -797,10 +976,15 @@ mod tests {
                     host: "ids.shiep.edu.cn".to_string(),
                     ip: "10.166.35.12".to_string(),
                 },
+                DnsRecord {
+                    rc_id: 206,
+                    host: "ids.shiep.edu.cn".to_string(),
+                    ip: "10.166.35.12".to_string(),
+                },
             ],
         };
         let matcher = RouteMatcher::from_table(table).unwrap();
-        assert_eq!(matcher.dns_records, 2);
+        assert_eq!(matcher.dns_records, 3);
         let ips = matcher
             .dns_map
             .get(&205)
@@ -809,6 +993,10 @@ mod tests {
         assert_eq!(ips.len(), 2);
         assert_eq!(ips[0].to_string(), "10.166.35.11");
         assert_eq!(ips[1].to_string(), "10.166.35.12");
+        let exact_ips = matcher.dns_exact.get("ids.shiep.edu.cn").unwrap();
+        assert_eq!(exact_ips.len(), 2);
+        assert_eq!(exact_ips[0].to_string(), "10.166.35.11");
+        assert_eq!(exact_ips[1].to_string(), "10.166.35.12");
     }
 
     #[test]
