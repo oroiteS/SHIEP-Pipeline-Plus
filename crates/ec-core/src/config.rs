@@ -1,4 +1,5 @@
 use crate::error::{EcError, EcResult};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone)]
 pub struct AppConfig {
@@ -11,7 +12,93 @@ pub struct AppConfig {
     pub details: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RememberedConfig {
+    server: String,
+    username: String,
+}
+
+const REMEMBERED_FILE: &str = "remembered.json";
+
+fn load_remembered() -> Option<RememberedConfig> {
+    let content = std::fs::read_to_string(REMEMBERED_FILE).ok()?;
+    match serde_json::from_str::<RememberedConfig>(&content) {
+        Ok(cfg) => Some(cfg),
+        Err(e) => {
+            crate::output::warn(
+                crate::output::Scope::Cli,
+                format_args!(
+                    "failed to parse {}, ignoring: {}",
+                    REMEMBERED_FILE, e
+                ),
+            );
+            None
+        }
+    }
+}
+
+fn save_remembered(cfg: &RememberedConfig) {
+    match serde_json::to_string_pretty(cfg) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(REMEMBERED_FILE, &json) {
+                crate::output::warn(
+                    crate::output::Scope::Cli,
+                    format_args!("failed to write {}: {}", REMEMBERED_FILE, e),
+                );
+            }
+        }
+        Err(e) => {
+            crate::output::warn(
+                crate::output::Scope::Cli,
+                format_args!("failed to serialize remembered config: {}", e),
+            );
+        }
+    }
+}
+
 impl AppConfig {
+    pub fn resolve(
+        server: Option<String>,
+        username: Option<String>,
+        password: String,
+        socks_bind: String,
+        fallback_proxy: Option<String>,
+        extra_ips: Vec<String>,
+        details: bool,
+        remember: bool,
+    ) -> EcResult<Self> {
+        let (server, username) = if remember {
+            let remembered = load_remembered();
+            let server = server.or_else(|| remembered.as_ref().map(|r| r.server.clone()));
+            let username = username.or_else(|| remembered.as_ref().map(|r| r.username.clone()));
+            let resolved_server =
+                server.ok_or(EcError::InvalidConfig("server is required"))?;
+            let resolved_username =
+                username.ok_or(EcError::InvalidConfig("username is required"))?;
+
+            save_remembered(&RememberedConfig {
+                server: resolved_server.clone(),
+                username: resolved_username.clone(),
+            });
+
+            (resolved_server, resolved_username)
+        } else {
+            let server = server.ok_or(EcError::InvalidConfig("server is required"))?;
+            let username = username.ok_or(EcError::InvalidConfig("username is required"))?;
+            (server, username)
+        };
+
+        Self::new(
+            server,
+            username,
+            password,
+            socks_bind,
+            fallback_proxy,
+            extra_ips,
+            details,
+        )
+    }
+
     pub fn new(
         server: String,
         username: String,
@@ -71,7 +158,143 @@ fn require_non_empty_trimmed(value: &str, error: &'static str) -> EcResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::AppConfig;
+    use super::{AppConfig, RememberedConfig, REMEMBERED_FILE};
+
+    #[test]
+    fn remembered_config_roundtrip() {
+        let cfg = RememberedConfig {
+            server: "vpn.example.com:443".into(),
+            username: "alice".into(),
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let parsed: RememberedConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.server, "vpn.example.com:443");
+        assert_eq!(parsed.username, "alice");
+    }
+
+    #[test]
+    fn resolve_without_remember_requires_server() {
+        let result = AppConfig::resolve(
+            None,
+            Some("alice".into()),
+            "secret".into(),
+            "127.0.0.1:1080".into(),
+            None,
+            vec![],
+            false,
+            false,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_without_remember_requires_username() {
+        let result = AppConfig::resolve(
+            Some("vpn.example.com:443".into()),
+            None,
+            "secret".into(),
+            "127.0.0.1:1080".into(),
+            None,
+            vec![],
+            false,
+            false,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_without_remember_accepts_explicit_args() {
+        let result = AppConfig::resolve(
+            Some("vpn.example.com:443".into()),
+            Some("alice".into()),
+            "secret".into(),
+            "127.0.0.1:1080".into(),
+            None,
+            vec![],
+            false,
+            false,
+        );
+        assert!(result.is_ok());
+        let cfg = result.unwrap();
+        assert_eq!(cfg.server, "vpn.example.com:443");
+        assert_eq!(cfg.username, "alice");
+    }
+
+    #[test]
+    fn resolve_with_remember_explicit_args_saves_file() {
+        let _ = std::fs::remove_file(REMEMBERED_FILE);
+        let result = AppConfig::resolve(
+            Some("vpn.example.com:443".into()),
+            Some("alice".into()),
+            "secret".into(),
+            "127.0.0.1:1080".into(),
+            None,
+            vec![],
+            false,
+            true,
+        );
+        assert!(result.is_ok());
+        let saved = std::fs::read_to_string(REMEMBERED_FILE).unwrap();
+        let parsed: RememberedConfig = serde_json::from_str(&saved).unwrap();
+        assert_eq!(parsed.server, "vpn.example.com:443");
+        assert_eq!(parsed.username, "alice");
+        let _ = std::fs::remove_file(REMEMBERED_FILE);
+    }
+
+    #[test]
+    fn resolve_with_remember_reads_saved_file() {
+        let _ = std::fs::remove_file(REMEMBERED_FILE);
+        let saved = RememberedConfig {
+            server: "saved.example.com".into(),
+            username: "saved_user".into(),
+        };
+        std::fs::write(REMEMBERED_FILE, serde_json::to_string(&saved).unwrap()).unwrap();
+
+        let result = AppConfig::resolve(
+            None,
+            None,
+            "secret".into(),
+            "127.0.0.1:1080".into(),
+            None,
+            vec![],
+            false,
+            true,
+        );
+        assert!(result.is_ok());
+        let cfg = result.unwrap();
+        assert_eq!(cfg.server, "saved.example.com");
+        assert_eq!(cfg.username, "saved_user");
+        let _ = std::fs::remove_file(REMEMBERED_FILE);
+    }
+
+    #[test]
+    fn resolve_with_remember_args_override_saved() {
+        let _ = std::fs::remove_file(REMEMBERED_FILE);
+        let saved = RememberedConfig {
+            server: "saved.example.com".into(),
+            username: "saved_user".into(),
+        };
+        std::fs::write(REMEMBERED_FILE, serde_json::to_string(&saved).unwrap()).unwrap();
+
+        let result = AppConfig::resolve(
+            Some("override.example.com".into()),
+            None,
+            "secret".into(),
+            "127.0.0.1:1080".into(),
+            None,
+            vec![],
+            false,
+            true,
+        );
+        assert!(result.is_ok());
+        let cfg = result.unwrap();
+        assert_eq!(cfg.server, "override.example.com");
+        assert_eq!(cfg.username, "saved_user");
+        let updated = std::fs::read_to_string(REMEMBERED_FILE).unwrap();
+        let parsed: RememberedConfig = serde_json::from_str(&updated).unwrap();
+        assert_eq!(parsed.server, "override.example.com");
+        let _ = std::fs::remove_file(REMEMBERED_FILE);
+    }
 
     #[test]
     fn accepts_valid_config() {
