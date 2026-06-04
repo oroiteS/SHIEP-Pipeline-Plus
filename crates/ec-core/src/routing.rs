@@ -1,7 +1,7 @@
 use crate::error::{EcError, EcResult};
 use crate::route_table::{PortRange, RouteRule, RouteTable};
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -293,6 +293,12 @@ impl RouteMatcher {
             return plan;
         }
 
+        if let TargetKind::Domain(domain) = &target
+            && let Some(plan) = self.plan_via_domain_ip_resolution(host, port, domain)
+        {
+            return plan;
+        }
+
         RoutePlan::Fallback {
             target: format!("{host}:{port}"),
             reason: "no whitelist rule matched".to_string(),
@@ -431,6 +437,28 @@ impl RouteMatcher {
                     reserved_proto1: true,
                 });
             }
+        }
+        None
+    }
+
+    fn plan_via_domain_ip_resolution(
+        &self,
+        host: &str,
+        port: u16,
+        domain: &str,
+    ) -> Option<RoutePlan> {
+        let ip = resolve_domain_to_ipv4(domain)?;
+        let ip_target = TargetKind::Ipv4(ip);
+        if let Some(rule) = self.rule_index.find_first_match(&self.rules, &ip_target, port) {
+            return Some(RoutePlan::Remote {
+                dial: format!("{ip}:{port}"),
+                rc_id: rule.rc_id,
+                rc_name: rule.rc_name.clone(),
+                source: RouteSource::RuleIp,
+            });
+        }
+        if let Some(plan) = self.plan_extra_ip(host, port, &ip_target) {
+            return Some(plan);
         }
         None
     }
@@ -735,6 +763,15 @@ fn normalize_domain(host: &str) -> String {
 
 fn port_matches(range: PortRange, port: u16) -> bool {
     range.start <= port && port <= range.end
+}
+
+fn resolve_domain_to_ipv4(domain: &str) -> Option<Ipv4Addr> {
+    let addr_str = format!("{domain}:0");
+    let mut addrs = addr_str.to_socket_addrs().ok()?;
+    addrs.find_map(|addr| match addr {
+        SocketAddr::V4(v4) => Some(*v4.ip()),
+        SocketAddr::V6(_) => None,
+    })
 }
 
 #[cfg(test)]
