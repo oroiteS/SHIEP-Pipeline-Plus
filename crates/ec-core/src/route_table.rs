@@ -159,10 +159,11 @@ fn parse_rc(
         return Ok(());
     }
 
-    let width = hosts.len().max(ports.len());
-    for idx in 0..width {
-        let host = hosts[idx.min(hosts.len() - 1)].clone();
-        let port = ports[idx.min(ports.len() - 1)];
+    if hosts.len() != ports.len() {
+        return Ok(());
+    }
+
+    for (host, port) in hosts.into_iter().zip(ports) {
         rules.push(RouteRule {
             rc_id,
             proto,
@@ -339,6 +340,22 @@ mod tests {
         assert_eq!(table.dns_records.len(), 1);
         assert_eq!(table.dns_records[0].host, "ids.shiep.edu.cn");
         assert_eq!(table.dns_records[0].ip, "10.166.35.11");
+    }
+
+    #[test]
+    fn parse_xml_skips_rc_with_mismatched_host_port_lists() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<Resource>
+  <Rcs>
+    <Rc id="205" proto="0" name="bad" host="a.example;b.example" port="443~443" />
+    <Rc id="206" proto="0" name="good" host="c.example" port="80~80" />
+  </Rcs>
+</Resource>"#;
+        let table = parse_route_table_xml(xml).unwrap();
+        assert_eq!(table.rules.len(), 1);
+        assert_eq!(table.rules[0].rc_id, 206);
+        assert_eq!(table.rules[0].host, "c.example");
+        assert_eq!(table.rules[0].port.start, 80);
     }
 
     #[test]
