@@ -438,7 +438,20 @@ fn open_data_stream(
         )));
     }
 
+    clear_data_stream_read_timeout(&stream, profile)?;
     Ok(stream)
+}
+
+fn clear_data_stream_read_timeout(
+    stream: &SslStream<TcpStream>,
+    profile: StreamProfile,
+) -> EcResult<()> {
+    stream.get_ref().set_read_timeout(None).map_err(|e| {
+        EcError::Runtime(format!(
+            "clear {} stream read timeout failed: {e}",
+            profile.label()
+        ))
+    })
 }
 
 fn connect_vpn_tls(authority: &str, host: &str) -> EcResult<SslStream<TcpStream>> {
