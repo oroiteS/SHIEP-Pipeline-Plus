@@ -649,7 +649,13 @@ fn rule_matches_flow(rule: &CompiledRule, port: u16, flow_proto: FlowProto) -> b
     if is_vipall(rule) {
         return true;
     }
-    port_matches(rule.port, port) && proto_matches(rule.proto, flow_proto)
+    if !proto_matches(rule.proto, flow_proto) {
+        return false;
+    }
+    if flow_proto == FlowProto::Icmp {
+        return true;
+    }
+    port_matches(rule.port, port)
 }
 
 #[cfg(test)]
@@ -1280,6 +1286,55 @@ mod tests {
                 }
                 _ => panic!("expected remote plan"),
             }
+        }
+    }
+
+    #[test]
+    fn icmp_flow_ignores_port_after_proto_and_ip_hit() {
+        let table = RouteTable {
+            rules: vec![RouteRule {
+                rc_id: 338,
+                proto: 2,
+                svc: "Other".to_string(),
+                name: "icmp-only".to_string(),
+                host: "10.50.2.206".to_string(),
+                port: PortRange { start: 80, end: 80 },
+            }],
+            dns_servers: vec![],
+            dns_records: vec![],
+        };
+        let matcher = RouteMatcher::from_table(table).unwrap();
+        let plan = matcher.plan("10.50.2.206", 443, FlowProto::Icmp);
+        match plan {
+            RoutePlan::Remote { rc_id, dial, .. } => {
+                assert_eq!(rc_id, 338);
+                assert_eq!(dial, "10.50.2.206:443");
+            }
+            _ => panic!("expected remote plan"),
+        }
+    }
+
+    #[test]
+    fn icmp_flow_still_respects_proto() {
+        let table = RouteTable {
+            rules: vec![RouteRule {
+                rc_id: 339,
+                proto: 0,
+                svc: "Other".to_string(),
+                name: "tcp-only".to_string(),
+                host: "10.50.2.206".to_string(),
+                port: PortRange { start: 80, end: 80 },
+            }],
+            dns_servers: vec![],
+            dns_records: vec![],
+        };
+        let matcher = RouteMatcher::from_table(table).unwrap();
+        let plan = matcher.plan("10.50.2.206", 80, FlowProto::Icmp);
+        match plan {
+            RoutePlan::Fallback { reason, .. } => {
+                assert_eq!(reason, "no whitelist rule matched");
+            }
+            _ => panic!("expected fallback plan"),
         }
     }
 
