@@ -6,6 +6,7 @@ use crate::socks_wire::{
     SocksCommand, encode_socks_udp_packet, format_socket_target, negotiate_method,
     parse_socks_udp_packet, read_socks_request, write_bound_reply, write_reply,
 };
+use std::io::ErrorKind;
 use std::io::{Read, Write};
 use std::net::{
     Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream, ToSocketAddrs,
@@ -152,8 +153,12 @@ fn handle_udp_associate(
         let mut buf = [0u8; 1];
         loop {
             match control.read(&mut buf) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
                 Ok(_) => {}
+                Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                    continue;
+                }
+                Err(_) => break,
             }
         }
         let _ = stop_tx.send(());
