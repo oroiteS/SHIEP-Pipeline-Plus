@@ -132,10 +132,16 @@ fn handle_udp_associate(
         }
     };
 
+    let mut control = client
+        .try_clone()
+        .map_err(|e| EcError::Runtime(format!("clone socks control stream failed: {e}")))?;
     let udp_assoc = crate::netstack::open_udp_association()?;
     let tunnel_sender = udp_assoc.sender();
     let tunnel_rx = udp_assoc.into_receiver();
-    write_bound_reply(&mut client, SOCKS_REP_SUCCEEDED, relay_addr)?;
+    if let Err(err) = write_bound_reply(&mut client, SOCKS_REP_SUCCEEDED, relay_addr) {
+        let _ = tunnel_sender.close();
+        return Err(err);
+    }
     output::info(
         Scope::Rx,
         format_args!("UDP ASSOCIATE -> {}", output::value(relay_addr)),
@@ -150,9 +156,6 @@ fn handle_udp_associate(
 
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
     let control_addr = relay_addr;
-    let mut control = client
-        .try_clone()
-        .map_err(|e| EcError::Runtime(format!("clone socks control stream failed: {e}")))?;
     let control_watcher = thread::spawn(move || {
         let mut buf = [0u8; 1];
         loop {
@@ -173,6 +176,7 @@ fn handle_udp_associate(
         stop_rx,
     );
     let _ = tunnel_sender.close();
+    let _ = client.shutdown(Shutdown::Both);
     let _ = tunnel_to_client.join();
     let _ = control_watcher.join();
     relay_result
