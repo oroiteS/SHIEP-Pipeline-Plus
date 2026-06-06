@@ -46,7 +46,7 @@ The project focuses on minimal scope, clear structure, and maintainability, with
 3. Run it with required arguments:
 
 ```bash
-./SHIEP-Pipeline --server <VPN_SERVER> --username <USERNAME> --password <PASSWORD>
+SHIEP_PIPELINE_PASSWORD=<PASSWORD> ./SHIEP-Pipeline --server <VPN_SERVER> --username <USERNAME>
 ```
 
 ### Option B: Run From Source
@@ -56,7 +56,7 @@ The project focuses on minimal scope, clear structure, and maintainability, with
 3. Run with Cargo
 
 ```bash
-cargo run -p ec-cli -- --server <VPN_SERVER> --username <USERNAME> --password <PASSWORD>
+SHIEP_PIPELINE_PASSWORD=<PASSWORD> cargo run -p ec-cli -- --server <VPN_SERVER> --username <USERNAME>
 ```
 
 Default listener address: `127.0.0.1:1080`.
@@ -65,17 +65,17 @@ Default listener address: `127.0.0.1:1080`.
 
 - `--server` required, VPN server address
 - `--username` required, username
-- `--password` required, password
+- `SHIEP_PIPELINE_PASSWORD` required unless `--password` is provided
+- `--password` optional, VPN password; not recommended because process arguments may be visible
 - `--bind` optional, local bind address, default `127.0.0.1:1080`
 - `--fallback` optional, fallback upstream proxy address
 
 Example:
 
 ```bash
-./SHIEP-Pipeline \
+SHIEP_PIPELINE_PASSWORD=<PASSWORD> ./SHIEP-Pipeline \
   --server <VPN_SERVER> \
   --username <USERNAME> \
-  --password <PASSWORD> \
   --bind 127.0.0.1:1080 \
   --fallback socks5h://127.0.0.1:114514
 ```
