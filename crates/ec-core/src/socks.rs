@@ -10,6 +10,7 @@ const SOCKS_VERSION_5: u8 = 0x05;
 const SOCKS_METHOD_NO_AUTH: u8 = 0x00;
 const SOCKS_METHOD_NOT_ACCEPTABLE: u8 = 0xff;
 const SOCKS_CMD_CONNECT: u8 = 0x01;
+const SOCKS_CMD_UDP_ASSOCIATE: u8 = 0x03;
 const SOCKS_RSV: u8 = 0x00;
 const SOCKS_ATYP_IPV4: u8 = 0x01;
 const SOCKS_ATYP_DOMAIN: u8 = 0x03;
@@ -79,7 +80,15 @@ fn spawn_accept_loop(listener: TcpListener, fallback_proxy: Option<FallbackProxy
 
 fn handle_client(mut client: TcpStream, fallback_proxy: Option<&FallbackProxy>) -> EcResult<()> {
     negotiate_method(&mut client)?;
-    let target = read_connect_request(&mut client)?;
+    let request = read_socks_request(&mut client)?;
+    let SocksCommand::Connect = request.command else {
+        let _ = write_reply(&mut client, SOCKS_REP_CMD_NOT_SUPPORTED);
+        return Err(EcError::Runtime(format!(
+            "{} command is not supported yet",
+            request.command
+        )));
+    };
+    let target = request.target;
     let target_display = target.to_string();
     let route = decide_route(&target, fallback_proxy);
     output::info(Scope::Rx, &route.line);
@@ -337,7 +346,7 @@ fn negotiate_method(client: &mut TcpStream) -> EcResult<()> {
     ))
 }
 
-fn read_connect_request(client: &mut TcpStream) -> EcResult<ConnectTarget> {
+fn read_socks_request(client: &mut TcpStream) -> EcResult<SocksRequest> {
     let mut req = [0u8; 4];
     client
         .read_exact(&mut req)
@@ -348,18 +357,24 @@ fn read_connect_request(client: &mut TcpStream) -> EcResult<ConnectTarget> {
             "invalid socks request version".to_string(),
         ));
     }
-    if req[1] != SOCKS_CMD_CONNECT {
+    let command = SocksCommand::from_byte(req[1]);
+    if matches!(command, SocksCommand::Other(_)) {
         let _ = write_reply(client, SOCKS_REP_CMD_NOT_SUPPORTED);
-        return Err(EcError::Runtime(
-            "only CONNECT command is supported".to_string(),
-        ));
+        return Err(EcError::Runtime(format!(
+            "unsupported socks command: {command}"
+        )));
     }
     if req[2] != SOCKS_RSV {
         let _ = write_reply(client, SOCKS_REP_GENERAL_FAILURE);
         return Err(EcError::Runtime("invalid socks reserved byte".to_string()));
     }
 
-    let host = match req[3] {
+    let target = read_request_target(client, req[3])?;
+    Ok(SocksRequest { command, target })
+}
+
+fn read_request_target(client: &mut TcpStream, atyp: u8) -> EcResult<ConnectTarget> {
+    let host = match atyp {
         SOCKS_ATYP_IPV4 => {
             let mut ip = [0u8; 4];
             client
@@ -512,6 +527,38 @@ struct RouteDecision {
     transport: RouteTransport,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SocksCommand {
+    Connect,
+    UdpAssociate,
+    Other(u8),
+}
+
+impl SocksCommand {
+    fn from_byte(value: u8) -> Self {
+        match value {
+            SOCKS_CMD_CONNECT => Self::Connect,
+            SOCKS_CMD_UDP_ASSOCIATE => Self::UdpAssociate,
+            other => Self::Other(other),
+        }
+    }
+}
+
+impl std::fmt::Display for SocksCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Connect => f.write_str("CONNECT"),
+            Self::UdpAssociate => f.write_str("UDP ASSOCIATE"),
+            Self::Other(value) => write!(f, "0x{value:02x}"),
+        }
+    }
+}
+
+struct SocksRequest {
+    command: SocksCommand,
+    target: ConnectTarget,
+}
+
 fn target_addr(target: &str) -> String {
     if let Some((host, port)) = target.rsplit_once(':') {
         return format_socket_target(host, port);
@@ -560,7 +607,7 @@ impl std::fmt::Display for ConnectTarget {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConnectTarget, normalize_bind_addr};
+    use super::{ConnectTarget, SocksCommand, normalize_bind_addr};
 
     #[test]
     fn normalize_bind_addr_expands_port_only() {
@@ -590,5 +637,12 @@ mod tests {
         };
         assert_eq!(target.to_socket_target(), "[2001:db8::1]:443");
         assert_eq!(target.to_string(), "2001:db8::1:443");
+    }
+
+    #[test]
+    fn socks_command_maps_known_values() {
+        assert_eq!(SocksCommand::from_byte(0x01), SocksCommand::Connect);
+        assert_eq!(SocksCommand::from_byte(0x03), SocksCommand::UdpAssociate);
+        assert_eq!(SocksCommand::from_byte(0x02), SocksCommand::Other(0x02));
     }
 }
