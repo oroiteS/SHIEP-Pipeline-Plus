@@ -2,7 +2,11 @@ use crate::error::{EcError, EcResult};
 use crate::output::{self, RouteKind, Scope};
 use crate::socks_proxy::{FallbackProxy, connect_via_proxy, parse_fallback_proxy};
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, TcpListener, TcpStream};
+use std::net::{
+    Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream, ToSocketAddrs,
+    UdpSocket,
+};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 const RELAY_BUFFER_SIZE: usize = 4096;
@@ -19,6 +23,7 @@ const SOCKS_REP_GENERAL_FAILURE: u8 = 0x01;
 const SOCKS_REP_SUCCEEDED: u8 = 0x00;
 const SOCKS_REP_CMD_NOT_SUPPORTED: u8 = 0x07;
 const SOCKS_REP_ATYP_NOT_SUPPORTED: u8 = 0x08;
+const UDP_RELAY_BUFFER_SIZE: usize = 64 * 1024;
 
 pub fn serve(bind_addr: &str, fallback_proxy: Option<&str>) -> EcResult<()> {
     let normalized = normalize_bind_addr(bind_addr);
@@ -81,19 +86,96 @@ fn spawn_accept_loop(listener: TcpListener, fallback_proxy: Option<FallbackProxy
 fn handle_client(mut client: TcpStream, fallback_proxy: Option<&FallbackProxy>) -> EcResult<()> {
     negotiate_method(&mut client)?;
     let request = read_socks_request(&mut client)?;
-    let SocksCommand::Connect = request.command else {
-        let _ = write_reply(&mut client, SOCKS_REP_CMD_NOT_SUPPORTED);
-        return Err(EcError::Runtime(format!(
-            "{} command is not supported yet",
-            request.command
-        )));
-    };
-    let target = request.target;
+    match request.command {
+        SocksCommand::Connect => handle_connect(client, request.target, fallback_proxy),
+        SocksCommand::UdpAssociate => handle_udp_associate(client, fallback_proxy),
+        SocksCommand::Other(_) => {
+            let _ = write_reply(&mut client, SOCKS_REP_CMD_NOT_SUPPORTED);
+            Err(EcError::Runtime(format!(
+                "unsupported socks command: {}",
+                request.command
+            )))
+        }
+    }
+}
+
+fn handle_connect(
+    client: TcpStream,
+    target: ConnectTarget,
+    fallback_proxy: Option<&FallbackProxy>,
+) -> EcResult<()> {
     let target_display = target.to_string();
     let route = decide_route(&target, fallback_proxy);
     output::info(Scope::Rx, &route.line);
-
     execute_route(client, target_display.as_str(), route)
+}
+
+fn handle_udp_associate(
+    mut client: TcpStream,
+    fallback_proxy: Option<&FallbackProxy>,
+) -> EcResult<()> {
+    let relay_bind = udp_relay_bind_addr(&client)?;
+    let udp_socket = Arc::new(
+        UdpSocket::bind(relay_bind)
+            .map_err(|e| EcError::Runtime(format!("udp relay bind failed: {e}")))?,
+    );
+    let relay_addr = match udp_socket
+        .local_addr()
+        .map_err(|e| EcError::Runtime(format!("udp relay local addr failed: {e}")))?
+    {
+        SocketAddr::V4(addr) => addr,
+        SocketAddr::V6(_) => {
+            let _ = write_reply(&mut client, SOCKS_REP_GENERAL_FAILURE);
+            return Err(EcError::Runtime(
+                "udp relay only supports ipv4 bind address".to_string(),
+            ));
+        }
+    };
+
+    let udp_assoc = crate::netstack::open_udp_association()?;
+    let tunnel_sender = udp_assoc.sender();
+    let tunnel_rx = udp_assoc.into_receiver();
+    write_bound_reply(&mut client, SOCKS_REP_SUCCEEDED, relay_addr)?;
+    output::info(
+        Scope::Rx,
+        format_args!("UDP ASSOCIATE -> {}", output::value(relay_addr)),
+    );
+
+    let client_peer = Arc::new(Mutex::new(None::<SocketAddr>));
+    let tunnel_socket = Arc::clone(&udp_socket);
+    let tunnel_peer = Arc::clone(&client_peer);
+    let tunnel_to_client = thread::spawn(move || {
+        forward_udp_from_tunnel(tunnel_rx, tunnel_socket, tunnel_peer);
+    });
+
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    let control_addr = relay_addr;
+    let mut control = client
+        .try_clone()
+        .map_err(|e| EcError::Runtime(format!("clone socks control stream failed: {e}")))?;
+    let control_watcher = thread::spawn(move || {
+        let mut buf = [0u8; 1];
+        loop {
+            match control.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+        let _ = stop_tx.send(());
+        wake_udp_relay(control_addr);
+    });
+
+    let relay_result = run_udp_relay(
+        udp_socket,
+        &tunnel_sender,
+        fallback_proxy,
+        client_peer,
+        stop_rx,
+    );
+    let _ = tunnel_sender.close();
+    let _ = tunnel_to_client.join();
+    let _ = control_watcher.join();
+    relay_result
 }
 
 fn decide_route(target: &ConnectTarget, fallback_proxy: Option<&FallbackProxy>) -> RouteDecision {
@@ -114,51 +196,7 @@ fn decide_route(target: &ConnectTarget, fallback_proxy: Option<&FallbackProxy>) 
                 .rsplit_once(':')
                 .map(|(ip, _)| ip)
                 .unwrap_or(dial.as_str());
-            let arrow = output::weak(" -> ");
-            match source {
-                crate::routing::RouteSource::DnsDataIpRule => {
-                    output::info(
-                        Scope::Upstream,
-                        format_args!(
-                            "dns.data resolved {}{}{} for rc_id={}",
-                            output::value(target.host()),
-                            arrow,
-                            output::value(resolved_ip),
-                            output::value(rc_id)
-                        ),
-                    );
-                }
-                crate::routing::RouteSource::DnsServerQuery(server)
-                | crate::routing::RouteSource::CnameDnsServerQuery(server)
-                | crate::routing::RouteSource::DnsServerIpRuleQuery(server) => {
-                    output::info(
-                        Scope::Upstream,
-                        format_args!(
-                            "dnsserver resolved {}{}{} via {} for rc_id={}",
-                            output::value(target.host()),
-                            arrow,
-                            output::value(resolved_ip),
-                            output::value(server),
-                            output::value(rc_id)
-                        ),
-                    );
-                }
-                crate::routing::RouteSource::DnsServerCache
-                | crate::routing::RouteSource::CnameDnsServerCache
-                | crate::routing::RouteSource::DnsServerIpRuleCache => {
-                    output::info(
-                        Scope::Upstream,
-                        format_args!(
-                            "dns cache hit {}{}{} for rc_id={}",
-                            output::value(target.host()),
-                            arrow,
-                            output::value(resolved_ip),
-                            output::value(rc_id)
-                        ),
-                    );
-                }
-                _ => {}
-            }
+            log_resolved_route_source(target.host(), resolved_ip, rc_id, source);
             route_decision_remote(target_display.as_str(), target_is_ip, dial, rc_name, source)
         }
         Ok(crate::routing::RoutePlan::Fallback {
@@ -172,6 +210,255 @@ fn decide_route(target: &ConnectTarget, fallback_proxy: Option<&FallbackProxy>) 
             fallback_proxy,
         ),
         Err(err) => route_decision_legacy(target, target_display.as_str(), err),
+    }
+}
+
+fn decide_udp_route(
+    target: &ConnectTarget,
+    fallback_proxy: Option<&FallbackProxy>,
+) -> UdpRouteDecision {
+    let target_display = target.to_string();
+    let target_is_ip = is_ip_host(target.host());
+    match crate::routing::plan_target_with_proto(
+        target.host(),
+        target.port(),
+        crate::routing::FlowProto::Udp,
+    ) {
+        Ok(crate::routing::RoutePlan::Remote {
+            dial,
+            rc_id,
+            rc_name,
+            source,
+        }) => {
+            let resolved_ip = dial
+                .rsplit_once(':')
+                .map(|(ip, _)| ip)
+                .unwrap_or(dial.as_str());
+            log_resolved_route_source(target.host(), resolved_ip, rc_id, source);
+            let decision =
+                route_decision_remote(target_display.as_str(), target_is_ip, dial, rc_name, source);
+            let transport = match resolve_dial_v4_from_str(decision_tunnel_target(&decision)) {
+                Ok(target) => UdpRouteTransport::Tunnel(target),
+                Err(err) => UdpRouteTransport::Unsupported(format!(
+                    "udp remote target is not ipv4: {}",
+                    crate::error::concise_error(err)
+                )),
+            };
+            UdpRouteDecision {
+                line: decision.line,
+                path: decision.path,
+                transport,
+            }
+        }
+        Ok(crate::routing::RoutePlan::Fallback {
+            target: planned_target,
+            reason,
+        }) => {
+            let decision = route_decision_fallback(
+                target.clone(),
+                target_display.as_str(),
+                target_addr(&planned_target),
+                reason,
+                fallback_proxy,
+            );
+            UdpRouteDecision {
+                line: decision.line,
+                path: decision.path,
+                transport: UdpRouteTransport::Unsupported(
+                    "udp fallback transport is not supported yet".to_string(),
+                ),
+            }
+        }
+        Err(err) => UdpRouteDecision {
+            line: format!(
+                "{target_display}{}{}{}legacy",
+                output::weak(" -> "),
+                output::route_label(RouteKind::Remote),
+                output::weak(" -> "),
+            ),
+            path: format!("remote -> legacy planner-unavailable={err}"),
+            transport: UdpRouteTransport::Unsupported(
+                "udp legacy route is not supported".to_string(),
+            ),
+        },
+    }
+}
+
+fn log_resolved_route_source(
+    host: &str,
+    resolved_ip: &str,
+    rc_id: i32,
+    source: crate::routing::RouteSource,
+) {
+    let arrow = output::weak(" -> ");
+    match source {
+        crate::routing::RouteSource::DnsDataIpRule => {
+            output::info(
+                Scope::Upstream,
+                format_args!(
+                    "dns.data resolved {}{}{} for rc_id={}",
+                    output::value(host),
+                    arrow,
+                    output::value(resolved_ip),
+                    output::value(rc_id)
+                ),
+            );
+        }
+        crate::routing::RouteSource::DnsServerQuery(server)
+        | crate::routing::RouteSource::CnameDnsServerQuery(server)
+        | crate::routing::RouteSource::DnsServerIpRuleQuery(server) => {
+            output::info(
+                Scope::Upstream,
+                format_args!(
+                    "dnsserver resolved {}{}{} via {} for rc_id={}",
+                    output::value(host),
+                    arrow,
+                    output::value(resolved_ip),
+                    output::value(server),
+                    output::value(rc_id)
+                ),
+            );
+        }
+        crate::routing::RouteSource::DnsServerCache
+        | crate::routing::RouteSource::CnameDnsServerCache
+        | crate::routing::RouteSource::DnsServerIpRuleCache => {
+            output::info(
+                Scope::Upstream,
+                format_args!(
+                    "dns cache hit {}{}{} for rc_id={}",
+                    output::value(host),
+                    arrow,
+                    output::value(resolved_ip),
+                    output::value(rc_id)
+                ),
+            );
+        }
+        _ => {}
+    }
+}
+
+fn decision_tunnel_target(decision: &RouteDecision) -> &str {
+    match &decision.transport {
+        RouteTransport::Tunnel(dial) => dial,
+        RouteTransport::Direct(dial) => dial,
+        RouteTransport::Proxy(_, target) => target.host(),
+    }
+}
+
+fn udp_relay_bind_addr(client: &TcpStream) -> EcResult<SocketAddrV4> {
+    match client
+        .local_addr()
+        .map_err(|e| EcError::Runtime(format!("socks control local addr failed: {e}")))?
+    {
+        SocketAddr::V4(addr) => Ok(SocketAddrV4::new(*addr.ip(), 0)),
+        SocketAddr::V6(_) => Err(EcError::Runtime(
+            "udp associate over ipv6 control connection is not supported".to_string(),
+        )),
+    }
+}
+
+fn run_udp_relay(
+    socket: Arc<UdpSocket>,
+    tunnel_sender: &crate::netstack::TunnelUdpSender,
+    fallback_proxy: Option<&FallbackProxy>,
+    client_peer: Arc<Mutex<Option<SocketAddr>>>,
+    stop_rx: mpsc::Receiver<()>,
+) -> EcResult<()> {
+    let mut buf = vec![0u8; UDP_RELAY_BUFFER_SIZE];
+    loop {
+        let (n, peer) = socket
+            .recv_from(&mut buf)
+            .map_err(|e| EcError::Runtime(format!("udp relay recv failed: {e}")))?;
+        if stop_rx.try_recv().is_ok() {
+            break;
+        }
+        if n == 0 {
+            continue;
+        }
+        if !remember_udp_client(&client_peer, peer) {
+            output::warn(
+                Scope::Rx,
+                format_args!(
+                    "drop udp packet from unexpected peer {}",
+                    output::value(peer)
+                ),
+            );
+            continue;
+        }
+
+        let packet = match parse_socks_udp_packet(&buf[..n]) {
+            Ok(packet) => packet,
+            Err(err) => {
+                output::warn(
+                    Scope::Rx,
+                    format_args!(
+                        "drop invalid udp packet: {}",
+                        crate::error::concise_error(err)
+                    ),
+                );
+                continue;
+            }
+        };
+        let route = decide_udp_route(&packet.target, fallback_proxy);
+        output::info(Scope::Rx, &route.line);
+        match route.transport {
+            UdpRouteTransport::Tunnel(target) => {
+                if let Err(err) = tunnel_sender.send(target, packet.payload) {
+                    output::error(
+                        Scope::Upstream,
+                        format_args!(
+                            "{}; failed: {}",
+                            route.path,
+                            crate::error::concise_error(err)
+                        ),
+                    );
+                }
+            }
+            UdpRouteTransport::Unsupported(reason) => {
+                output::error(
+                    Scope::Upstream,
+                    format_args!("{}; failed: {reason}", route.path),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn forward_udp_from_tunnel(
+    tunnel_rx: mpsc::Receiver<crate::netstack::UdpDatagram>,
+    socket: Arc<UdpSocket>,
+    client_peer: Arc<Mutex<Option<SocketAddr>>>,
+) {
+    while let Ok(datagram) = tunnel_rx.recv() {
+        let Some(peer) = current_udp_client(&client_peer) else {
+            continue;
+        };
+        let packet = encode_socks_udp_packet(datagram.source, &datagram.data);
+        let _ = socket.send_to(&packet, peer);
+    }
+}
+
+fn remember_udp_client(client_peer: &Mutex<Option<SocketAddr>>, peer: SocketAddr) -> bool {
+    let Ok(mut guard) = client_peer.lock() else {
+        return false;
+    };
+    match *guard {
+        Some(existing) => existing == peer,
+        None => {
+            *guard = Some(peer);
+            true
+        }
+    }
+}
+
+fn current_udp_client(client_peer: &Mutex<Option<SocketAddr>>) -> Option<SocketAddr> {
+    client_peer.lock().ok().and_then(|guard| *guard)
+}
+
+fn wake_udp_relay(relay_addr: SocketAddrV4) {
+    if let Ok(waker) = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)) {
+        let _ = waker.send_to(&[], relay_addr);
     }
 }
 
@@ -435,6 +722,16 @@ fn write_reply(client: &mut TcpStream, rep: u8) -> EcResult<()> {
         .map_err(|e| EcError::Runtime(format!("socks reply write failed: {e}")))
 }
 
+fn write_bound_reply(client: &mut TcpStream, rep: u8, bound: SocketAddrV4) -> EcResult<()> {
+    let mut reply = Vec::with_capacity(10);
+    reply.extend_from_slice(&[SOCKS_VERSION_5, rep, SOCKS_RSV, SOCKS_ATYP_IPV4]);
+    reply.extend_from_slice(&bound.ip().octets());
+    reply.extend_from_slice(&bound.port().to_be_bytes());
+    client
+        .write_all(&reply)
+        .map_err(|e| EcError::Runtime(format!("socks bound reply write failed: {e}")))
+}
+
 fn relay_tunnel(mut client: TcpStream, conn: crate::netstack::TunnelTcpConnection) -> EcResult<()> {
     let sender = conn.sender();
     let rx = conn.into_receiver();
@@ -515,6 +812,101 @@ fn pump_stream(mut src: TcpStream, mut dst: TcpStream) {
     let _ = dst.shutdown(Shutdown::Write);
 }
 
+fn parse_socks_udp_packet(data: &[u8]) -> EcResult<SocksUdpPacket> {
+    if data.len() < 4 {
+        return Err(EcError::Runtime(
+            "udp packet header is too short".to_string(),
+        ));
+    }
+    if data[0] != 0 || data[1] != 0 {
+        return Err(EcError::Runtime(
+            "udp packet with non-zero RSV is not supported".to_string(),
+        ));
+    }
+    if data[2] != 0 {
+        return Err(EcError::Runtime(
+            "fragmented udp packet is not supported".to_string(),
+        ));
+    }
+
+    let mut offset = 4;
+    let host = match data[3] {
+        SOCKS_ATYP_IPV4 => {
+            if data.len() < offset + 4 {
+                return Err(EcError::Runtime(
+                    "udp ipv4 address is truncated".to_string(),
+                ));
+            }
+            let ip = Ipv4Addr::new(
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            );
+            offset += 4;
+            ip.to_string()
+        }
+        SOCKS_ATYP_DOMAIN => {
+            if data.len() < offset + 1 {
+                return Err(EcError::Runtime(
+                    "udp domain length is truncated".to_string(),
+                ));
+            }
+            let len = data[offset] as usize;
+            offset += 1;
+            if data.len() < offset + len {
+                return Err(EcError::Runtime("udp domain is truncated".to_string()));
+            }
+            let domain = String::from_utf8(data[offset..offset + len].to_vec())
+                .map_err(|e| EcError::Runtime(format!("invalid udp domain utf8: {e}")))?;
+            offset += len;
+            domain
+        }
+        SOCKS_ATYP_IPV6 => {
+            return Err(EcError::Runtime(
+                "udp ipv6 targets are not supported yet".to_string(),
+            ));
+        }
+        atyp => {
+            return Err(EcError::Runtime(format!(
+                "unsupported udp atyp: 0x{atyp:02x}"
+            )));
+        }
+    };
+    if data.len() < offset + 2 {
+        return Err(EcError::Runtime("udp port is truncated".to_string()));
+    }
+    let port = u16::from_be_bytes([data[offset], data[offset + 1]]);
+    offset += 2;
+    Ok(SocksUdpPacket {
+        target: ConnectTarget { host, port },
+        payload: data[offset..].to_vec(),
+    })
+}
+
+fn encode_socks_udp_packet(source: SocketAddrV4, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(10 + payload.len());
+    out.extend_from_slice(&[0, 0, 0, SOCKS_ATYP_IPV4]);
+    out.extend_from_slice(&source.ip().octets());
+    out.extend_from_slice(&source.port().to_be_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+fn resolve_dial_v4_from_str(target: &str) -> EcResult<SocketAddrV4> {
+    let mut addrs = target
+        .to_socket_addrs()
+        .map_err(|e| EcError::Runtime(format!("resolve udp target failed: {target}: {e}")))?;
+    addrs
+        .find_map(|addr| match addr {
+            SocketAddr::V4(v4) => Some(v4),
+            SocketAddr::V6(_) => None,
+        })
+        .ok_or_else(|| {
+            EcError::Runtime(format!("no ipv4 address resolved for udp target {target}"))
+        })
+}
+
 enum RouteTransport {
     Tunnel(String),
     Direct(String),
@@ -525,6 +917,22 @@ struct RouteDecision {
     line: String,
     path: String,
     transport: RouteTransport,
+}
+
+enum UdpRouteTransport {
+    Tunnel(SocketAddrV4),
+    Unsupported(String),
+}
+
+struct UdpRouteDecision {
+    line: String,
+    path: String,
+    transport: UdpRouteTransport,
+}
+
+struct SocksUdpPacket {
+    target: ConnectTarget,
+    payload: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -607,7 +1015,11 @@ impl std::fmt::Display for ConnectTarget {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConnectTarget, SocksCommand, normalize_bind_addr};
+    use super::{
+        ConnectTarget, SocksCommand, encode_socks_udp_packet, normalize_bind_addr,
+        parse_socks_udp_packet,
+    };
+    use std::net::{Ipv4Addr, SocketAddrV4};
 
     #[test]
     fn normalize_bind_addr_expands_port_only() {
@@ -644,5 +1056,41 @@ mod tests {
         assert_eq!(SocksCommand::from_byte(0x01), SocksCommand::Connect);
         assert_eq!(SocksCommand::from_byte(0x03), SocksCommand::UdpAssociate);
         assert_eq!(SocksCommand::from_byte(0x02), SocksCommand::Other(0x02));
+    }
+
+    #[test]
+    fn parse_socks_udp_packet_reads_ipv4_target() {
+        let raw = [0, 0, 0, 1, 10, 50, 2, 206, 0, 53, b'q', b'1'];
+        let packet = parse_socks_udp_packet(&raw).unwrap();
+        assert_eq!(packet.target.host(), "10.50.2.206");
+        assert_eq!(packet.target.port(), 53);
+        assert_eq!(packet.payload, b"q1");
+    }
+
+    #[test]
+    fn parse_socks_udp_packet_reads_domain_target() {
+        let raw = [
+            0, 0, 0, 3, 7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0, 53, b'q',
+        ];
+        let packet = parse_socks_udp_packet(&raw).unwrap();
+        assert_eq!(packet.target.host(), "example");
+        assert_eq!(packet.target.port(), 53);
+        assert_eq!(packet.payload, b"q");
+    }
+
+    #[test]
+    fn parse_socks_udp_packet_rejects_fragments() {
+        let raw = [0, 0, 1, 1, 10, 50, 2, 206, 0, 53];
+        assert!(parse_socks_udp_packet(&raw).is_err());
+    }
+
+    #[test]
+    fn encode_socks_udp_packet_writes_ipv4_source() {
+        let source = SocketAddrV4::new(Ipv4Addr::new(10, 50, 2, 206), 53);
+        let packet = encode_socks_udp_packet(source, b"ans");
+        assert_eq!(
+            packet,
+            vec![0, 0, 0, 1, 10, 50, 2, 206, 0, 53, b'a', b'n', b's']
+        );
     }
 }
