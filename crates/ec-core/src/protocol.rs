@@ -102,7 +102,7 @@ impl TunnelRuntimeParams {
 }
 
 static TX_PACKET_SENDER: OnceLock<mpsc::Sender<Vec<u8>>> = OnceLock::new();
-static QUERY_KEEPALIVE: OnceLock<Mutex<Option<SslStream<TcpStream>>>> = OnceLock::new();
+static QUERY_IP_STREAM_HOLDER: OnceLock<Mutex<Option<SslStream<TcpStream>>>> = OnceLock::new();
 static RX_PACKET_RECEIVER: OnceLock<Mutex<Option<mpsc::Receiver<Vec<u8>>>>> = OnceLock::new();
 static TUNNEL_FATAL_STATE: OnceLock<TunnelFatalState> = OnceLock::new();
 
@@ -299,7 +299,7 @@ fn query_assigned_ip_once(
     }
 
     let assigned_ip = [reply[4], reply[5], reply[6], reply[7]];
-    keep_query_stream_alive(stream)?;
+    hold_query_ip_stream(stream)?;
     Ok(assigned_ip)
 }
 
@@ -434,11 +434,11 @@ fn connect_vpn_tls(authority: &str, host: &str) -> EcResult<SslStream<TcpStream>
     crate::tls::handshake(ssl, tcp, "vpn")
 }
 
-fn keep_query_stream_alive(stream: SslStream<TcpStream>) -> EcResult<()> {
-    let holder = QUERY_KEEPALIVE.get_or_init(|| Mutex::new(None));
+fn hold_query_ip_stream(stream: SslStream<TcpStream>) -> EcResult<()> {
+    let holder = QUERY_IP_STREAM_HOLDER.get_or_init(|| Mutex::new(None));
     let mut guard = holder
         .lock()
-        .map_err(|_| EcError::Runtime("query keepalive mutex poisoned".to_string()))?;
+        .map_err(|_| EcError::Runtime("query-ip stream holder mutex poisoned".to_string()))?;
     *guard = Some(stream);
     Ok(())
 }
