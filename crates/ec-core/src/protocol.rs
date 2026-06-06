@@ -24,11 +24,31 @@ enum StreamProfile {
     Tx,
 }
 
+#[derive(Clone, Copy)]
+enum StreamOpenKind {
+    First,
+    Resume,
+}
+
 impl StreamProfile {
-    fn op_code(self) -> u8 {
+    fn first_op_code(self) -> u8 {
         match self {
             Self::Rx => 0x06,
             Self::Tx => 0x05,
+        }
+    }
+
+    fn resume_op_code(self) -> u8 {
+        match self {
+            Self::Rx => 0x07,
+            Self::Tx => 0x08,
+        }
+    }
+
+    fn op_code(self, kind: StreamOpenKind) -> u8 {
+        match kind {
+            StreamOpenKind::First => self.first_op_code(),
+            StreamOpenKind::Resume => self.resume_op_code(),
         }
     }
 
@@ -82,6 +102,7 @@ impl TunnelRuntimeParams {
             &self.token,
             &self.ip_rev,
             profile,
+            StreamOpenKind::First,
         )
     }
 
@@ -96,6 +117,7 @@ impl TunnelRuntimeParams {
             &self.token,
             &self.ip_rev,
             profile,
+            StreamOpenKind::Resume,
             retries,
         )
     }
@@ -363,6 +385,7 @@ fn reopen_data_stream(
     token: &[u8; PROTOCOL_TOKEN_LEN],
     ip_rev: &[u8; 4],
     profile: StreamProfile,
+    kind: StreamOpenKind,
     retries: usize,
 ) -> EcResult<SslStream<TcpStream>> {
     if retries > STREAM_RETRY_LIMIT {
@@ -372,7 +395,7 @@ fn reopen_data_stream(
         )));
     }
     thread::sleep(STREAM_RETRY_DELAY);
-    open_data_stream(authority, host, token, ip_rev, profile)
+    open_data_stream(authority, host, token, ip_rev, profile, kind)
 }
 
 fn open_data_stream(
@@ -381,9 +404,10 @@ fn open_data_stream(
     token: &[u8; PROTOCOL_TOKEN_LEN],
     ip_rev: &[u8; 4],
     profile: StreamProfile,
+    kind: StreamOpenKind,
 ) -> EcResult<SslStream<TcpStream>> {
     let mut stream = connect_vpn_tls(authority, host)?;
-    let op_code = profile.op_code();
+    let op_code = profile.op_code(kind);
     let expected_reply = profile.expected_reply();
 
     let message = build_stream_handshake_message(op_code, token, ip_rev);
@@ -464,4 +488,17 @@ fn read_stream_once<S: Read + Write>(
 
 fn is_wouldblock_or_timeout(err: &std::io::Error) -> bool {
     matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StreamOpenKind, StreamProfile};
+
+    #[test]
+    fn stream_profiles_use_official_first_and_resume_ops() {
+        assert_eq!(StreamProfile::Rx.op_code(StreamOpenKind::First), 0x06);
+        assert_eq!(StreamProfile::Rx.op_code(StreamOpenKind::Resume), 0x07);
+        assert_eq!(StreamProfile::Tx.op_code(StreamOpenKind::First), 0x05);
+        assert_eq!(StreamProfile::Tx.op_code(StreamOpenKind::Resume), 0x08);
+    }
 }
