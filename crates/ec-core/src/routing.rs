@@ -641,7 +641,14 @@ fn proto_matches(rule_proto: i32, flow_proto: FlowProto) -> bool {
     rule_proto == -1 || rule_proto == flow_proto.code()
 }
 
+fn is_vipall(rule: &CompiledRule) -> bool {
+    rule.svc.trim() == "vipall"
+}
+
 fn rule_matches_flow(rule: &CompiledRule, port: u16, flow_proto: FlowProto) -> bool {
+    if is_vipall(rule) {
+        return true;
+    }
     port_matches(rule.port, port) && proto_matches(rule.proto, flow_proto)
 }
 
@@ -1181,6 +1188,72 @@ mod tests {
                 assert_eq!(reason, "no whitelist rule matched");
             }
             _ => panic!("expected fallback plan"),
+        }
+    }
+
+    #[test]
+    fn vipall_ip_rule_ignores_port_and_proto_after_ip_hit() {
+        let table = RouteTable {
+            rules: vec![RouteRule {
+                rc_id: 336,
+                proto: 0,
+                svc: "vipall".to_string(),
+                name: "vip-all".to_string(),
+                host: "10.50.2.206".to_string(),
+                port: PortRange { start: 80, end: 80 },
+            }],
+            dns_servers: vec![],
+            dns_records: vec![],
+        };
+        let matcher = RouteMatcher::from_table(table).unwrap();
+        let plan = matcher.plan("10.50.2.206", 443, FlowProto::Udp);
+        match plan {
+            RoutePlan::Remote {
+                dial,
+                rc_id,
+                source,
+                ..
+            } => {
+                assert_eq!(dial, "10.50.2.206:443");
+                assert_eq!(rc_id, 336);
+                assert_eq!(source, RouteSource::RuleIp);
+            }
+            _ => panic!("expected remote plan"),
+        }
+    }
+
+    #[test]
+    fn vipall_dns_data_ip_rule_ignores_port_and_proto_after_ip_hit() {
+        let table = RouteTable {
+            rules: vec![RouteRule {
+                rc_id: 337,
+                proto: 0,
+                svc: "vipall".to_string(),
+                name: "vip-all-range".to_string(),
+                host: "10.50.2.1~10.50.2.254".to_string(),
+                port: PortRange { start: 80, end: 80 },
+            }],
+            dns_servers: vec![],
+            dns_records: vec![DnsRecord {
+                rc_id: 337,
+                host: "vip.example".to_string(),
+                ip: "10.50.2.206".to_string(),
+            }],
+        };
+        let matcher = RouteMatcher::from_table(table).unwrap();
+        let plan = matcher.plan("vip.example", 443, FlowProto::Udp);
+        match plan {
+            RoutePlan::Remote {
+                dial,
+                rc_id,
+                source,
+                ..
+            } => {
+                assert_eq!(dial, "10.50.2.206:443");
+                assert_eq!(rc_id, 337);
+                assert_eq!(source, RouteSource::DnsDataIpRule);
+            }
+            _ => panic!("expected remote plan"),
         }
     }
 
