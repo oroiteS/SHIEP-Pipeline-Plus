@@ -136,6 +136,7 @@ struct CompiledRule {
     rc_id: i32,
     rc_name: String,
     proto: i32,
+    svc: String,
     matcher: HostMatcher,
     port: PortRange,
 }
@@ -556,6 +557,7 @@ struct RuleDedupKey {
     rc_id: i32,
     rc_name: String,
     proto: i32,
+    svc: String,
     matcher: MatcherDedupKey,
     port_start: u16,
     port_end: u16,
@@ -579,6 +581,7 @@ impl CompiledRule {
             rc_id: self.rc_id,
             rc_name: self.rc_name.clone(),
             proto: self.proto,
+            svc: self.svc.clone(),
             matcher,
             port_start: self.port.start,
             port_end: self.port.end,
@@ -612,6 +615,7 @@ fn compile_rule(rule: RouteRule) -> Option<CompiledRule> {
         rc_id: rule.rc_id,
         rc_name: rule.name,
         proto: rule.proto,
+        svc: rule.svc,
         matcher,
         port: rule.port,
     })
@@ -652,6 +656,7 @@ mod tests {
             rules: vec![RouteRule {
                 rc_id: 205,
                 proto: 0,
+                svc: "Other".to_string(),
                 name: "ids".to_string(),
                 host: "ids.shiep.edu.cn".to_string(),
                 port: PortRange {
@@ -710,6 +715,7 @@ mod tests {
             rules: vec![RouteRule {
                 rc_id: 301,
                 proto: 0,
+                svc: "Other".to_string(),
                 name: "ip-range".to_string(),
                 host: "10.166.0.1~10.166.255.254".to_string(),
                 port: PortRange {
@@ -747,6 +753,7 @@ mod tests {
             rules: vec![RouteRule {
                 rc_id: 302,
                 proto: 0,
+                svc: "Other".to_string(),
                 name: "domain-text-ip".to_string(),
                 host: "resolved.example".to_string(),
                 port: PortRange { start: 80, end: 80 },
@@ -774,6 +781,7 @@ mod tests {
             rules: vec![RouteRule {
                 rc_id: -98,
                 proto: 1,
+                svc: "".to_string(),
                 name: "__DNS_HIDE_RC1".to_string(),
                 host: "210.35.88.5".to_string(),
                 port: PortRange { start: 53, end: 53 },
@@ -801,6 +809,7 @@ mod tests {
             rules: vec![RouteRule {
                 rc_id: 150,
                 proto: 0,
+                svc: "Other".to_string(),
                 name: "SUEP-WAF".to_string(),
                 host: "lgwf0-46.shiep.edu.cn".to_string(),
                 port: PortRange {
@@ -845,6 +854,7 @@ mod tests {
             rules: vec![RouteRule {
                 rc_id: 150,
                 proto: 0,
+                svc: "Other".to_string(),
                 name: "private-ip".to_string(),
                 host: "10.166.64.6".to_string(),
                 port: PortRange {
@@ -871,6 +881,7 @@ mod tests {
             rules: vec![RouteRule {
                 rc_id: 302,
                 proto: 0,
+                svc: "Other".to_string(),
                 name: "resolved-range".to_string(),
                 host: "10.50.2.1~10.50.2.254".to_string(),
                 port: PortRange { start: 80, end: 80 },
@@ -904,6 +915,7 @@ mod tests {
             rules: vec![RouteRule {
                 rc_id: 334,
                 proto: 0,
+                svc: "Other".to_string(),
                 name: "fee".to_string(),
                 host: "10.50.2.1~10.50.2.254".to_string(),
                 port: PortRange { start: 80, end: 80 },
@@ -943,6 +955,7 @@ mod tests {
             rules: vec![RouteRule {
                 rc_id: 205,
                 proto: 0,
+                svc: "Other".to_string(),
                 name: "ids".to_string(),
                 host: "ids.shiep.edu.cn".to_string(),
                 port: PortRange {
@@ -997,6 +1010,7 @@ mod tests {
                 RouteRule {
                     rc_id: 115,
                     proto: 0,
+                    svc: "Other".to_string(),
                     name: "qikan".to_string(),
                     host: "qikan.chaoxing.com".to_string(),
                     port: PortRange { start: 80, end: 80 },
@@ -1004,6 +1018,7 @@ mod tests {
                 RouteRule {
                     rc_id: 115,
                     proto: 0,
+                    svc: "Other".to_string(),
                     name: "qikan".to_string(),
                     host: "qikan.chaoxing.com".to_string(),
                     port: PortRange { start: 80, end: 80 },
@@ -1011,6 +1026,7 @@ mod tests {
                 RouteRule {
                     rc_id: 115,
                     proto: 0,
+                    svc: "Other".to_string(),
                     name: "qikan".to_string(),
                     host: "qikan.chaoxing.com".to_string(),
                     port: PortRange {
@@ -1068,6 +1084,7 @@ mod tests {
             rules: vec![RouteRule {
                 rc_id: 205,
                 proto: 0,
+                svc: "Other".to_string(),
                 name: "ids".to_string(),
                 host: "ids.shiep.edu.cn".to_string(),
                 port: PortRange {
@@ -1094,6 +1111,7 @@ mod tests {
             rules: vec![RouteRule {
                 rc_id: -98,
                 proto: 1,
+                svc: "".to_string(),
                 name: "__DNS_HIDE_RC1".to_string(),
                 host: "210.35.88.5".to_string(),
                 port: PortRange { start: 53, end: 53 },
@@ -1117,6 +1135,7 @@ mod tests {
             rules: vec![RouteRule {
                 rc_id: -98,
                 proto: 1,
+                svc: "".to_string(),
                 name: "__DNS_HIDE_RC1".to_string(),
                 host: "210.35.88.5".to_string(),
                 port: PortRange { start: 53, end: 53 },
@@ -1147,6 +1166,7 @@ mod tests {
             rules: vec![RouteRule {
                 rc_id: 334,
                 proto: 0,
+                svc: "Other".to_string(),
                 name: "tcp-only".to_string(),
                 host: "10.50.2.206".to_string(),
                 port: PortRange { start: 80, end: 80 },
@@ -1170,6 +1190,7 @@ mod tests {
             rules: vec![RouteRule {
                 rc_id: 335,
                 proto: -1,
+                svc: "Other".to_string(),
                 name: "any-proto".to_string(),
                 host: "10.50.2.206".to_string(),
                 port: PortRange { start: 80, end: 80 },
@@ -1196,6 +1217,7 @@ mod tests {
                 RouteRule {
                     rc_id: 1,
                     proto: 0,
+                    svc: "Other".to_string(),
                     name: "range-first".to_string(),
                     host: "10.50.2.1~10.50.2.254".to_string(),
                     port: PortRange { start: 80, end: 80 },
@@ -1203,6 +1225,7 @@ mod tests {
                 RouteRule {
                     rc_id: 2,
                     proto: 0,
+                    svc: "Other".to_string(),
                     name: "exact-second".to_string(),
                     host: "10.50.2.206".to_string(),
                     port: PortRange { start: 80, end: 80 },

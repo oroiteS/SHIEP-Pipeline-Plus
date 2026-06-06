@@ -21,6 +21,7 @@ pub struct RouteTable {
 pub struct RouteRule {
     pub rc_id: i32,
     pub proto: i32,
+    pub svc: String,
     pub name: String,
     pub host: String,
     pub port: PortRange,
@@ -119,6 +120,7 @@ fn parse_rc(
 ) -> EcResult<()> {
     let mut id_raw: Option<String> = None;
     let mut proto_raw: Option<String> = None;
+    let mut svc: Option<String> = None;
     let mut host_raw: Option<String> = None;
     let mut port_raw: Option<String> = None;
     let mut name: Option<String> = None;
@@ -129,6 +131,7 @@ fn parse_rc(
         match attr.key.as_ref() {
             b"id" => id_raw = Some(value),
             b"proto" => proto_raw = Some(value),
+            b"svc" => svc = Some(value),
             b"host" => host_raw = Some(value),
             b"port" => port_raw = Some(value),
             b"name" => name = Some(value),
@@ -152,6 +155,7 @@ fn parse_rc(
         .as_deref()
         .and_then(|v| v.parse::<i32>().ok())
         .unwrap_or(0);
+    let svc = svc.unwrap_or_default();
     let name = name.unwrap_or_default();
     let hosts = split_hosts(&host_raw);
     let ports = split_ports(&port_raw);
@@ -167,6 +171,7 @@ fn parse_rc(
         rules.push(RouteRule {
             rc_id,
             proto,
+            svc: svc.clone(),
             name: name.clone(),
             host,
             port,
@@ -328,7 +333,7 @@ mod tests {
         let xml = r#"<?xml version="1.0" encoding="utf-8"?>
 <Resource>
   <Rcs>
-    <Rc id="205" proto="1" name="IDS" host="ids.shiep.edu.cn;10.1.2.3" port="443~443;80~80" />
+    <Rc id="205" proto="1" svc="Other" name="IDS" host="ids.shiep.edu.cn;10.1.2.3" port="443~443;80~80" />
   </Rcs>
   <Dns dnsserver="210.35.88.5;114.114.114.114" data="205:ids.shiep.edu.cn:10.166.35.11;" />
 </Resource>"#;
@@ -336,10 +341,25 @@ mod tests {
         assert_eq!(table.rules.len(), 2);
         assert_eq!(table.rules[0].proto, 1);
         assert_eq!(table.rules[1].proto, 1);
+        assert_eq!(table.rules[0].svc, "Other");
+        assert_eq!(table.rules[1].svc, "Other");
         assert_eq!(table.dns_servers.len(), 2);
         assert_eq!(table.dns_records.len(), 1);
         assert_eq!(table.dns_records[0].host, "ids.shiep.edu.cn");
         assert_eq!(table.dns_records[0].ip, "10.166.35.11");
+    }
+
+    #[test]
+    fn parse_xml_defaults_missing_svc_to_empty() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<Resource>
+  <Rcs>
+    <Rc id="-98" proto="1" name="__DNS_HIDE_RC1" host="210.35.88.5" port="53~53" />
+  </Rcs>
+</Resource>"#;
+        let table = parse_route_table_xml(xml).unwrap();
+        assert_eq!(table.rules.len(), 1);
+        assert_eq!(table.rules[0].svc, "");
     }
 
     #[test]
