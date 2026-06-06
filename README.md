@@ -14,10 +14,10 @@ The project focuses on minimal scope, clear structure, and maintainability, with
 - Username/password login (RSA-encrypted password flow)
 - Session and agent token acquisition
 - VPN tunnel setup with RX/TX runtime
-- Local SOCKS5 listener (CONNECT only, no auth)
+- Local SOCKS5 listener (CONNECT and UDP ASSOCIATE for remote routes, no auth)
 - Automatic route-table fetch and parse (`/por/rclist.csp`) for split-routing decisions
 - Route table based target decision (whitelist hit -> remote)
-- Configurable fallback routing (non-whitelist -> direct or upstream proxy via `--fallback`)
+- Configurable TCP fallback routing (non-whitelist -> direct or upstream proxy via `--fallback`)
 - Structured, colorized logging that balances operational detail and visual clarity
 - Supported fallback proxy input formats:
 
@@ -84,9 +84,9 @@ Example:
 
 - The app fetches and parses route rules from `/por/rclist.csp`.
 - If a whitelist rule matches, traffic goes remote (preferring mapped DNS IP).
-- If no whitelist rule matches, traffic goes fallback.
-- With `--fallback`, traffic goes through the upstream proxy.
-- Without `--fallback`, traffic goes direct.
+- If no whitelist rule matches, TCP traffic goes fallback.
+- With `--fallback`, TCP traffic goes through the upstream proxy.
+- Without `--fallback`, TCP traffic goes direct.
 
 ## Release Artifacts
 
