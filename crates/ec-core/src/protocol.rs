@@ -442,7 +442,7 @@ fn open_data_stream(
 }
 
 fn connect_vpn_tls(authority: &str, host: &str) -> EcResult<SslStream<TcpStream>> {
-    let tcp = crate::tls::connect_tcp_with_timeout(authority, Duration::from_secs(5), "vpn")?;
+    let tcp = crate::tls::connect_vpn_tcp(authority, Duration::from_secs(5))?;
     let mut builder = crate::tls::new_insecure_connector_builder("vpn")?;
     builder.set_security_level(0);
     builder

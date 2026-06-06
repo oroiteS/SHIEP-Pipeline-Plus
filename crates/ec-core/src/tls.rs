@@ -3,8 +3,13 @@ use openssl::ssl::{
     ConnectConfiguration, Ssl, SslConnector, SslConnectorBuilder, SslMethod, SslOptions, SslStream,
     SslVerifyMode,
 };
+use socket2::{SockRef, TcpKeepalive};
 use std::net::TcpStream;
 use std::time::Duration;
+
+const VPN_TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
+const VPN_TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
+const VPN_TCP_KEEPALIVE_RETRIES: u32 = 3;
 
 pub(crate) fn connect_tcp_with_timeout(
     authority: &str,
@@ -18,6 +23,22 @@ pub(crate) fn connect_tcp_with_timeout(
     tcp.set_write_timeout(Some(timeout))
         .map_err(|e| EcError::Runtime(format!("set write timeout failed: {e}")))?;
     Ok(tcp)
+}
+
+pub(crate) fn connect_vpn_tcp(authority: &str, timeout: Duration) -> EcResult<TcpStream> {
+    let tcp = connect_tcp_with_timeout(authority, timeout, "vpn")?;
+    apply_vpn_tcp_keepalive(&tcp)?;
+    Ok(tcp)
+}
+
+fn apply_vpn_tcp_keepalive(tcp: &TcpStream) -> EcResult<()> {
+    let keepalive = TcpKeepalive::new()
+        .with_time(VPN_TCP_KEEPALIVE_IDLE)
+        .with_interval(VPN_TCP_KEEPALIVE_INTERVAL)
+        .with_retries(VPN_TCP_KEEPALIVE_RETRIES);
+    SockRef::from(tcp)
+        .set_tcp_keepalive(&keepalive)
+        .map_err(|e| EcError::Runtime(format!("set vpn tcp keepalive failed: {e}")))
 }
 
 pub(crate) fn new_insecure_connector_builder(context: &str) -> EcResult<SslConnectorBuilder> {
