@@ -90,7 +90,11 @@ fn handle_client(mut client: TcpStream, fallback_proxy: Option<&FallbackProxy>) 
 fn decide_route(target: &ConnectTarget, fallback_proxy: Option<&FallbackProxy>) -> RouteDecision {
     let target_display = target.to_string();
     let target_is_ip = is_ip_host(target.host());
-    match crate::routing::plan_target(target.host(), target.port()) {
+    match crate::routing::plan_target_with_proto(
+        target.host(),
+        target.port(),
+        crate::routing::FlowProto::Tcp,
+    ) {
         Ok(crate::routing::RoutePlan::Remote {
             dial,
             rc_id,
@@ -151,26 +155,13 @@ fn decide_route(target: &ConnectTarget, fallback_proxy: Option<&FallbackProxy>) 
         Ok(crate::routing::RoutePlan::Fallback {
             target: planned_target,
             reason,
-            reserved_proto1,
-        }) => {
-            if reserved_proto1 {
-                output::warn(
-                    Scope::Upstream,
-                    format_args!(
-                        "{} hit reserved proto=1 route (separated from normal routing); forcing {}",
-                        output::value(target_display.as_str()),
-                        output::route_label(RouteKind::Fallback),
-                    ),
-                );
-            }
-            route_decision_fallback(
-                target.clone(),
-                target_display.as_str(),
-                target_addr(&planned_target),
-                reason,
-                fallback_proxy,
-            )
-        }
+        }) => route_decision_fallback(
+            target.clone(),
+            target_display.as_str(),
+            target_addr(&planned_target),
+            reason,
+            fallback_proxy,
+        ),
         Err(err) => route_decision_legacy(target, target_display.as_str(), err),
     }
 }

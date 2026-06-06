@@ -26,8 +26,25 @@ pub enum RoutePlan {
     Fallback {
         target: String,
         reason: String,
-        reserved_proto1: bool,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum FlowProto {
+    Tcp,
+    Udp,
+    Icmp,
+}
+
+impl FlowProto {
+    fn code(self) -> i32 {
+        match self {
+            FlowProto::Tcp => 0,
+            FlowProto::Udp => 1,
+            FlowProto::Icmp => 2,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,7 +103,12 @@ pub fn install_route_table(table: RouteTable) -> EcResult<RouteInstallSummary> {
     Ok(summary)
 }
 
+#[allow(dead_code)]
 pub fn plan_target(host: &str, port: u16) -> EcResult<RoutePlan> {
+    plan_target_with_proto(host, port, FlowProto::Tcp)
+}
+
+pub fn plan_target_with_proto(host: &str, port: u16, flow_proto: FlowProto) -> EcResult<RoutePlan> {
     let holder = ROUTER
         .get()
         .ok_or_else(|| EcError::Runtime(ROUTER_NOT_INITIALIZED.to_string()))?;
@@ -96,15 +118,13 @@ pub fn plan_target(host: &str, port: u16) -> EcResult<RoutePlan> {
     let Some(matcher) = matcher.as_ref().cloned() else {
         return Err(EcError::Runtime(ROUTER_NOT_INITIALIZED.to_string()));
     };
-    Ok(matcher.plan(host, port))
+    Ok(matcher.plan(host, port, flow_proto))
 }
 
 #[derive(Debug, Clone)]
 struct RouteMatcher {
     rules: Vec<CompiledRule>,
     rule_index: RuleIndex,
-    proto1_rules: Vec<CompiledRule>,
-    proto1_index: RuleIndex,
     dns_map: HashMap<i32, HashMap<String, Vec<Ipv4Addr>>>,
     dns_exact: HashMap<String, Vec<Ipv4Addr>>,
     dns_servers: Vec<SocketAddr>,
@@ -115,6 +135,7 @@ struct RouteMatcher {
 struct CompiledRule {
     rc_id: i32,
     rc_name: String,
+    proto: i32,
     matcher: HostMatcher,
     port: PortRange,
 }
@@ -148,17 +169,14 @@ impl RouteMatcher {
             ..
         } = table;
 
-        let (rules, proto1_rules) = compile_rules(raw_rules);
+        let rules = compile_rules(raw_rules);
         let rule_index = RuleIndex::build(&rules);
-        let proto1_index = RuleIndex::build(&proto1_rules);
         let dns_indexes = build_dns_indexes(raw_dns_records);
         let dns_servers = normalize_dns_servers(dns_servers);
 
         Ok(Self {
             rules,
             rule_index,
-            proto1_rules,
-            proto1_index,
             dns_map: dns_indexes.scoped,
             dns_exact: dns_indexes.exact,
             dns_servers,
@@ -166,34 +184,23 @@ impl RouteMatcher {
         })
     }
 
-    fn plan(&self, host: &str, port: u16) -> RoutePlan {
+    fn plan(&self, host: &str, port: u16, flow_proto: FlowProto) -> RoutePlan {
         let target = parse_target(host);
-        if let Some(rule) = self.rule_index.find_first_match(&self.rules, &target, port) {
+        if let Some(rule) = self
+            .rule_index
+            .find_first_match(&self.rules, &target, port, flow_proto)
+        {
             return self.plan_remote_with_rule(rule, host, port, &target);
         }
 
-        if let Some(rule) = self
-            .proto1_index
-            .find_first_match(&self.proto1_rules, &target, port)
-        {
-            return RoutePlan::Fallback {
-                target: format!("{host}:{port}"),
-                reason: format!(
-                    "matched reserved proto=1 rule rc_id={} name={}; proto=1 is separated from normal routing and forced to fallback",
-                    rule.rc_id, rule.rc_name
-                ),
-                reserved_proto1: true,
-            };
-        }
-
         if let TargetKind::Domain(domain) = &target
-            && let Some(plan) = self.plan_dns_data_ip_rule(host, port, domain)
+            && let Some(plan) = self.plan_dns_data_ip_rule(port, domain, flow_proto)
         {
             return plan;
         }
 
         if let TargetKind::Domain(domain) = &target
-            && let Some(plan) = self.plan_dnsserver_derived_rules(host, port, domain)
+            && let Some(plan) = self.plan_dnsserver_derived_rules(host, port, domain, flow_proto)
         {
             return plan;
         }
@@ -201,7 +208,6 @@ impl RouteMatcher {
         RoutePlan::Fallback {
             target: format!("{host}:{port}"),
             reason: "no whitelist rule matched".to_string(),
-            reserved_proto1: false,
         }
     }
 
@@ -240,7 +246,6 @@ impl RouteMatcher {
                             "hostname matched rc_id={} but dns map is missing and dnsserver is unavailable",
                             rule.rc_id
                         ),
-                        reserved_proto1: false,
                     };
                 }
 
@@ -269,16 +274,20 @@ impl RouteMatcher {
                             rule.rc_id,
                             crate::error::concise_error(err)
                         ),
-                        reserved_proto1: false,
                     },
                 }
             }
         }
     }
 
-    fn plan_dns_data_ip_rule(&self, host: &str, port: u16, domain: &str) -> Option<RoutePlan> {
+    fn plan_dns_data_ip_rule(
+        &self,
+        port: u16,
+        domain: &str,
+        flow_proto: FlowProto,
+    ) -> Option<RoutePlan> {
         let ips = self.dns_exact.get(domain)?;
-        self.plan_from_resolved_ips(host, port, ips, RouteSource::DnsDataIpRule)
+        self.plan_from_resolved_ips(port, ips, flow_proto, RouteSource::DnsDataIpRule)
     }
 
     fn plan_dnsserver_derived_rules(
@@ -286,12 +295,14 @@ impl RouteMatcher {
         host: &str,
         port: u16,
         domain: &str,
+        flow_proto: FlowProto,
     ) -> Option<RoutePlan> {
         if self.dns_servers.is_empty() {
             return None;
         }
         let resolved = crate::dns_resolver::resolve_lookup(domain, &self.dns_servers).ok()?;
-        if let Some(plan) = self.plan_from_cname_aliases(host, port, &resolved.aliases) {
+        if let Some(plan) = self.plan_from_cname_aliases(host, port, &resolved.aliases, flow_proto)
+        {
             return Some(plan);
         }
         let source = match resolved.source {
@@ -300,7 +311,7 @@ impl RouteMatcher {
                 RouteSource::DnsServerIpRuleQuery(server)
             }
         };
-        self.plan_from_resolved_ips(host, port, &resolved.ips, source)
+        self.plan_from_resolved_ips(port, &resolved.ips, flow_proto, source)
     }
 
     fn plan_from_cname_aliases(
@@ -308,6 +319,7 @@ impl RouteMatcher {
         host: &str,
         port: u16,
         aliases: &[String],
+        flow_proto: FlowProto,
     ) -> Option<RoutePlan> {
         for alias in aliases {
             let alias = normalize_domain(alias);
@@ -315,21 +327,11 @@ impl RouteMatcher {
                 continue;
             }
             let target = TargetKind::Domain(alias);
-            if let Some(rule) = self.rule_index.find_first_match(&self.rules, &target, port) {
-                return Some(self.plan_remote_with_cname_rule(rule, host, port, &target));
-            }
             if let Some(rule) =
-                self.proto1_index
-                    .find_first_match(&self.proto1_rules, &target, port)
+                self.rule_index
+                    .find_first_match(&self.rules, &target, port, flow_proto)
             {
-                return Some(RoutePlan::Fallback {
-                    target: format!("{host}:{port}"),
-                    reason: format!(
-                        "cname matched reserved proto=1 rule rc_id={} name={}; proto=1 is separated from normal routing and forced to fallback",
-                        rule.rc_id, rule.rc_name
-                    ),
-                    reserved_proto1: true,
-                });
+                return Some(self.plan_remote_with_cname_rule(rule, host, port, &target));
             }
         }
         None
@@ -337,32 +339,22 @@ impl RouteMatcher {
 
     fn plan_from_resolved_ips(
         &self,
-        host: &str,
         port: u16,
         ips: &[Ipv4Addr],
+        flow_proto: FlowProto,
         source: RouteSource,
     ) -> Option<RoutePlan> {
         for ip in ips {
             let target = TargetKind::Ipv4(*ip);
-            if let Some(rule) = self.rule_index.find_first_match(&self.rules, &target, port) {
+            if let Some(rule) =
+                self.rule_index
+                    .find_first_match(&self.rules, &target, port, flow_proto)
+            {
                 return Some(RoutePlan::Remote {
                     dial: format!("{ip}:{port}"),
                     rc_id: rule.rc_id,
                     rc_name: rule.rc_name.clone(),
                     source,
-                });
-            }
-            if let Some(rule) =
-                self.proto1_index
-                    .find_first_match(&self.proto1_rules, &target, port)
-            {
-                return Some(RoutePlan::Fallback {
-                    target: format!("{host}:{port}"),
-                    reason: format!(
-                        "resolved ip matched reserved proto=1 rule rc_id={} name={}; proto=1 is separated from normal routing and forced to fallback",
-                        rule.rc_id, rule.rc_name
-                    ),
-                    reserved_proto1: true,
                 });
             }
         }
@@ -434,21 +426,23 @@ impl RuleIndex {
         rules: &'a [CompiledRule],
         target: &TargetKind,
         port: u16,
+        flow_proto: FlowProto,
     ) -> Option<&'a CompiledRule> {
         match target {
             TargetKind::Domain(domain) => self
                 .domain
                 .get(domain)
                 .and_then(|ids| {
-                    ids.iter()
-                        .find_map(|&idx| port_matches(rules[idx].port, port).then_some(idx))
+                    ids.iter().find_map(|&idx| {
+                        rule_matches_flow(&rules[idx], port, flow_proto).then_some(idx)
+                    })
                 })
                 .map(|idx| &rules[idx]),
             TargetKind::Ipv4(ip) => {
                 let mut best_idx: Option<usize> = None;
                 if let Some(ids) = self.ipv4.get(ip) {
                     for &idx in ids {
-                        if port_matches(rules[idx].port, port)
+                        if rule_matches_flow(&rules[idx], port, flow_proto)
                             && best_idx.is_none_or(|best| idx < best)
                         {
                             best_idx = Some(idx);
@@ -464,7 +458,7 @@ impl RuleIndex {
                     };
                     if *start <= needle
                         && needle <= *end
-                        && port_matches(rule.port, port)
+                        && rule_matches_flow(rule, port, flow_proto)
                         && best_idx.is_none_or(|best| idx < best)
                     {
                         best_idx = Some(idx);
@@ -503,21 +497,10 @@ fn normalize_dns_servers(servers: Vec<String>) -> Vec<SocketAddr> {
     out
 }
 
-fn compile_rules(raw_rules: Vec<RouteRule>) -> (Vec<CompiledRule>, Vec<CompiledRule>) {
+fn compile_rules(raw_rules: Vec<RouteRule>) -> Vec<CompiledRule> {
     let mut rules = Vec::with_capacity(raw_rules.len());
-    let mut proto1_rules = Vec::with_capacity(raw_rules.len());
     let mut seen_rules = HashSet::<RuleDedupKey>::with_capacity(raw_rules.len());
-    let mut seen_proto1_rules = HashSet::<RuleDedupKey>::with_capacity(raw_rules.len());
     for rule in raw_rules {
-        if rule.proto == 1 {
-            if let Some(compiled) = compile_rule(rule) {
-                let key = compiled.dedup_key();
-                if seen_proto1_rules.insert(key) {
-                    proto1_rules.push(compiled);
-                }
-            }
-            continue;
-        }
         if let Some(compiled) = compile_rule(rule) {
             let key = compiled.dedup_key();
             if seen_rules.insert(key) {
@@ -525,7 +508,7 @@ fn compile_rules(raw_rules: Vec<RouteRule>) -> (Vec<CompiledRule>, Vec<CompiledR
             }
         }
     }
-    (rules, proto1_rules)
+    rules
 }
 
 #[derive(Debug, Clone)]
@@ -572,6 +555,7 @@ fn build_dns_indexes(raw_dns_records: Vec<crate::route_table::DnsRecord>) -> Dns
 struct RuleDedupKey {
     rc_id: i32,
     rc_name: String,
+    proto: i32,
     matcher: MatcherDedupKey,
     port_start: u16,
     port_end: u16,
@@ -594,6 +578,7 @@ impl CompiledRule {
         RuleDedupKey {
             rc_id: self.rc_id,
             rc_name: self.rc_name.clone(),
+            proto: self.proto,
             matcher,
             port_start: self.port.start,
             port_end: self.port.end,
@@ -626,6 +611,7 @@ fn compile_rule(rule: RouteRule) -> Option<CompiledRule> {
     Some(CompiledRule {
         rc_id: rule.rc_id,
         rc_name: rule.name,
+        proto: rule.proto,
         matcher,
         port: rule.port,
     })
@@ -647,9 +633,17 @@ fn port_matches(range: PortRange, port: u16) -> bool {
     range.start <= port && port <= range.end
 }
 
+fn proto_matches(rule_proto: i32, flow_proto: FlowProto) -> bool {
+    rule_proto == -1 || rule_proto == flow_proto.code()
+}
+
+fn rule_matches_flow(rule: &CompiledRule, port: u16, flow_proto: FlowProto) -> bool {
+    port_matches(rule.port, port) && proto_matches(rule.proto, flow_proto)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{RouteMatcher, RoutePlan, RouteSource};
+    use super::{FlowProto, RouteMatcher, RoutePlan, RouteSource};
     use crate::route_table::{DnsRecord, PortRange, RouteRule, RouteTable};
 
     #[test]
@@ -673,7 +667,7 @@ mod tests {
             }],
         };
         let matcher = RouteMatcher::from_table(table).unwrap();
-        let plan = matcher.plan("ids.shiep.edu.cn", 443);
+        let plan = matcher.plan("ids.shiep.edu.cn", 443, FlowProto::Tcp);
         match plan {
             RoutePlan::Remote {
                 dial,
@@ -701,7 +695,7 @@ mod tests {
             }],
         };
         let matcher = RouteMatcher::from_table(table).unwrap();
-        let plan = matcher.plan("ecard.shiep.edu.cn", 80);
+        let plan = matcher.plan("ecard.shiep.edu.cn", 80, FlowProto::Tcp);
         match plan {
             RoutePlan::Fallback { reason, .. } => {
                 assert_eq!(reason, "no whitelist rule matched");
@@ -731,7 +725,7 @@ mod tests {
             }],
         };
         let matcher = RouteMatcher::from_table(table).unwrap();
-        let plan = matcher.plan("pan2.shiep.edu.cn", 10002);
+        let plan = matcher.plan("pan2.shiep.edu.cn", 10002, FlowProto::Tcp);
         match plan {
             RoutePlan::Remote {
                 dial,
@@ -765,7 +759,7 @@ mod tests {
             }],
         };
         let matcher = RouteMatcher::from_table(table).unwrap();
-        let plan = matcher.plan("pan2.shiep.edu.cn", 80);
+        let plan = matcher.plan("pan2.shiep.edu.cn", 80, FlowProto::Tcp);
         match plan {
             RoutePlan::Fallback { reason, .. } => {
                 assert_eq!(reason, "no whitelist rule matched");
@@ -775,7 +769,7 @@ mod tests {
     }
 
     #[test]
-    fn dns_data_exact_host_respects_reserved_proto1_ip_rule() {
+    fn dns_data_exact_host_skips_udp_only_ip_rule_for_tcp() {
         let table = RouteTable {
             rules: vec![RouteRule {
                 rc_id: -98,
@@ -792,10 +786,10 @@ mod tests {
             }],
         };
         let matcher = RouteMatcher::from_table(table).unwrap();
-        let plan = matcher.plan("dns-hide.example", 53);
+        let plan = matcher.plan("dns-hide.example", 53, FlowProto::Tcp);
         match plan {
             RoutePlan::Fallback { reason, .. } => {
-                assert!(reason.contains("resolved ip matched reserved proto=1 rule"));
+                assert_eq!(reason, "no whitelist rule matched");
             }
             _ => panic!("expected fallback plan"),
         }
@@ -827,6 +821,7 @@ mod tests {
                 "estudent.shiep.edu.cn",
                 443,
                 &["lgwf0-46.shiep.edu.cn".to_string()],
+                FlowProto::Tcp,
             )
             .unwrap();
         match plan {
@@ -865,6 +860,7 @@ mod tests {
             "estudent.shiep.edu.cn",
             443,
             &["10.166.64.6".to_string()],
+            FlowProto::Tcp,
         );
         assert!(plan.is_none());
     }
@@ -885,12 +881,7 @@ mod tests {
         let matcher = RouteMatcher::from_table(table).unwrap();
         let ips = vec!["10.50.2.206".parse().unwrap()];
         let plan = matcher
-            .plan_from_resolved_ips(
-                "pan2.shiep.edu.cn",
-                80,
-                &ips,
-                RouteSource::DnsServerIpRuleCache,
-            )
+            .plan_from_resolved_ips(80, &ips, FlowProto::Tcp, RouteSource::DnsServerIpRuleCache)
             .unwrap();
         match plan {
             RoutePlan::Remote {
@@ -921,7 +912,7 @@ mod tests {
             dns_records: vec![],
         };
         let matcher = RouteMatcher::from_table(table).unwrap();
-        let plan = matcher.plan("10.50.2.206", 80);
+        let plan = matcher.plan("10.50.2.206", 80, FlowProto::Tcp);
         match plan {
             RoutePlan::Remote { dial, source, .. } => {
                 assert_eq!(dial, "10.50.2.206:80");
@@ -939,7 +930,7 @@ mod tests {
             dns_records: vec![],
         };
         let matcher = RouteMatcher::from_table(table).unwrap();
-        let plan = matcher.plan("example.com", 443);
+        let plan = matcher.plan("example.com", 443, FlowProto::Tcp);
         match plan {
             RoutePlan::Fallback { .. } => {}
             _ => panic!("expected fallback plan"),
@@ -1088,7 +1079,7 @@ mod tests {
             dns_records: vec![],
         };
         let matcher = RouteMatcher::from_table(table).unwrap();
-        let plan = matcher.plan("ids.shiep.edu.cn", 443);
+        let plan = matcher.plan("ids.shiep.edu.cn", 443, FlowProto::Tcp);
         match plan {
             RoutePlan::Fallback { reason, .. } => {
                 assert!(reason.contains("dnsserver lookup failed"));
@@ -1098,7 +1089,7 @@ mod tests {
     }
 
     #[test]
-    fn proto1_rules_are_excluded_from_matching() {
+    fn tcp_flow_skips_udp_only_rule() {
         let table = RouteTable {
             rules: vec![RouteRule {
                 rc_id: -98,
@@ -1111,12 +1102,90 @@ mod tests {
             dns_records: vec![],
         };
         let matcher = RouteMatcher::from_table(table).unwrap();
-        let plan = matcher.plan("210.35.88.5", 53);
+        let plan = matcher.plan("210.35.88.5", 53, FlowProto::Tcp);
         match plan {
             RoutePlan::Fallback { reason, .. } => {
-                assert!(reason.contains("matched reserved proto=1 rule"));
+                assert_eq!(reason, "no whitelist rule matched");
             }
             _ => panic!("expected fallback plan"),
+        }
+    }
+
+    #[test]
+    fn udp_flow_matches_proto1_dns_rule() {
+        let table = RouteTable {
+            rules: vec![RouteRule {
+                rc_id: -98,
+                proto: 1,
+                name: "__DNS_HIDE_RC1".to_string(),
+                host: "210.35.88.5".to_string(),
+                port: PortRange { start: 53, end: 53 },
+            }],
+            dns_servers: vec![],
+            dns_records: vec![],
+        };
+        let matcher = RouteMatcher::from_table(table).unwrap();
+        let plan = matcher.plan("210.35.88.5", 53, FlowProto::Udp);
+        match plan {
+            RoutePlan::Remote {
+                dial,
+                rc_id,
+                source,
+                ..
+            } => {
+                assert_eq!(dial, "210.35.88.5:53");
+                assert_eq!(rc_id, -98);
+                assert_eq!(source, RouteSource::RuleIp);
+            }
+            _ => panic!("expected remote plan"),
+        }
+    }
+
+    #[test]
+    fn udp_flow_skips_tcp_only_rule() {
+        let table = RouteTable {
+            rules: vec![RouteRule {
+                rc_id: 334,
+                proto: 0,
+                name: "tcp-only".to_string(),
+                host: "10.50.2.206".to_string(),
+                port: PortRange { start: 80, end: 80 },
+            }],
+            dns_servers: vec![],
+            dns_records: vec![],
+        };
+        let matcher = RouteMatcher::from_table(table).unwrap();
+        let plan = matcher.plan("10.50.2.206", 80, FlowProto::Udp);
+        match plan {
+            RoutePlan::Fallback { reason, .. } => {
+                assert_eq!(reason, "no whitelist rule matched");
+            }
+            _ => panic!("expected fallback plan"),
+        }
+    }
+
+    #[test]
+    fn wildcard_proto_matches_tcp_and_udp() {
+        let table = RouteTable {
+            rules: vec![RouteRule {
+                rc_id: 335,
+                proto: -1,
+                name: "any-proto".to_string(),
+                host: "10.50.2.206".to_string(),
+                port: PortRange { start: 80, end: 80 },
+            }],
+            dns_servers: vec![],
+            dns_records: vec![],
+        };
+        let matcher = RouteMatcher::from_table(table).unwrap();
+        for flow_proto in [FlowProto::Tcp, FlowProto::Udp] {
+            let plan = matcher.plan("10.50.2.206", 80, flow_proto);
+            match plan {
+                RoutePlan::Remote { rc_id, .. } => {
+                    assert_eq!(rc_id, 335);
+                }
+                _ => panic!("expected remote plan"),
+            }
         }
     }
 
@@ -1143,7 +1212,7 @@ mod tests {
             dns_records: vec![],
         };
         let matcher = RouteMatcher::from_table(table).unwrap();
-        let plan = matcher.plan("10.50.2.206", 80);
+        let plan = matcher.plan("10.50.2.206", 80, FlowProto::Tcp);
         match plan {
             RoutePlan::Remote { rc_id, dial, .. } => {
                 assert_eq!(rc_id, 1);
