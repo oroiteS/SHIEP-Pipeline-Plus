@@ -489,6 +489,7 @@ fn validate_stream_ack(
             expected_ack,
             format_args!("{}({})", control.label(), control.code()),
         )),
+        None if legacy_stream_ack_matches(reply, expected_ack) => Ok(()),
         None => Err(unexpected_stream_ack_err(
             profile,
             op_code,
@@ -496,6 +497,10 @@ fn validate_stream_ack(
             format_args!("non-control-frame len={}", reply.len()),
         )),
     }
+}
+
+fn legacy_stream_ack_matches(reply: &[u8], expected_ack: NativeControlType) -> bool {
+    reply.first().copied() == u8::try_from(expected_ack.code()).ok()
 }
 
 fn unexpected_stream_ack_err(
@@ -631,7 +636,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_ack_rejects_wrong_type_or_non_control_frame() {
+    fn stream_ack_rejects_wrong_type_and_accepts_legacy_marker() {
         let mut frame = [0u8; 0x28];
         frame[0..4].copy_from_slice(b"AABB");
         frame[4..8].copy_from_slice(&2u32.to_le_bytes());
@@ -639,15 +644,15 @@ mod tests {
             validate_stream_ack(StreamProfile::Rx, 0x06, NativeControlType::RxAck, &frame).is_err()
         );
 
-        let old_marker_only_reply = [0x01u8, 0, 0, 0, 0, 0, 0, 0];
+        let legacy_marker_reply = [0x01u8, 0, 0, 0, 0, 0, 0, 0];
         assert!(
             validate_stream_ack(
                 StreamProfile::Rx,
                 0x06,
                 NativeControlType::RxAck,
-                &old_marker_only_reply
+                &legacy_marker_reply
             )
-            .is_err()
+            .is_ok()
         );
     }
 
