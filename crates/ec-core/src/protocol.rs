@@ -185,6 +185,9 @@ impl TunnelRuntimeParams {
 }
 
 static TX_PACKET_SENDER: OnceLock<mpsc::Sender<Vec<u8>>> = OnceLock::new();
+// This is not EasyConnect's command socket or keepalive channel. SHIEP's server
+// still appears to require the query-ip TLS context to remain open before later
+// L3 RX/TX streams are accepted.
 static QUERY_IP_STREAM_HOLDER: OnceLock<Mutex<Option<SslStream<TcpStream>>>> = OnceLock::new();
 static RX_PACKET_RECEIVER: OnceLock<Mutex<Option<mpsc::Receiver<Vec<u8>>>>> = OnceLock::new();
 static TUNNEL_FATAL_STATE: OnceLock<TunnelFatalState> = OnceLock::new();
@@ -654,6 +657,8 @@ fn connect_vpn_tls(authority: &str, host: &str) -> EcResult<SslStream<TcpStream>
 }
 
 fn hold_query_ip_stream(stream: SslStream<TcpStream>) -> EcResult<()> {
+    // Real command-channel behavior needs CmdRealSsl/JJYY handling. This holder
+    // only preserves the query-ip context that gates subsequent data streams.
     let holder = QUERY_IP_STREAM_HOLDER.get_or_init(|| Mutex::new(None));
     let mut guard = holder
         .lock()
