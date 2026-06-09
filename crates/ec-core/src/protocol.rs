@@ -493,14 +493,27 @@ fn reopen_data_stream(
     kind: StreamOpenKind,
     retries: usize,
 ) -> EcResult<SslStream<TcpStream>> {
-    if retries > STREAM_RETRY_LIMIT {
-        return Err(EcError::Runtime(format!(
-            "{} stream reached retry limit",
-            profile.label()
-        )));
+    let mut attempt = retries;
+    let mut last_error = None;
+    while attempt <= STREAM_RETRY_LIMIT {
+        thread::sleep(STREAM_RETRY_DELAY);
+        match open_data_stream(authority, host, token, ip_rev, profile, kind) {
+            Ok(stream) => return Ok(stream),
+            Err(err) => {
+                last_error = Some(crate::error::concise_error(&err));
+                attempt += 1;
+            }
+        }
     }
-    thread::sleep(STREAM_RETRY_DELAY);
-    open_data_stream(authority, host, token, ip_rev, profile, kind)
+
+    let detail = last_error
+        .map(|err| format!("; last error: {err}"))
+        .unwrap_or_default();
+    Err(EcError::Runtime(format!(
+        "{} stream reached retry limit during reconnect{}",
+        profile.label(),
+        detail
+    )))
 }
 
 fn open_data_stream(
