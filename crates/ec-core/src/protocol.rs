@@ -33,6 +33,13 @@ enum StreamOpenKind {
     Resume,
 }
 
+#[derive(Clone, Copy)]
+struct StreamOpenRetry {
+    first_attempt: usize,
+    delay_first_attempt: bool,
+    phase: &'static str,
+}
+
 impl StreamProfile {
     fn first_op_code(self) -> u8 {
         match self {
@@ -66,6 +73,24 @@ impl StreamProfile {
         match self {
             Self::Rx => "rx",
             Self::Tx => "tx",
+        }
+    }
+}
+
+impl StreamOpenRetry {
+    fn first_open() -> Self {
+        Self {
+            first_attempt: 0,
+            delay_first_attempt: false,
+            phase: "open",
+        }
+    }
+
+    fn reconnect(first_attempt: usize) -> Self {
+        Self {
+            first_attempt,
+            delay_first_attempt: true,
+            phase: "reconnect",
         }
     }
 }
@@ -106,13 +131,14 @@ impl TunnelRuntimeParams {
     }
 
     fn open_stream(&self, profile: StreamProfile) -> EcResult<SslStream<TcpStream>> {
-        open_data_stream(
+        open_data_stream_with_retries(
             &self.authority,
             &self.host,
             &self.token,
             &self.ip_rev,
             profile,
             StreamOpenKind::First,
+            StreamOpenRetry::first_open(),
         )
     }
 
@@ -121,14 +147,14 @@ impl TunnelRuntimeParams {
         profile: StreamProfile,
         retries: usize,
     ) -> EcResult<SslStream<TcpStream>> {
-        reopen_data_stream(
+        open_data_stream_with_retries(
             &self.authority,
             &self.host,
             &self.token,
             &self.ip_rev,
             profile,
             StreamOpenKind::Resume,
-            retries,
+            StreamOpenRetry::reconnect(retries),
         )
     }
 
@@ -487,19 +513,21 @@ fn should_log_heartbeat_sample(seq: u64) -> bool {
     seq.is_power_of_two()
 }
 
-fn reopen_data_stream(
+fn open_data_stream_with_retries(
     authority: &str,
     host: &str,
     token: &[u8; PROTOCOL_TOKEN_LEN],
     ip_rev: &[u8; 4],
     profile: StreamProfile,
     kind: StreamOpenKind,
-    retries: usize,
+    retry: StreamOpenRetry,
 ) -> EcResult<SslStream<TcpStream>> {
-    let mut attempt = retries;
+    let mut attempt = retry.first_attempt;
     let mut last_error = None;
     while attempt <= STREAM_RETRY_LIMIT {
-        thread::sleep(STREAM_RETRY_DELAY);
+        if retry.delay_first_attempt || attempt > retry.first_attempt {
+            thread::sleep(STREAM_RETRY_DELAY);
+        }
         match open_data_stream(authority, host, token, ip_rev, profile, kind) {
             Ok(stream) => return Ok(stream),
             Err(err) => {
@@ -513,8 +541,9 @@ fn reopen_data_stream(
         .map(|err| format!("; last error: {err}"))
         .unwrap_or_default();
     Err(EcError::Runtime(format!(
-        "{} stream reached retry limit during reconnect{}",
+        "{} stream reached retry limit during {}{}",
         profile.label(),
+        retry.phase,
         detail
     )))
 }
