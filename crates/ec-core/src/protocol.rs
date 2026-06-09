@@ -374,6 +374,7 @@ fn rx_worker_loop(
             Ok(0) => {
                 retries += 1;
                 stream = runtime.reopen_stream(StreamProfile::Rx, retries)?;
+                retries = 0;
             }
             Ok(n) => {
                 retries = 0;
@@ -392,6 +393,7 @@ fn rx_worker_loop(
             Err(_) => {
                 retries += 1;
                 stream = runtime.reopen_stream(StreamProfile::Rx, retries)?;
+                retries = 0;
             }
         }
     }
@@ -445,6 +447,7 @@ fn tx_worker_loop(
         stream.write_all(&packet).map_err(|e| {
             EcError::Runtime(format!("tx stream write failed after reconnect: {e}"))
         })?;
+        retries = 0;
         log_tx_heartbeat_if_sampled(heartbeat_seq, packet.len());
     }
 }
