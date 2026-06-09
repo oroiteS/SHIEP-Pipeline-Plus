@@ -3,8 +3,9 @@ use crate::error::{EcError, EcResult};
 use crate::output::{self, Scope};
 use crate::protocol_wire::{
     HEARTBEAT_OPAQUE_TAIL_LEN, HEARTBEAT_SESSION_LEN, NativeControlType, PROTOCOL_TOKEN_LEN,
-    build_query_ip_message, build_stream_handshake_message, build_tx_heartbeat_packet,
-    parse_native_control_frame, parse_protocol_token,
+    TX_HEARTBEAT_DEFAULT_DST, build_query_ip_message, build_stream_handshake_message,
+    build_tx_heartbeat_packet, is_tx_heartbeat_echo_reply, parse_native_control_frame,
+    parse_protocol_token,
 };
 use openssl::ssl::SslStream;
 use std::io::{ErrorKind, Read, Write};
@@ -76,6 +77,7 @@ struct TunnelRuntimeParams {
     token: [u8; PROTOCOL_TOKEN_LEN],
     assigned_ip: [u8; 4],
     ip_rev: [u8; 4],
+    heartbeat_dst: [u8; 4],
     heartbeat_tail: [u8; HEARTBEAT_OPAQUE_TAIL_LEN],
 }
 
@@ -98,6 +100,7 @@ impl TunnelRuntimeParams {
                 assigned_ip[1],
                 assigned_ip[0],
             ],
+            heartbeat_dst: TX_HEARTBEAT_DEFAULT_DST,
             heartbeat_tail,
         }
     }
@@ -132,6 +135,17 @@ impl TunnelRuntimeParams {
     fn tx_heartbeat_packet(&self) -> [u8; 0x4c] {
         build_tx_heartbeat_packet(
             self.assigned_ip,
+            self.heartbeat_dst,
+            self.heartbeat_session(),
+            &self.heartbeat_tail,
+        )
+    }
+
+    fn is_tx_heartbeat_echo_reply(&self, data: &[u8]) -> bool {
+        is_tx_heartbeat_echo_reply(
+            data,
+            self.assigned_ip,
+            self.heartbeat_dst,
             self.heartbeat_session(),
             &self.heartbeat_tail,
         )
@@ -352,6 +366,7 @@ fn rx_worker_loop(
     tx: mpsc::Sender<Vec<u8>>,
 ) -> EcResult<()> {
     let mut retries = 0usize;
+    let mut heartbeat_reply_count = 0u64;
     let mut buf = [0u8; 4096];
 
     loop {
@@ -364,6 +379,10 @@ fn rx_worker_loop(
                 retries = 0;
                 if !should_forward_rx_payload(&buf[..n])? {
                     continue;
+                }
+                if runtime.is_tx_heartbeat_echo_reply(&buf[..n]) {
+                    heartbeat_reply_count += 1;
+                    log_rx_heartbeat_if_sampled(heartbeat_reply_count, n);
                 }
                 if tx.send(buf[..n].to_vec()).is_err() {
                     return Ok(());
@@ -434,7 +453,7 @@ fn log_tx_heartbeat_if_sampled(seq: Option<u64>, len: usize) {
     let Some(seq) = seq else {
         return;
     };
-    if !should_log_tx_heartbeat(seq) {
+    if !should_log_heartbeat_sample(seq) {
         return;
     }
     output::info(
@@ -447,7 +466,21 @@ fn log_tx_heartbeat_if_sampled(seq: Option<u64>, len: usize) {
     );
 }
 
-fn should_log_tx_heartbeat(seq: u64) -> bool {
+fn log_rx_heartbeat_if_sampled(seq: u64, len: usize) {
+    if !should_log_heartbeat_sample(seq) {
+        return;
+    }
+    output::info(
+        Scope::Protocol,
+        format_args!(
+            "RX heartbeat #{} received: len {}",
+            output::value(seq),
+            output::value(len)
+        ),
+    );
+}
+
+fn should_log_heartbeat_sample(seq: u64) -> bool {
     seq.is_power_of_two()
 }
 
@@ -637,7 +670,7 @@ fn splitmix64(mut x: u64) -> u64 {
 mod tests {
     use super::{
         NativeControlType, StreamOpenKind, StreamProfile, TunnelRuntimeParams,
-        should_forward_rx_payload, should_log_tx_heartbeat, validate_stream_ack,
+        should_forward_rx_payload, should_log_heartbeat_sample, validate_stream_ack,
     };
 
     #[test]
@@ -718,10 +751,12 @@ mod tests {
 
     #[test]
     fn tx_heartbeat_log_sampling_uses_powers_of_two() {
-        let sampled: Vec<u64> = (1..=16).filter(|v| should_log_tx_heartbeat(*v)).collect();
+        let sampled: Vec<u64> = (1..=16)
+            .filter(|v| should_log_heartbeat_sample(*v))
+            .collect();
         assert_eq!(sampled, vec![1, 2, 4, 8, 16]);
-        assert!(!should_log_tx_heartbeat(0));
-        assert!(!should_log_tx_heartbeat(3));
-        assert!(!should_log_tx_heartbeat(12));
+        assert!(!should_log_heartbeat_sample(0));
+        assert!(!should_log_heartbeat_sample(3));
+        assert!(!should_log_heartbeat_sample(12));
     }
 }

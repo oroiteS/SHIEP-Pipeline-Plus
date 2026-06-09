@@ -4,7 +4,7 @@ pub(crate) const PROTOCOL_TOKEN_LEN: usize = 48;
 pub(crate) const HEARTBEAT_SESSION_LEN: usize = 16;
 pub(crate) const HEARTBEAT_OPAQUE_TAIL_LEN: usize = 8;
 const TX_HEARTBEAT_PACKET_LEN: usize = 0x4c;
-const TX_HEARTBEAT_DST: [u8; 4] = [10, 166, 64, 3];
+pub(crate) const TX_HEARTBEAT_DEFAULT_DST: [u8; 4] = [10, 166, 64, 3];
 const TX_HEARTBEAT_IPV4_ID: [u8; 2] = [0xbb, 0xaa];
 const TX_HEARTBEAT_TTL: u8 = 0x40;
 const TX_HEARTBEAT_ICMP_ID: [u8; 2] = [0x55, 0x55];
@@ -121,6 +121,7 @@ pub(crate) fn build_stream_handshake_message(
 
 pub(crate) fn build_tx_heartbeat_packet(
     assigned_ip: [u8; 4],
+    heartbeat_dst: [u8; 4],
     session: &[u8; HEARTBEAT_SESSION_LEN],
     opaque_tail: &[u8; HEARTBEAT_OPAQUE_TAIL_LEN],
 ) -> [u8; TX_HEARTBEAT_PACKET_LEN] {
@@ -132,7 +133,7 @@ pub(crate) fn build_tx_heartbeat_packet(
     packet[8] = TX_HEARTBEAT_TTL;
     packet[9] = 0x01;
     packet[12..16].copy_from_slice(&assigned_ip);
-    packet[16..20].copy_from_slice(&TX_HEARTBEAT_DST);
+    packet[16..20].copy_from_slice(&heartbeat_dst);
 
     packet[20] = 0x08;
     packet[21] = 0x00;
@@ -149,6 +150,29 @@ pub(crate) fn build_tx_heartbeat_packet(
     packet[22..24].copy_from_slice(&icmp_checksum.to_be_bytes());
 
     packet
+}
+
+pub(crate) fn is_tx_heartbeat_echo_reply(
+    data: &[u8],
+    assigned_ip: [u8; 4],
+    heartbeat_dst: [u8; 4],
+    session: &[u8; HEARTBEAT_SESSION_LEN],
+    opaque_tail: &[u8; HEARTBEAT_OPAQUE_TAIL_LEN],
+) -> bool {
+    data.len() == TX_HEARTBEAT_PACKET_LEN
+        && data[0] == 0x45
+        && u16::from_be_bytes([data[2], data[3]]) == TX_HEARTBEAT_PACKET_LEN as u16
+        && data[9] == 0x01
+        && data[12..16] == heartbeat_dst
+        && data[16..20] == assigned_ip
+        && data[20] == 0x00
+        && data[21] == 0x00
+        && data[24..26] == TX_HEARTBEAT_ICMP_ID
+        && data[26..28] == TX_HEARTBEAT_ICMP_SEQ
+        && data[28..46] == *TX_HEARTBEAT_PAYLOAD_PREFIX
+        && data[46..62] == session[..]
+        && data[62..70] == opaque_tail[..]
+        && data[70..76] == *TX_HEARTBEAT_PAYLOAD_SUFFIX
 }
 
 fn internet_checksum(data: &[u8]) -> u16 {
@@ -172,8 +196,9 @@ fn internet_checksum(data: &[u8]) -> u16 {
 mod tests {
     use super::NativeControlType::{Heartbeat, RxAck, Unknown};
     use super::{
-        PROTOCOL_TOKEN_LEN, build_query_ip_message, build_stream_handshake_message,
-        build_tx_heartbeat_packet, parse_native_control_frame, parse_protocol_token,
+        PROTOCOL_TOKEN_LEN, TX_HEARTBEAT_DEFAULT_DST, build_query_ip_message,
+        build_stream_handshake_message, build_tx_heartbeat_packet, is_tx_heartbeat_echo_reply,
+        parse_native_control_frame, parse_protocol_token,
     };
 
     #[test]
@@ -248,6 +273,7 @@ mod tests {
     fn tx_heartbeat_packet_matches_captured_layout() {
         let packet = build_tx_heartbeat_packet(
             [10, 166, 80, 12],
+            TX_HEARTBEAT_DEFAULT_DST,
             b"eab27cdf7c24a40f",
             &[0x03, 0xa2, 0x16, 0x5a, 0xd5, 0x3d, 0x79, 0xb8],
         );
@@ -260,5 +286,36 @@ mod tests {
             0x4c, 0x33, 0x56, 0x50, 0x4e, 0x00,
         ];
         assert_eq!(packet, expected);
+    }
+
+    #[test]
+    fn tx_heartbeat_echo_reply_matches_reversed_request() {
+        let assigned_ip = [10, 166, 80, 12];
+        let session = b"eab27cdf7c24a40f";
+        let tail = [0x03, 0xa2, 0x16, 0x5a, 0xd5, 0x3d, 0x79, 0xb8];
+        let mut reply =
+            build_tx_heartbeat_packet(assigned_ip, TX_HEARTBEAT_DEFAULT_DST, session, &tail);
+
+        reply[12..16].copy_from_slice(&TX_HEARTBEAT_DEFAULT_DST);
+        reply[16..20].copy_from_slice(&assigned_ip);
+        reply[20] = 0x00;
+        reply[22..24].copy_from_slice(&[0x00, 0x00]);
+
+        assert!(is_tx_heartbeat_echo_reply(
+            &reply,
+            assigned_ip,
+            TX_HEARTBEAT_DEFAULT_DST,
+            session,
+            &tail
+        ));
+
+        reply[20] = 0x08;
+        assert!(!is_tx_heartbeat_echo_reply(
+            &reply,
+            assigned_ip,
+            TX_HEARTBEAT_DEFAULT_DST,
+            session,
+            &tail
+        ));
     }
 }
