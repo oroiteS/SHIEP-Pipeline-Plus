@@ -397,14 +397,19 @@ fn tx_worker_loop(
 ) -> EcResult<()> {
     let mut retries = 0usize;
     let mut next_heartbeat = Instant::now() + TX_HEARTBEAT_INTERVAL;
+    let mut heartbeat_count = 0u64;
     loop {
         let now = Instant::now();
-        let packet = if now >= next_heartbeat {
+        let (packet, heartbeat_seq) = if now >= next_heartbeat {
             next_heartbeat = now + TX_HEARTBEAT_INTERVAL;
-            runtime.tx_heartbeat_packet().to_vec()
+            heartbeat_count += 1;
+            (
+                runtime.tx_heartbeat_packet().to_vec(),
+                Some(heartbeat_count),
+            )
         } else {
             match rx.recv_timeout(next_heartbeat - now) {
-                Ok(packet) => packet,
+                Ok(packet) => (packet, None),
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
             }
@@ -412,6 +417,7 @@ fn tx_worker_loop(
 
         if stream.write_all(&packet).is_ok() {
             retries = 0;
+            log_tx_heartbeat_if_sampled(heartbeat_seq, packet.len());
             continue;
         }
 
@@ -420,7 +426,29 @@ fn tx_worker_loop(
         stream.write_all(&packet).map_err(|e| {
             EcError::Runtime(format!("tx stream write failed after reconnect: {e}"))
         })?;
+        log_tx_heartbeat_if_sampled(heartbeat_seq, packet.len());
     }
+}
+
+fn log_tx_heartbeat_if_sampled(seq: Option<u64>, len: usize) {
+    let Some(seq) = seq else {
+        return;
+    };
+    if !should_log_tx_heartbeat(seq) {
+        return;
+    }
+    output::info(
+        Scope::Protocol,
+        format_args!(
+            "TX heartbeat #{} sent: len {}",
+            output::value(seq),
+            output::value(len)
+        ),
+    );
+}
+
+fn should_log_tx_heartbeat(seq: u64) -> bool {
+    seq.is_power_of_two()
 }
 
 fn reopen_data_stream(
@@ -609,7 +637,7 @@ fn splitmix64(mut x: u64) -> u64 {
 mod tests {
     use super::{
         NativeControlType, StreamOpenKind, StreamProfile, TunnelRuntimeParams,
-        should_forward_rx_payload, validate_stream_ack,
+        should_forward_rx_payload, should_log_tx_heartbeat, validate_stream_ack,
     };
 
     #[test]
@@ -686,5 +714,14 @@ mod tests {
         assert_eq!(&packet[16..20], &[10, 166, 64, 3]);
         assert_eq!(&packet[46..62], b"eab27cdf7c24a40f");
         assert_eq!(&packet[70..76], b"L3VPN\0");
+    }
+
+    #[test]
+    fn tx_heartbeat_log_sampling_uses_powers_of_two() {
+        let sampled: Vec<u64> = (1..=16).filter(|v| should_log_tx_heartbeat(*v)).collect();
+        assert_eq!(sampled, vec![1, 2, 4, 8, 16]);
+        assert!(!should_log_tx_heartbeat(0));
+        assert!(!should_log_tx_heartbeat(3));
+        assert!(!should_log_tx_heartbeat(12));
     }
 }
