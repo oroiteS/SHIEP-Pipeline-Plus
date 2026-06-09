@@ -341,6 +341,9 @@ fn rx_worker_loop(
             }
             Ok(n) => {
                 retries = 0;
+                if !should_forward_rx_payload(&buf[..n])? {
+                    continue;
+                }
                 if tx.send(buf[..n].to_vec()).is_err() {
                     return Ok(());
                 }
@@ -351,6 +354,18 @@ fn rx_worker_loop(
                 stream = runtime.reopen_stream(StreamProfile::Rx, retries)?;
             }
         }
+    }
+}
+
+fn should_forward_rx_payload(data: &[u8]) -> EcResult<bool> {
+    match parse_native_control_frame(data) {
+        Some(NativeControlType::RxAck) => Ok(false),
+        Some(control) => Err(EcError::Runtime(format!(
+            "unexpected rx control frame: {}({})",
+            control.label(),
+            control.code()
+        ))),
+        None => Ok(true),
     }
 }
 
@@ -532,7 +547,10 @@ fn is_wouldblock_or_timeout(err: &std::io::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{NativeControlType, StreamOpenKind, StreamProfile, validate_stream_ack};
+    use super::{
+        NativeControlType, StreamOpenKind, StreamProfile, should_forward_rx_payload,
+        validate_stream_ack,
+    };
 
     #[test]
     fn stream_profiles_use_official_first_and_resume_ops() {
@@ -576,5 +594,19 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn rx_payload_filter_consumes_rx_ack_only() {
+        let mut frame = [0u8; 0x28];
+        frame[0..4].copy_from_slice(b"AABB");
+        frame[4..8].copy_from_slice(&1u32.to_le_bytes());
+        assert!(!should_forward_rx_payload(&frame).unwrap());
+
+        frame[4..8].copy_from_slice(&15u32.to_le_bytes());
+        assert!(should_forward_rx_payload(&frame).is_err());
+
+        let ipv4_packet = [0x45u8, 0, 0, 20, 0, 0, 0, 0];
+        assert!(should_forward_rx_payload(&ipv4_packet).unwrap());
     }
 }
