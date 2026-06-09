@@ -2,8 +2,8 @@ use crate::endpoint::parse_server;
 use crate::error::{EcError, EcResult};
 use crate::output::{self, Scope};
 use crate::protocol_wire::{
-    PROTOCOL_TOKEN_LEN, build_query_ip_message, build_stream_handshake_message,
-    parse_protocol_token,
+    NativeControlType, PROTOCOL_TOKEN_LEN, build_query_ip_message, build_stream_handshake_message,
+    parse_native_control_frame, parse_protocol_token,
 };
 use openssl::ssl::SslStream;
 use std::io::{ErrorKind, Read, Write};
@@ -52,10 +52,10 @@ impl StreamProfile {
         }
     }
 
-    fn expected_reply(self) -> u8 {
+    fn expected_ack(self) -> NativeControlType {
         match self {
-            Self::Rx => 0x01,
-            Self::Tx => 0x02,
+            Self::Rx => NativeControlType::RxAck,
+            Self::Tx => NativeControlType::TxAck,
         }
     }
 
@@ -408,7 +408,7 @@ fn open_data_stream(
 ) -> EcResult<SslStream<TcpStream>> {
     let mut stream = connect_vpn_tls(authority, host)?;
     let op_code = profile.op_code(kind);
-    let expected_reply = profile.expected_reply();
+    let expected_ack = profile.expected_ack();
 
     let message = build_stream_handshake_message(op_code, token, ip_rev);
     stream
@@ -425,21 +425,48 @@ fn open_data_stream(
             op,
         )));
     }
-    if reply[0] != expected_reply {
-        let expected = format!("0x{expected_reply:02x}");
-        let got = format!("0x{:02x}", reply[0]);
-        let op = format!("0x{op_code:02x}");
-        return Err(EcError::Runtime(format!(
-            "unexpected {} stream handshake reply marker; expected: {}; got: {}; op: {}",
-            profile.label(),
-            expected,
-            got,
-            op,
-        )));
-    }
+    validate_stream_ack(profile, op_code, expected_ack, &reply[..n])?;
 
     clear_data_stream_read_timeout(&stream, profile)?;
     Ok(stream)
+}
+
+fn validate_stream_ack(
+    profile: StreamProfile,
+    op_code: u8,
+    expected_ack: NativeControlType,
+    reply: &[u8],
+) -> EcResult<()> {
+    match parse_native_control_frame(reply) {
+        Some(control) if control == expected_ack => Ok(()),
+        Some(control) => Err(unexpected_stream_ack_err(
+            profile,
+            op_code,
+            expected_ack,
+            format_args!("{}({})", control.label(), control.code()),
+        )),
+        None => Err(unexpected_stream_ack_err(
+            profile,
+            op_code,
+            expected_ack,
+            format_args!("non-control-frame len={}", reply.len()),
+        )),
+    }
+}
+
+fn unexpected_stream_ack_err(
+    profile: StreamProfile,
+    op_code: u8,
+    expected_ack: NativeControlType,
+    got: std::fmt::Arguments<'_>,
+) -> EcError {
+    EcError::Runtime(format!(
+        "unexpected {} stream handshake ack; expected: {}({}); got: {}; op: 0x{op_code:02x}",
+        profile.label(),
+        expected_ack.label(),
+        expected_ack.code(),
+        got,
+    ))
 }
 
 fn clear_data_stream_read_timeout(
@@ -505,7 +532,7 @@ fn is_wouldblock_or_timeout(err: &std::io::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{StreamOpenKind, StreamProfile};
+    use super::{NativeControlType, StreamOpenKind, StreamProfile, validate_stream_ack};
 
     #[test]
     fn stream_profiles_use_official_first_and_resume_ops() {
@@ -513,5 +540,41 @@ mod tests {
         assert_eq!(StreamProfile::Rx.op_code(StreamOpenKind::Resume), 0x07);
         assert_eq!(StreamProfile::Tx.op_code(StreamOpenKind::First), 0x05);
         assert_eq!(StreamProfile::Tx.op_code(StreamOpenKind::Resume), 0x08);
+    }
+
+    #[test]
+    fn stream_ack_accepts_matching_aabb_control_frame() {
+        let mut frame = [0u8; 0x28];
+        frame[0..4].copy_from_slice(b"AABB");
+        frame[4..8].copy_from_slice(&1u32.to_le_bytes());
+        assert!(
+            validate_stream_ack(StreamProfile::Rx, 0x06, NativeControlType::RxAck, &frame).is_ok()
+        );
+
+        frame[4..8].copy_from_slice(&2u32.to_le_bytes());
+        assert!(
+            validate_stream_ack(StreamProfile::Tx, 0x05, NativeControlType::TxAck, &frame).is_ok()
+        );
+    }
+
+    #[test]
+    fn stream_ack_rejects_wrong_type_or_non_control_frame() {
+        let mut frame = [0u8; 0x28];
+        frame[0..4].copy_from_slice(b"AABB");
+        frame[4..8].copy_from_slice(&2u32.to_le_bytes());
+        assert!(
+            validate_stream_ack(StreamProfile::Rx, 0x06, NativeControlType::RxAck, &frame).is_err()
+        );
+
+        let old_marker_only_reply = [0x01u8, 0, 0, 0, 0, 0, 0, 0];
+        assert!(
+            validate_stream_ack(
+                StreamProfile::Rx,
+                0x06,
+                NativeControlType::RxAck,
+                &old_marker_only_reply
+            )
+            .is_err()
+        );
     }
 }
