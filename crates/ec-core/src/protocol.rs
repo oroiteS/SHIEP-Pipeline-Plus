@@ -2,7 +2,8 @@ use crate::endpoint::parse_server;
 use crate::error::{EcError, EcResult};
 use crate::output::{self, Scope};
 use crate::protocol_wire::{
-    NativeControlType, PROTOCOL_TOKEN_LEN, build_query_ip_message, build_stream_handshake_message,
+    HEARTBEAT_OPAQUE_TAIL_LEN, HEARTBEAT_SESSION_LEN, NativeControlType, PROTOCOL_TOKEN_LEN,
+    build_query_ip_message, build_stream_handshake_message, build_tx_heartbeat_packet,
     parse_native_control_frame, parse_protocol_token,
 };
 use openssl::ssl::SslStream;
@@ -10,12 +11,13 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::sync::{Condvar, Mutex, OnceLock, mpsc};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const STREAM_RETRY_LIMIT: usize = 5;
 const STREAM_RETRY_DELAY: Duration = Duration::from_secs(1);
 const QUERY_IP_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 const STREAM_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const TX_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(12);
 const RUNTIME_ALREADY_STARTED: &str = "tunnel runtime already started in this process";
 
 #[derive(Clone, Copy)]
@@ -72,7 +74,9 @@ struct TunnelRuntimeParams {
     authority: String,
     host: String,
     token: [u8; PROTOCOL_TOKEN_LEN],
+    assigned_ip: [u8; 4],
     ip_rev: [u8; 4],
+    heartbeat_tail: [u8; HEARTBEAT_OPAQUE_TAIL_LEN],
 }
 
 impl TunnelRuntimeParams {
@@ -82,16 +86,19 @@ impl TunnelRuntimeParams {
         token: [u8; PROTOCOL_TOKEN_LEN],
         assigned_ip: [u8; 4],
     ) -> Self {
+        let heartbeat_tail = new_heartbeat_tail(&token, assigned_ip);
         Self {
             authority,
             host,
             token,
+            assigned_ip,
             ip_rev: [
                 assigned_ip[3],
                 assigned_ip[2],
                 assigned_ip[1],
                 assigned_ip[0],
             ],
+            heartbeat_tail,
         }
     }
 
@@ -120,6 +127,20 @@ impl TunnelRuntimeParams {
             StreamOpenKind::Resume,
             retries,
         )
+    }
+
+    fn tx_heartbeat_packet(&self) -> [u8; 0x4c] {
+        build_tx_heartbeat_packet(
+            self.assigned_ip,
+            self.heartbeat_session(),
+            &self.heartbeat_tail,
+        )
+    }
+
+    fn heartbeat_session(&self) -> &[u8; HEARTBEAT_SESSION_LEN] {
+        self.token[32..48]
+            .try_into()
+            .expect("protocol token must contain a 16-byte session suffix")
     }
 }
 
@@ -375,10 +396,18 @@ fn tx_worker_loop(
     rx: mpsc::Receiver<Vec<u8>>,
 ) -> EcResult<()> {
     let mut retries = 0usize;
+    let mut next_heartbeat = Instant::now() + TX_HEARTBEAT_INTERVAL;
     loop {
-        let packet = match rx.recv() {
-            Ok(packet) => packet,
-            Err(_) => return Ok(()),
+        let now = Instant::now();
+        let packet = if now >= next_heartbeat {
+            next_heartbeat = now + TX_HEARTBEAT_INTERVAL;
+            runtime.tx_heartbeat_packet().to_vec()
+        } else {
+            match rx.recv_timeout(next_heartbeat - now) {
+                Ok(packet) => packet,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            }
         };
 
         if stream.write_all(&packet).is_ok() {
@@ -545,11 +574,37 @@ fn is_wouldblock_or_timeout(err: &std::io::Error) -> bool {
     matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
 }
 
+fn new_heartbeat_tail(
+    token: &[u8; PROTOCOL_TOKEN_LEN],
+    assigned_ip: [u8; 4],
+) -> [u8; HEARTBEAT_OPAQUE_TAIL_LEN] {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|v| v.as_nanos() as u64)
+        .unwrap_or_default();
+    let mut seed =
+        now ^ (u64::from(std::process::id()) << 32) ^ u64::from(u32::from_be_bytes(assigned_ip));
+    for chunk in token.chunks(8) {
+        let mut buf = [0u8; 8];
+        buf[..chunk.len()].copy_from_slice(chunk);
+        seed ^= u64::from_le_bytes(buf).rotate_left(13);
+        seed = splitmix64(seed);
+    }
+    splitmix64(seed).to_le_bytes()
+}
+
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9e3779b97f4a7c15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+    x ^ (x >> 31)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        NativeControlType, StreamOpenKind, StreamProfile, should_forward_rx_payload,
-        validate_stream_ack,
+        NativeControlType, StreamOpenKind, StreamProfile, TunnelRuntimeParams,
+        should_forward_rx_payload, validate_stream_ack,
     };
 
     #[test]
@@ -608,5 +663,23 @@ mod tests {
 
         let ipv4_packet = [0x45u8, 0, 0, 20, 0, 0, 0, 0];
         assert!(should_forward_rx_payload(&ipv4_packet).unwrap());
+    }
+
+    #[test]
+    fn tunnel_runtime_builds_tx_heartbeat_from_assigned_ip_and_session_suffix() {
+        let mut token = [b'a'; 48];
+        token[32..48].copy_from_slice(b"eab27cdf7c24a40f");
+        let runtime = TunnelRuntimeParams::new(
+            "vpn.example:443".to_string(),
+            "vpn.example".to_string(),
+            token,
+            [10, 166, 80, 12],
+        );
+
+        let packet = runtime.tx_heartbeat_packet();
+        assert_eq!(&packet[12..16], &[10, 166, 80, 12]);
+        assert_eq!(&packet[16..20], &[10, 166, 64, 3]);
+        assert_eq!(&packet[46..62], b"eab27cdf7c24a40f");
+        assert_eq!(&packet[70..76], b"L3VPN\0");
     }
 }
