@@ -13,8 +13,12 @@ struct CliArgs {
     #[arg(long, help_heading = "Required", help = "VPN username")]
     username: Option<String>,
 
-    #[arg(long, help_heading = "Required", help = "VPN password")]
-    password: String,
+    #[arg(
+        long,
+        help_heading = "Optional",
+        help = "VPN password; may also be set via SHIEP_PIPELINE_PASSWORD"
+    )]
+    password: Option<String>,
 
     #[arg(
         long = "bind",
@@ -69,7 +73,7 @@ fn main() {
     let config = match AppConfig::resolve(
         args.server,
         args.username,
-        args.password,
+        resolve_password(args.password),
         args.socks_bind,
         args.fallback_proxy,
         args.extra,
@@ -109,6 +113,12 @@ fn parse_args() -> CliArgs {
 
     let matches = cmd.get_matches();
     CliArgs::from_arg_matches(&matches).unwrap_or_else(|e| e.exit())
+}
+
+fn resolve_password(arg_password: Option<String>) -> String {
+    arg_password
+        .or_else(|| std::env::var("SHIEP_PIPELINE_PASSWORD").ok())
+        .unwrap_or_default()
 }
 
 fn current_bin_name() -> Option<String> {

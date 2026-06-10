@@ -44,7 +44,6 @@ cargo run -p ec-cli -- \
 ./SHIEP-Pipeline \
   --server <VPN_SERVER> \
   --username <USERNAME> \
-  --password <PASSWORD> \
   --bind 127.0.0.1:1080 \
   --fallback socks5h://127.0.0.1:114514 \
   --extra <IP>
@@ -52,7 +51,13 @@ cargo run -p ec-cli -- \
 
 默认 SOCKS5 监听地址：`127.0.0.1:1080`。
 
-所有参数的详细说明见原版 README。
+- VPN 启动后自动从 `/por/rclist.csp` 获取并解析路由规则。
+- 白名单规则命中时，流量走远程隧道（优先使用映射的 DNS IP）。
+- 未命中白名单时，TCP 流量走 fallback 路由。
+- 指定 `--fallback` 时，TCP 流量走上游代理。
+- 未指定 `--fallback` 时，TCP 流量直连。
+
+所有参数的详细说明见[原版 README](https://github.com/Yan233th/SHIEP-Pipeline)。
 
 ## 致谢
 

@@ -15,6 +15,7 @@ mod route_table;
 mod routing;
 mod socks;
 mod socks_proxy;
+mod socks_wire;
 mod tls;
 mod token;
 mod transport;

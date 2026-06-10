@@ -405,6 +405,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smoltcp",
+ "socket2",
  "thiserror 2.0.18",
  "urlencoding",
 ]

@@ -1,6 +1,88 @@
 use crate::error::{EcError, EcResult};
 
 pub(crate) const PROTOCOL_TOKEN_LEN: usize = 48;
+pub(crate) const HEARTBEAT_SESSION_LEN: usize = 16;
+pub(crate) const HEARTBEAT_OPAQUE_TAIL_LEN: usize = 8;
+const TX_HEARTBEAT_PACKET_LEN: usize = 0x4c;
+pub(crate) const TX_HEARTBEAT_DEFAULT_DST: [u8; 4] = [10, 166, 64, 3];
+const TX_HEARTBEAT_IPV4_ID: [u8; 2] = [0xbb, 0xaa];
+const TX_HEARTBEAT_TTL: u8 = 0x40;
+const TX_HEARTBEAT_ICMP_ID: [u8; 2] = [0x55, 0x55];
+const TX_HEARTBEAT_ICMP_SEQ: [u8; 2] = [0x44, 0x33];
+const TX_HEARTBEAT_PAYLOAD_PREFIX: &[u8; 18] = b"SANGFORSCSIPCLIENT";
+const TX_HEARTBEAT_PAYLOAD_SUFFIX: &[u8; 6] = b"L3VPN\0";
+const NATIVE_CONTROL_FRAME_LEN: usize = 0x28;
+const NATIVE_CONTROL_MAGIC: &[u8; 4] = b"AABB";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativeControlType {
+    SendIp,
+    RxAck,
+    TxAck,
+    ServerReset,
+    Recovered,
+    IpBusy,
+    Shutdown,
+    IpConflict,
+    IpKick,
+    Heartbeat,
+    Unknown(u32),
+}
+
+impl NativeControlType {
+    pub(crate) fn code(self) -> u32 {
+        match self {
+            Self::SendIp => 0,
+            Self::RxAck => 1,
+            Self::TxAck => 2,
+            Self::ServerReset => 3,
+            Self::Recovered => 4,
+            Self::IpBusy => 5,
+            Self::Shutdown => 8,
+            Self::IpConflict => 9,
+            Self::IpKick => 14,
+            Self::Heartbeat => 15,
+            Self::Unknown(v) => v,
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::SendIp => "send-ip",
+            Self::RxAck => "rx-ack",
+            Self::TxAck => "tx-ack",
+            Self::ServerReset => "server-reset",
+            Self::Recovered => "recovered",
+            Self::IpBusy => "ip-busy",
+            Self::Shutdown => "shutdown",
+            Self::IpConflict => "ip-conflict",
+            Self::IpKick => "ip-kick",
+            Self::Heartbeat => "heartbeat",
+            Self::Unknown(_) => "unknown",
+        }
+    }
+}
+
+pub(crate) fn parse_native_control_frame(data: &[u8]) -> Option<NativeControlType> {
+    if data.len() != NATIVE_CONTROL_FRAME_LEN || !data.starts_with(NATIVE_CONTROL_MAGIC) {
+        return None;
+    }
+
+    let code = u32::from_le_bytes(data[4..8].try_into().ok()?);
+    Some(match code {
+        0 => NativeControlType::SendIp,
+        1 => NativeControlType::RxAck,
+        2 => NativeControlType::TxAck,
+        3 => NativeControlType::ServerReset,
+        4 => NativeControlType::Recovered,
+        5 => NativeControlType::IpBusy,
+        8 => NativeControlType::Shutdown,
+        9 => NativeControlType::IpConflict,
+        14 => NativeControlType::IpKick,
+        15 => NativeControlType::Heartbeat,
+        v => NativeControlType::Unknown(v),
+    })
+}
 
 pub(crate) fn parse_protocol_token(token: &str) -> EcResult<[u8; PROTOCOL_TOKEN_LEN]> {
     let token_bytes = token.as_bytes();
@@ -37,11 +119,86 @@ pub(crate) fn build_stream_handshake_message(
     message
 }
 
+pub(crate) fn build_tx_heartbeat_packet(
+    assigned_ip: [u8; 4],
+    heartbeat_dst: [u8; 4],
+    session: &[u8; HEARTBEAT_SESSION_LEN],
+    opaque_tail: &[u8; HEARTBEAT_OPAQUE_TAIL_LEN],
+) -> [u8; TX_HEARTBEAT_PACKET_LEN] {
+    let mut packet = [0u8; TX_HEARTBEAT_PACKET_LEN];
+
+    packet[0] = 0x45;
+    packet[2..4].copy_from_slice(&(TX_HEARTBEAT_PACKET_LEN as u16).to_be_bytes());
+    packet[4..6].copy_from_slice(&TX_HEARTBEAT_IPV4_ID);
+    packet[8] = TX_HEARTBEAT_TTL;
+    packet[9] = 0x01;
+    packet[12..16].copy_from_slice(&assigned_ip);
+    packet[16..20].copy_from_slice(&heartbeat_dst);
+
+    packet[20] = 0x08;
+    packet[21] = 0x00;
+    packet[24..26].copy_from_slice(&TX_HEARTBEAT_ICMP_ID);
+    packet[26..28].copy_from_slice(&TX_HEARTBEAT_ICMP_SEQ);
+    packet[28..46].copy_from_slice(TX_HEARTBEAT_PAYLOAD_PREFIX);
+    packet[46..62].copy_from_slice(session);
+    packet[62..70].copy_from_slice(opaque_tail);
+    packet[70..76].copy_from_slice(TX_HEARTBEAT_PAYLOAD_SUFFIX);
+
+    let ip_checksum = internet_checksum(&packet[0..20]);
+    packet[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
+    let icmp_checksum = internet_checksum(&packet[20..]);
+    packet[22..24].copy_from_slice(&icmp_checksum.to_be_bytes());
+
+    packet
+}
+
+pub(crate) fn is_tx_heartbeat_echo_reply(
+    data: &[u8],
+    assigned_ip: [u8; 4],
+    heartbeat_dst: [u8; 4],
+    session: &[u8; HEARTBEAT_SESSION_LEN],
+    opaque_tail: &[u8; HEARTBEAT_OPAQUE_TAIL_LEN],
+) -> bool {
+    data.len() == TX_HEARTBEAT_PACKET_LEN
+        && data[0] == 0x45
+        && u16::from_be_bytes([data[2], data[3]]) == TX_HEARTBEAT_PACKET_LEN as u16
+        && data[9] == 0x01
+        && data[12..16] == heartbeat_dst
+        && data[16..20] == assigned_ip
+        && data[20] == 0x00
+        && data[21] == 0x00
+        && data[24..26] == TX_HEARTBEAT_ICMP_ID
+        && data[26..28] == TX_HEARTBEAT_ICMP_SEQ
+        && data[28..46] == *TX_HEARTBEAT_PAYLOAD_PREFIX
+        && data[46..62] == session[..]
+        && data[62..70] == opaque_tail[..]
+        && data[70..76] == *TX_HEARTBEAT_PAYLOAD_SUFFIX
+}
+
+fn internet_checksum(data: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    for chunk in data.chunks(2) {
+        let word = if let [hi, lo] = chunk {
+            u16::from_be_bytes([*hi, *lo])
+        } else {
+            u16::from_be_bytes([chunk[0], 0])
+        };
+        sum += u32::from(word);
+    }
+
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
 #[cfg(test)]
 mod tests {
+    use super::NativeControlType::{Heartbeat, RxAck, Unknown};
     use super::{
-        PROTOCOL_TOKEN_LEN, build_query_ip_message, build_stream_handshake_message,
-        parse_protocol_token,
+        PROTOCOL_TOKEN_LEN, TX_HEARTBEAT_DEFAULT_DST, build_query_ip_message,
+        build_stream_handshake_message, build_tx_heartbeat_packet, is_tx_heartbeat_echo_reply,
+        parse_native_control_frame, parse_protocol_token,
     };
 
     #[test]
@@ -85,5 +242,80 @@ mod tests {
                 .all(|v| *v == 0x22)
         );
         assert_eq!(&message[60..64], &ip_rev);
+    }
+
+    #[test]
+    fn native_control_frame_parses_aabb_little_endian_type() {
+        let mut frame = [0u8; 0x28];
+        frame[0..4].copy_from_slice(b"AABB");
+        frame[4..8].copy_from_slice(&15u32.to_le_bytes());
+        assert_eq!(parse_native_control_frame(&frame), Some(Heartbeat));
+
+        frame[4..8].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(parse_native_control_frame(&frame), Some(RxAck));
+
+        frame[4..8].copy_from_slice(&42u32.to_le_bytes());
+        assert_eq!(parse_native_control_frame(&frame), Some(Unknown(42)));
+    }
+
+    #[test]
+    fn native_control_frame_rejects_wrong_len_or_magic() {
+        let mut frame = [0u8; 0x28];
+        frame[0..4].copy_from_slice(b"AABB");
+        frame[4..8].copy_from_slice(&15u32.to_le_bytes());
+        assert_eq!(parse_native_control_frame(&frame[..0x27]), None);
+
+        frame[0..4].copy_from_slice(b"TIMQ");
+        assert_eq!(parse_native_control_frame(&frame), None);
+    }
+
+    #[test]
+    fn tx_heartbeat_packet_matches_captured_layout() {
+        let packet = build_tx_heartbeat_packet(
+            [10, 166, 80, 12],
+            TX_HEARTBEAT_DEFAULT_DST,
+            b"eab27cdf7c24a40f",
+            &[0x03, 0xa2, 0x16, 0x5a, 0xd5, 0x3d, 0x79, 0xb8],
+        );
+        let expected = [
+            0x45, 0x00, 0x00, 0x4c, 0xbb, 0xaa, 0x00, 0x00, 0x40, 0x01, 0x19, 0xac, 0x0a, 0xa6,
+            0x50, 0x0c, 0x0a, 0xa6, 0x40, 0x03, 0x08, 0x00, 0x04, 0xbd, 0x55, 0x55, 0x44, 0x33,
+            0x53, 0x41, 0x4e, 0x47, 0x46, 0x4f, 0x52, 0x53, 0x43, 0x53, 0x49, 0x50, 0x43, 0x4c,
+            0x49, 0x45, 0x4e, 0x54, 0x65, 0x61, 0x62, 0x32, 0x37, 0x63, 0x64, 0x66, 0x37, 0x63,
+            0x32, 0x34, 0x61, 0x34, 0x30, 0x66, 0x03, 0xa2, 0x16, 0x5a, 0xd5, 0x3d, 0x79, 0xb8,
+            0x4c, 0x33, 0x56, 0x50, 0x4e, 0x00,
+        ];
+        assert_eq!(packet, expected);
+    }
+
+    #[test]
+    fn tx_heartbeat_echo_reply_matches_reversed_request() {
+        let assigned_ip = [10, 166, 80, 12];
+        let session = b"eab27cdf7c24a40f";
+        let tail = [0x03, 0xa2, 0x16, 0x5a, 0xd5, 0x3d, 0x79, 0xb8];
+        let mut reply =
+            build_tx_heartbeat_packet(assigned_ip, TX_HEARTBEAT_DEFAULT_DST, session, &tail);
+
+        reply[12..16].copy_from_slice(&TX_HEARTBEAT_DEFAULT_DST);
+        reply[16..20].copy_from_slice(&assigned_ip);
+        reply[20] = 0x00;
+        reply[22..24].copy_from_slice(&[0x00, 0x00]);
+
+        assert!(is_tx_heartbeat_echo_reply(
+            &reply,
+            assigned_ip,
+            TX_HEARTBEAT_DEFAULT_DST,
+            session,
+            &tail
+        ));
+
+        reply[20] = 0x08;
+        assert!(!is_tx_heartbeat_echo_reply(
+            &reply,
+            assigned_ip,
+            TX_HEARTBEAT_DEFAULT_DST,
+            session,
+            &tail
+        ));
     }
 }
