@@ -379,9 +379,12 @@ fn record_tunnel_fatal_reason(reason: String) {
 
 fn worker_exit_detail(profile: StreamProfile, result: EcResult<()>) -> String {
     match result {
-        Ok(()) => format!("{} worker exited unexpectedly", profile.label()),
+        Ok(()) => format!(
+            "stream closed: {}; reason: exited unexpectedly",
+            profile.label()
+        ),
         Err(err) => format!(
-            "{} worker stopped: {}",
+            "stream closed: {}; reason: {}",
             profile.label(),
             crate::error::concise_error(err)
         ),
@@ -672,7 +675,7 @@ fn start_command_heartbeat(token: [u8; PROTOCOL_TOKEN_LEN]) {
     thread::spawn(move || {
         if let Err(err) = command_heartbeat_loop(token) {
             let detail = format!(
-                "command heartbeat stopped: {}",
+                "stream closed: command; reason: {}",
                 crate::error::concise_error(err)
             );
             output::warn(Scope::Protocol, &detail);
@@ -714,7 +717,7 @@ fn command_heartbeat_loop(token: [u8; PROTOCOL_TOKEN_LEN]) -> EcResult<()> {
                 output::warn(
                     Scope::Protocol,
                     format_args!(
-                        "command heartbeat failed: {}; retrying after {}s ({}/{})",
+                        "command heartbeat failed: {}; retrying in {}s ({}/{})",
                         reason,
                         COMMAND_HEARTBEAT_RETRY_DELAY.as_secs(),
                         output::value(failure_count),

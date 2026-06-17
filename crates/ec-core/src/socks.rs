@@ -28,7 +28,7 @@ pub fn serve(bind_addr: &str, fallback_proxy: Option<&str>) -> EcResult<()> {
 
     let reason = crate::protocol::wait_tunnel_fatal_reason();
     Err(EcError::Runtime(format!(
-        "tunnel terminated: {}",
+        "tunnel closed: {}",
         crate::error::concise_message(reason)
     )))
 }
@@ -52,7 +52,7 @@ fn log_socks_startup(bind_addr: &str, fallback_proxy: Option<&FallbackProxy>) {
     }
     output::info(
         Scope::App,
-        format_args!("socks listening on {}", output::value(bind_addr)),
+        format_args!("listening on {}", output::value(bind_addr)),
     );
 }
 
