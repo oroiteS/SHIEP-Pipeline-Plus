@@ -3,9 +3,9 @@ use crate::error::{EcError, EcResult};
 use crate::output::{self, Scope};
 use crate::protocol_wire::{
     HEARTBEAT_OPAQUE_TAIL_LEN, HEARTBEAT_SESSION_LEN, NativeControlType, PROTOCOL_TOKEN_LEN,
-    TX_HEARTBEAT_DEFAULT_DST, build_query_ip_message, build_stream_handshake_message,
-    build_tx_heartbeat_packet, is_tx_heartbeat_echo_reply, parse_native_control_frame,
-    parse_protocol_token,
+    SendIpReply, build_query_ip_message, build_stream_handshake_message, build_tx_heartbeat_packet,
+    is_tx_heartbeat_echo_reply, parse_native_control_frame, parse_protocol_token,
+    parse_send_ip_reply,
 };
 use openssl::ssl::SslStream;
 use std::io::{ErrorKind, Read, Write};
@@ -111,21 +111,21 @@ impl TunnelRuntimeParams {
         authority: String,
         host: String,
         token: [u8; PROTOCOL_TOKEN_LEN],
-        assigned_ip: [u8; 4],
+        ips: TunnelIps,
     ) -> Self {
-        let heartbeat_tail = new_heartbeat_tail(&token, assigned_ip);
+        let heartbeat_tail = new_heartbeat_tail(&token, ips.assigned_ip);
         Self {
             authority,
             host,
             token,
-            assigned_ip,
+            assigned_ip: ips.assigned_ip,
             ip_rev: [
-                assigned_ip[3],
-                assigned_ip[2],
-                assigned_ip[1],
-                assigned_ip[0],
+                ips.assigned_ip[3],
+                ips.assigned_ip[2],
+                ips.assigned_ip[1],
+                ips.assigned_ip[0],
             ],
-            heartbeat_dst: TX_HEARTBEAT_DEFAULT_DST,
+            heartbeat_dst: ips.lan_ip,
             heartbeat_tail,
         }
     }
@@ -184,6 +184,21 @@ impl TunnelRuntimeParams {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TunnelIps {
+    pub assigned_ip: [u8; 4],
+    pub lan_ip: [u8; 4],
+}
+
+impl From<SendIpReply> for TunnelIps {
+    fn from(reply: SendIpReply) -> Self {
+        Self {
+            assigned_ip: reply.assigned_ip,
+            lan_ip: reply.lan_ip,
+        }
+    }
+}
+
 static TX_PACKET_SENDER: OnceLock<mpsc::Sender<Vec<u8>>> = OnceLock::new();
 // This is not EasyConnect's command socket or keepalive channel. SHIEP's server
 // still appears to require the query-ip TLS context to remain open before later
@@ -197,19 +212,18 @@ struct TunnelFatalState {
     cv: Condvar,
 }
 
-pub fn query_assigned_ip(server: &str, token: &str) -> EcResult<[u8; 4]> {
+pub fn query_assigned_ip(server: &str, token: &str) -> EcResult<TunnelIps> {
     let (authority, host) = parse_server(server)?;
     let token_bytes = parse_protocol_token(token)?;
 
     query_assigned_ip_once(&authority, &host, &token_bytes)
 }
 
-pub fn start_tunnel_runtime(server: &str, token: &str, assigned_ip: [u8; 4]) -> EcResult<()> {
+pub fn start_tunnel_runtime(server: &str, token: &str, ips: TunnelIps) -> EcResult<()> {
     clear_tunnel_fatal_reason();
 
     let (authority, host) = parse_server(server)?;
-    let runtime =
-        TunnelRuntimeParams::new(authority, host, parse_protocol_token(token)?, assigned_ip);
+    let runtime = TunnelRuntimeParams::new(authority, host, parse_protocol_token(token)?, ips);
 
     let rx_stream = runtime.open_stream(StreamProfile::Rx)?;
     output::success(Scope::Protocol, "RX handshake successful");
@@ -347,7 +361,7 @@ fn query_assigned_ip_once(
     authority: &str,
     host: &str,
     token_bytes: &[u8; PROTOCOL_TOKEN_LEN],
-) -> EcResult<[u8; 4]> {
+) -> EcResult<TunnelIps> {
     let mut stream = connect_vpn_tls(authority, host)?;
 
     let message = build_query_ip_message(token_bytes);
@@ -372,21 +386,15 @@ fn query_assigned_ip_once(
         }
     }
 
-    if total < 8 {
-        return Err(EcError::Runtime(format!(
-            "query-ip reply too short or timeout: {total} bytes"
-        )));
-    }
-    if reply[0] != 0x00 {
-        return Err(EcError::Runtime(format!(
-            "unexpected query-ip reply marker: 0x{:02x}",
-            reply[0]
-        )));
+    if total == 0 {
+        return Err(EcError::Runtime(
+            "query-ip reply is empty or timed out".to_string(),
+        ));
     }
 
-    let assigned_ip = [reply[4], reply[5], reply[6], reply[7]];
+    let send_ip = parse_send_ip_reply(&reply[..total])?;
     hold_query_ip_stream(stream)?;
-    Ok(assigned_ip)
+    Ok(send_ip.into())
 }
 
 fn rx_worker_loop(
@@ -719,7 +727,7 @@ fn splitmix64(mut x: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        NativeControlType, StreamOpenKind, StreamProfile, TunnelRuntimeParams,
+        NativeControlType, StreamOpenKind, StreamProfile, TunnelIps, TunnelRuntimeParams,
         should_forward_rx_payload, should_log_heartbeat_sample, validate_stream_ack,
     };
 
@@ -789,12 +797,15 @@ mod tests {
             "vpn.example:443".to_string(),
             "vpn.example".to_string(),
             token,
-            [10, 166, 80, 12],
+            TunnelIps {
+                assigned_ip: [10, 166, 80, 12],
+                lan_ip: [10, 166, 64, 7],
+            },
         );
 
         let packet = runtime.tx_heartbeat_packet();
         assert_eq!(&packet[12..16], &[10, 166, 80, 12]);
-        assert_eq!(&packet[16..20], &[10, 166, 64, 3]);
+        assert_eq!(&packet[16..20], &[10, 166, 64, 7]);
         assert_eq!(&packet[46..62], b"eab27cdf7c24a40f");
         assert_eq!(&packet[70..76], b"L3VPN\0");
     }

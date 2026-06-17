@@ -4,7 +4,6 @@ pub(crate) const PROTOCOL_TOKEN_LEN: usize = 48;
 pub(crate) const HEARTBEAT_SESSION_LEN: usize = 16;
 pub(crate) const HEARTBEAT_OPAQUE_TAIL_LEN: usize = 8;
 const TX_HEARTBEAT_PACKET_LEN: usize = 0x4c;
-pub(crate) const TX_HEARTBEAT_DEFAULT_DST: [u8; 4] = [10, 166, 64, 3];
 const TX_HEARTBEAT_IPV4_ID: [u8; 2] = [0xbb, 0xaa];
 const TX_HEARTBEAT_TTL: u8 = 0x40;
 const TX_HEARTBEAT_ICMP_ID: [u8; 2] = [0x55, 0x55];
@@ -13,6 +12,13 @@ const TX_HEARTBEAT_PAYLOAD_PREFIX: &[u8; 18] = b"SANGFORSCSIPCLIENT";
 const TX_HEARTBEAT_PAYLOAD_SUFFIX: &[u8; 6] = b"L3VPN\0";
 const NATIVE_CONTROL_FRAME_LEN: usize = 0x28;
 const NATIVE_CONTROL_MAGIC: &[u8; 4] = b"AABB";
+const SEND_IP_REPLY_MIN_LEN: usize = 16;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SendIpReply {
+    pub(crate) assigned_ip: [u8; 4],
+    pub(crate) lan_ip: [u8; 4],
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NativeControlType {
@@ -107,6 +113,35 @@ pub(crate) fn build_query_ip_message(token: &[u8; PROTOCOL_TOKEN_LEN]) -> [u8; 6
     message
 }
 
+pub(crate) fn parse_send_ip_reply(data: &[u8]) -> EcResult<SendIpReply> {
+    if data.len() < SEND_IP_REPLY_MIN_LEN {
+        return Err(EcError::Runtime(format!(
+            "send-ip reply too short: {} bytes",
+            data.len()
+        )));
+    }
+
+    let code = u32::from_le_bytes(
+        data[0..4]
+            .try_into()
+            .expect("send-ip reply code slice is fixed width"),
+    );
+    if code != 0 {
+        return Err(EcError::Runtime(format!(
+            "unexpected send-ip reply code: {code}"
+        )));
+    }
+
+    Ok(SendIpReply {
+        assigned_ip: data[4..8]
+            .try_into()
+            .expect("send-ip assigned ip slice is fixed width"),
+        lan_ip: data[12..16]
+            .try_into()
+            .expect("send-ip lan ip slice is fixed width"),
+    })
+}
+
 pub(crate) fn build_stream_handshake_message(
     op_code: u8,
     token: &[u8; PROTOCOL_TOKEN_LEN],
@@ -196,9 +231,9 @@ fn internet_checksum(data: &[u8]) -> u16 {
 mod tests {
     use super::NativeControlType::{Heartbeat, RxAck, Unknown};
     use super::{
-        PROTOCOL_TOKEN_LEN, TX_HEARTBEAT_DEFAULT_DST, build_query_ip_message,
-        build_stream_handshake_message, build_tx_heartbeat_packet, is_tx_heartbeat_echo_reply,
-        parse_native_control_frame, parse_protocol_token,
+        PROTOCOL_TOKEN_LEN, build_query_ip_message, build_stream_handshake_message,
+        build_tx_heartbeat_packet, is_tx_heartbeat_echo_reply, parse_native_control_frame,
+        parse_protocol_token, parse_send_ip_reply,
     };
 
     #[test]
@@ -227,6 +262,27 @@ mod tests {
                 .all(|v| *v == 0x11)
         );
         assert_eq!(&message[60..64], &[0xff, 0xff, 0xff, 0xff]);
+    }
+
+    #[test]
+    fn send_ip_reply_parses_assigned_and_lan_ips() {
+        let reply = [
+            0x00, 0x00, 0x00, 0x00, 0x0a, 0xa6, 0x50, 0x36, 0x00, 0xa1, 0x45, 0x7d, 0x0a, 0xa6,
+            0x40, 0x03, 0x00, 0x00, 0x00, 0x00,
+        ];
+
+        let parsed = parse_send_ip_reply(&reply).unwrap();
+        assert_eq!(parsed.assigned_ip, [10, 166, 80, 54]);
+        assert_eq!(parsed.lan_ip, [10, 166, 64, 3]);
+    }
+
+    #[test]
+    fn send_ip_reply_rejects_short_or_nonzero_code() {
+        assert!(parse_send_ip_reply(&[0u8; 15]).is_err());
+
+        let mut reply = [0u8; 16];
+        reply[0..4].copy_from_slice(&15u32.to_le_bytes());
+        assert!(parse_send_ip_reply(&reply).is_err());
     }
 
     #[test]
@@ -271,9 +327,10 @@ mod tests {
 
     #[test]
     fn tx_heartbeat_packet_matches_captured_layout() {
+        let heartbeat_dst = [10, 166, 64, 3];
         let packet = build_tx_heartbeat_packet(
             [10, 166, 80, 12],
-            TX_HEARTBEAT_DEFAULT_DST,
+            heartbeat_dst,
             b"eab27cdf7c24a40f",
             &[0x03, 0xa2, 0x16, 0x5a, 0xd5, 0x3d, 0x79, 0xb8],
         );
@@ -291,12 +348,12 @@ mod tests {
     #[test]
     fn tx_heartbeat_echo_reply_matches_reversed_request() {
         let assigned_ip = [10, 166, 80, 12];
+        let heartbeat_dst = [10, 166, 64, 3];
         let session = b"eab27cdf7c24a40f";
         let tail = [0x03, 0xa2, 0x16, 0x5a, 0xd5, 0x3d, 0x79, 0xb8];
-        let mut reply =
-            build_tx_heartbeat_packet(assigned_ip, TX_HEARTBEAT_DEFAULT_DST, session, &tail);
+        let mut reply = build_tx_heartbeat_packet(assigned_ip, heartbeat_dst, session, &tail);
 
-        reply[12..16].copy_from_slice(&TX_HEARTBEAT_DEFAULT_DST);
+        reply[12..16].copy_from_slice(&heartbeat_dst);
         reply[16..20].copy_from_slice(&assigned_ip);
         reply[20] = 0x00;
         reply[22..24].copy_from_slice(&[0x00, 0x00]);
@@ -304,7 +361,7 @@ mod tests {
         assert!(is_tx_heartbeat_echo_reply(
             &reply,
             assigned_ip,
-            TX_HEARTBEAT_DEFAULT_DST,
+            heartbeat_dst,
             session,
             &tail
         ));
@@ -313,7 +370,7 @@ mod tests {
         assert!(!is_tx_heartbeat_echo_reply(
             &reply,
             assigned_ip,
-            TX_HEARTBEAT_DEFAULT_DST,
+            heartbeat_dst,
             session,
             &tail
         ));
