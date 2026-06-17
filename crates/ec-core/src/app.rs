@@ -55,13 +55,15 @@ impl EasyConnectApp {
                 );
             }
             Err(err) => {
+                let reason = crate::error::concise_error(err);
                 output::warn(
                     Scope::App,
                     format_args!(
-                        "route table unavailable; split routing unavailable: {}",
-                        crate::error::concise_error(err)
+                        "route table unavailable; routing degraded to tunnel: {}",
+                        reason
                     ),
                 );
+                crate::routing::install_tunnel_fallback()?;
             }
         }
         Ok(())

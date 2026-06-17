@@ -5,7 +5,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock};
 
-static ROUTER: OnceLock<Mutex<Option<Arc<RouteMatcher>>>> = OnceLock::new();
+static ROUTER: OnceLock<Mutex<RouteMode>> = OnceLock::new();
 const ROUTER_NOT_INITIALIZED: &str = "route matcher is not initialized";
 
 #[derive(Debug, Clone)]
@@ -49,6 +49,7 @@ impl FlowProto {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteSource {
+    RouteTableUnavailable,
     RuleIp,
     DnsMap,
     DnsDataIpRule,
@@ -64,6 +65,7 @@ pub enum RouteSource {
 impl RouteSource {
     pub fn label(self) -> &'static str {
         match self {
+            RouteSource::RouteTableUnavailable => "route-table-unavailable",
             RouteSource::RuleIp => "rule-ip",
             RouteSource::DnsMap => "dns-map",
             RouteSource::DnsDataIpRule => "dns-data-ip-rule",
@@ -94,13 +96,23 @@ pub fn install_route_table(table: RouteTable) -> EcResult<RouteInstallSummary> {
         dns_server_count: matcher.dns_servers.len(),
         dns_record_count: matcher.dns_records,
     };
-    let holder = ROUTER.get_or_init(|| Mutex::new(None));
+    let holder = ROUTER.get_or_init(|| Mutex::new(RouteMode::Unavailable));
     let mut guard = holder
         .lock()
         .map_err(|_| EcError::Runtime("route matcher mutex poisoned".to_string()))?;
     crate::dns_resolver::clear_cache();
-    *guard = Some(Arc::new(matcher));
+    *guard = RouteMode::Matcher(Arc::new(matcher));
     Ok(summary)
+}
+
+pub fn install_tunnel_fallback() -> EcResult<()> {
+    let holder = ROUTER.get_or_init(|| Mutex::new(RouteMode::Unavailable));
+    let mut guard = holder
+        .lock()
+        .map_err(|_| EcError::Runtime("route matcher mutex poisoned".to_string()))?;
+    crate::dns_resolver::clear_cache();
+    *guard = RouteMode::TunnelFallback;
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -112,13 +124,26 @@ pub fn plan_target_with_proto(host: &str, port: u16, flow_proto: FlowProto) -> E
     let holder = ROUTER
         .get()
         .ok_or_else(|| EcError::Runtime(ROUTER_NOT_INITIALIZED.to_string()))?;
-    let matcher = holder
+    let mode = holder
         .lock()
         .map_err(|_| EcError::Runtime("route matcher mutex poisoned".to_string()))?;
-    let Some(matcher) = matcher.as_ref().cloned() else {
-        return Err(EcError::Runtime(ROUTER_NOT_INITIALIZED.to_string()));
-    };
-    Ok(matcher.plan(host, port, flow_proto))
+    match &*mode {
+        RouteMode::Matcher(matcher) => Ok(matcher.plan(host, port, flow_proto)),
+        RouteMode::TunnelFallback => Ok(RoutePlan::Remote {
+            dial: format!("{host}:{port}"),
+            rc_id: 0,
+            rc_name: "route-table-unavailable".to_string(),
+            source: RouteSource::RouteTableUnavailable,
+        }),
+        RouteMode::Unavailable => Err(EcError::Runtime(ROUTER_NOT_INITIALIZED.to_string())),
+    }
+}
+
+#[derive(Debug, Clone)]
+enum RouteMode {
+    Unavailable,
+    Matcher(Arc<RouteMatcher>),
+    TunnelFallback,
 }
 
 #[derive(Debug, Clone)]
