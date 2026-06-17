@@ -11,7 +11,7 @@ const COLOR_SCOPE_CLI: u8 = 117;
 const COLOR_SCOPE_APP: u8 = 81;
 const COLOR_SCOPE_LOGIN: u8 = 118;
 const COLOR_SCOPE_AGENT: u8 = 222;
-const COLOR_SCOPE_RX: u8 = 213;
+const COLOR_SCOPE_REQ: u8 = 213;
 const COLOR_SCOPE_UPSTREAM: u8 = 141;
 const COLOR_SCOPE_VPN: u8 = 214;
 const COLOR_SCOPE_NETSTACK: u8 = 33;
@@ -28,7 +28,7 @@ pub enum Scope {
     App,
     Login,
     Agent,
-    Rx,
+    Req,
     Upstream,
     Protocol,
     Netstack,
@@ -67,7 +67,7 @@ impl Scope {
             Scope::App => "APP",
             Scope::Login => "LOGIN",
             Scope::Agent => "AGENT",
-            Scope::Rx => "RX",
+            Scope::Req => "REQ",
             Scope::Upstream => "UPSTREAM",
             Scope::Protocol => "VPN",
             Scope::Netstack => "NETSTACK",
@@ -81,7 +81,7 @@ impl Scope {
             Scope::App => style_ansi256(COLOR_SCOPE_APP),
             Scope::Login => style_ansi256(COLOR_SCOPE_LOGIN),
             Scope::Agent => style_ansi256(COLOR_SCOPE_AGENT),
-            Scope::Rx => style_ansi256(COLOR_SCOPE_RX),
+            Scope::Req => style_ansi256(COLOR_SCOPE_REQ),
             Scope::Upstream => style_ansi256(COLOR_SCOPE_UPSTREAM),
             Scope::Protocol => style_ansi256(COLOR_SCOPE_VPN),
             Scope::Netstack => style_ansi256(COLOR_SCOPE_NETSTACK),

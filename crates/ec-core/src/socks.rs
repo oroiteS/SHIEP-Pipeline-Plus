@@ -62,7 +62,7 @@ fn spawn_accept_loop(listener: TcpListener, fallback_proxy: Option<FallbackProxy
             let (stream, _peer) = match listener.accept() {
                 Ok(v) => v,
                 Err(err) => {
-                    output::warn(Scope::Rx, format_args!("accept failed: {err}"));
+                    output::warn(Scope::Req, format_args!("accept failed: {err}"));
                     continue;
                 }
             };
@@ -99,7 +99,7 @@ fn handle_connect(
 ) -> EcResult<()> {
     let target_display = target.to_string();
     let route = decide_route(&target, fallback_proxy);
-    output::info(Scope::Rx, &route.line);
+    output::info(Scope::Req, &route.line);
     execute_route(client, target_display.as_str(), route)
 }
 
@@ -136,7 +136,7 @@ fn handle_udp_associate(
         return Err(err);
     }
     output::info(
-        Scope::Rx,
+        Scope::Req,
         format_args!("UDP ASSOCIATE -> {}", output::value(relay_addr)),
     );
 
@@ -277,7 +277,7 @@ fn decide_udp_route(
                 output::route_label(RouteKind::Remote),
                 output::weak(" -> "),
             ),
-            path: format!("remote -> legacy planner-unavailable={err}"),
+            path: format!("remote -> legacy; reason: planner unavailable: {err}"),
             transport: UdpRouteTransport::Unsupported(
                 "udp legacy route is not supported".to_string(),
             ),
@@ -378,7 +378,7 @@ fn run_udp_relay(
         }
         if !remember_udp_client(&client_peer, peer) {
             output::warn(
-                Scope::Rx,
+                Scope::Req,
                 format_args!(
                     "drop udp packet from unexpected peer {}",
                     output::value(peer)
@@ -391,7 +391,7 @@ fn run_udp_relay(
             Ok(packet) => packet,
             Err(err) => {
                 output::warn(
-                    Scope::Rx,
+                    Scope::Req,
                     format_args!(
                         "drop invalid udp packet: {}",
                         crate::error::concise_error(err)
@@ -401,14 +401,14 @@ fn run_udp_relay(
             }
         };
         let route = decide_udp_route(&packet.target, fallback_proxy);
-        output::info(Scope::Rx, &route.line);
+        output::info(Scope::Req, &route.line);
         match route.transport {
             UdpRouteTransport::Tunnel(target) => {
                 if let Err(err) = tunnel_sender.send(target, packet.payload) {
                     output::error(
                         Scope::Upstream,
                         format_args!(
-                            "{}; failed: {}",
+                            "{}; error: {}",
                             route.path,
                             crate::error::concise_error(err)
                         ),
@@ -418,7 +418,7 @@ fn run_udp_relay(
             UdpRouteTransport::Unsupported(reason) => {
                 output::error(
                     Scope::Upstream,
-                    format_args!("{}; failed: {reason}", route.path),
+                    format_args!("{}; error: {reason}", route.path),
                 );
             }
         }
@@ -522,7 +522,7 @@ fn route_decision_fallback(
             output::route_label(RouteKind::Fallback),
             output::route_label(RouteKind::Direct),
         ),
-        path: format!("fallback -> direct dial={dial}; reason: {reason}"),
+        path: format!("fallback -> direct; dial: {dial}; reason: {reason}"),
         transport: RouteTransport::Direct(dial),
     }
 }
@@ -541,7 +541,7 @@ fn route_decision_legacy(
             "{target_display}{arrow}{}{arrow}legacy{lparen}{legacy}{rparen}",
             output::route_label(RouteKind::Remote),
         ),
-        path: format!("remote -> legacy({legacy}) planner-unavailable={err}"),
+        path: format!("remote -> legacy({legacy}); reason: planner unavailable: {err}"),
         transport: RouteTransport::Tunnel(legacy),
     }
 }
@@ -582,7 +582,7 @@ fn route_runtime_error(
     err: impl std::fmt::Display,
 ) -> EcError {
     let cause = crate::error::concise_error(err);
-    EcError::Runtime(format!("{target_display} -> {route_path}; failed: {cause}"))
+    EcError::Runtime(format!("{target_display} -> {route_path}; error: {cause}"))
 }
 
 fn write_connect_ok_reply(
