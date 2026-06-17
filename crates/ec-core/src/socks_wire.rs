@@ -290,10 +290,6 @@ impl ConnectTarget {
     pub(crate) fn port(&self) -> u16 {
         self.port
     }
-
-    pub(crate) fn to_socket_target(&self) -> String {
-        format_socket_target(&self.host, self.port)
-    }
 }
 
 impl std::fmt::Display for ConnectTarget {
@@ -304,28 +300,8 @@ impl std::fmt::Display for ConnectTarget {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConnectTarget, SocksCommand, encode_socks_udp_packet, parse_socks_udp_packet};
+    use super::{SocksCommand, encode_socks_udp_packet, parse_socks_udp_packet};
     use std::net::{Ipv4Addr, SocketAddrV4};
-
-    #[test]
-    fn connect_target_formats_socket_target() {
-        let target = ConnectTarget {
-            host: "10.0.0.1".to_string(),
-            port: 80,
-        };
-        assert_eq!(target.to_socket_target(), "10.0.0.1:80");
-        assert_eq!(target.to_string(), "10.0.0.1:80");
-    }
-
-    #[test]
-    fn connect_target_formats_ipv6_socket_target() {
-        let target = ConnectTarget {
-            host: "2001:db8::1".to_string(),
-            port: 443,
-        };
-        assert_eq!(target.to_socket_target(), "[2001:db8::1]:443");
-        assert_eq!(target.to_string(), "2001:db8::1:443");
-    }
 
     #[test]
     fn socks_command_maps_known_values() {

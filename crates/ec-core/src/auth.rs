@@ -71,7 +71,7 @@ pub fn login(config: &AppConfig) -> EcResult<String> {
         .map_err(|e| EcError::Runtime(format!("login_psw body read failed: {e}")))?;
 
     if let Some(reason) = unsupported_2fa_reason(&login_psw_body) {
-        return Err(EcError::NotImplemented(reason));
+        return Err(EcError::Unsupported(reason));
     }
     if !login_psw_body.contains(TAG_RESULT_SUCCESS) {
         return Err(EcError::Runtime(

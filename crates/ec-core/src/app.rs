@@ -58,13 +58,9 @@ impl EasyConnectApp {
                 output::warn(
                     Scope::App,
                     format_args!(
-                        "route table unavailable: {}",
+                        "route table unavailable; split routing unavailable: {}",
                         crate::error::concise_error(err)
                     ),
-                );
-                output::warn(
-                    Scope::App,
-                    "split routing is disabled; fallback will use tunnel",
                 );
             }
         }

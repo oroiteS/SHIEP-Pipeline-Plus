@@ -360,6 +360,10 @@ pub(crate) fn wait_tunnel_fatal_reason() -> String {
     }
 }
 
+pub(crate) fn record_runtime_fatal(reason: impl Into<String>) {
+    record_tunnel_fatal_reason(reason.into());
+}
+
 fn clear_tunnel_fatal_reason() {
     let state = tunnel_fatal_state();
     if let Ok(mut guard) = state.reason.lock() {

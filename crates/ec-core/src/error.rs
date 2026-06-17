@@ -8,8 +8,8 @@ pub enum EcError {
     #[error("invalid config: {0}")]
     InvalidConfig(&'static str),
 
-    #[error("not implemented yet: {0}")]
-    NotImplemented(&'static str),
+    #[error("unsupported: {0}")]
+    Unsupported(&'static str),
 
     #[error("runtime failure: {0}")]
     Runtime(String),
