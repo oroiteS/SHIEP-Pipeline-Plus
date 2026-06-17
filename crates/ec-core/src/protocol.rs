@@ -383,7 +383,7 @@ fn open_command_stream_once(
     let message = build_initial_query_ip_message(token_bytes);
     stream
         .write_all(&message)
-        .map_err(|e| EcError::Runtime(format!("query-ip write failed: {e}")))?;
+        .map_err(|e| EcError::Runtime(format!("SEND_IP write failed: {e}")))?;
 
     let mut reply = [0u8; 0x80];
     let total = read_at_least(
@@ -394,14 +394,14 @@ fn open_command_stream_once(
     )
     .map_err(|e| {
         EcError::Runtime(format!(
-            "query-ip read failed: {}",
+            "SEND_IP read failed: {}",
             crate::error::concise_error(e)
         ))
     })?;
 
     if total == 0 {
         return Err(EcError::Runtime(
-            "query-ip reply is empty or timed out".to_string(),
+            "SEND_IP reply is empty or timed out".to_string(),
         ));
     }
 
