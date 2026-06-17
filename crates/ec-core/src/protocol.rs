@@ -193,12 +193,23 @@ pub struct TunnelIps {
     pub lan_ip: [u8; 4],
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CommandStreamInit {
+    pub ips: TunnelIps,
+}
+
 impl From<SendIpReply> for TunnelIps {
     fn from(reply: SendIpReply) -> Self {
         Self {
             assigned_ip: reply.assigned_ip,
             lan_ip: reply.lan_ip,
         }
+    }
+}
+
+impl From<SendIpReply> for CommandStreamInit {
+    fn from(reply: SendIpReply) -> Self {
+        Self { ips: reply.into() }
     }
 }
 
@@ -214,11 +225,11 @@ struct TunnelFatalState {
     cv: Condvar,
 }
 
-pub fn query_assigned_ip(server: &str, token: &str) -> EcResult<TunnelIps> {
+pub fn open_command_stream(server: &str, token: &str) -> EcResult<CommandStreamInit> {
     let (authority, host) = parse_server(server)?;
     let token_bytes = parse_protocol_token(token)?;
 
-    query_assigned_ip_once(&authority, &host, &token_bytes)
+    open_command_stream_once(&authority, &host, &token_bytes)
 }
 
 pub fn start_tunnel_runtime(server: &str, token: &str, ips: TunnelIps) -> EcResult<()> {
@@ -362,11 +373,11 @@ fn tunnel_fatal_state() -> &'static TunnelFatalState {
     })
 }
 
-fn query_assigned_ip_once(
+fn open_command_stream_once(
     authority: &str,
     host: &str,
     token_bytes: &[u8; PROTOCOL_TOKEN_LEN],
-) -> EcResult<TunnelIps> {
+) -> EcResult<CommandStreamInit> {
     let mut stream = connect_vpn_tls(authority, host)?;
 
     let message = build_initial_query_ip_message(token_bytes);
@@ -689,6 +700,7 @@ fn start_command_heartbeat(token: [u8; PROTOCOL_TOKEN_LEN]) {
 }
 
 fn command_heartbeat_loop(token: [u8; PROTOCOL_TOKEN_LEN]) -> EcResult<()> {
+    let mut heartbeat_count = 0u64;
     loop {
         thread::sleep(COMMAND_HEARTBEAT_INTERVAL);
         let holder = COMMAND_STREAM_HOLDER
@@ -701,7 +713,19 @@ fn command_heartbeat_loop(token: [u8; PROTOCOL_TOKEN_LEN]) -> EcResult<()> {
             .as_mut()
             .ok_or_else(|| EcError::Runtime("command stream is not available".to_string()))?;
         send_command_heartbeat(stream, &token)?;
+        heartbeat_count += 1;
+        log_command_heartbeat_if_sampled(heartbeat_count);
     }
+}
+
+fn log_command_heartbeat_if_sampled(seq: u64) {
+    if !should_log_heartbeat_sample(seq) {
+        return;
+    }
+    output::info(
+        Scope::Protocol,
+        format_args!("command heartbeat #{} acknowledged", output::value(seq)),
+    );
 }
 
 fn send_command_heartbeat(

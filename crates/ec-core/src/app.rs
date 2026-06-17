@@ -79,8 +79,9 @@ impl EasyConnectApp {
     }
 
     fn start_tunnel(&self, token: &str) -> EcResult<crate::protocol::TunnelIps> {
-        output::info(Scope::Protocol, "querying assigned IP...");
-        let tunnel_ips = crate::protocol::query_assigned_ip(&self.config.server, token)?;
+        output::info(Scope::Protocol, "opening command stream...");
+        let command = crate::protocol::open_command_stream(&self.config.server, token)?;
+        let tunnel_ips = command.ips;
         output::success(
             Scope::Protocol,
             format_args!(
