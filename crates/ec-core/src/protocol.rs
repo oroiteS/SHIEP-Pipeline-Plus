@@ -274,6 +274,13 @@ pub fn start_tunnel_runtime(server: &str, token: &str, ips: TunnelIps) -> EcResu
     output::info(
         Scope::Protocol,
         format_args!(
+            "data heartbeat: TX every {}s",
+            output::value(TX_HEARTBEAT_INTERVAL.as_secs())
+        ),
+    );
+    output::info(
+        Scope::Protocol,
+        format_args!(
             "command heartbeat: every {}s; retry {}s x{}",
             output::value(COMMAND_HEARTBEAT_INTERVAL.as_secs()),
             output::value(COMMAND_HEARTBEAT_RETRY_DELAY.as_secs()),
@@ -437,7 +444,6 @@ fn rx_worker_loop(
     tx: mpsc::Sender<Vec<u8>>,
 ) -> EcResult<()> {
     let mut retries = 0usize;
-    let mut heartbeat_reply_count = 0u64;
     let mut buf = [0u8; 4096];
 
     loop {
@@ -452,10 +458,7 @@ fn rx_worker_loop(
                 if !should_forward_rx_payload(&buf[..n])? {
                     continue;
                 }
-                if runtime.is_tx_heartbeat_echo_reply(&buf[..n]) {
-                    heartbeat_reply_count += 1;
-                    log_rx_heartbeat_if_sampled(heartbeat_reply_count, n);
-                }
+                let _ = runtime.is_tx_heartbeat_echo_reply(&buf[..n]);
                 if tx.send(buf[..n].to_vec()).is_err() {
                     return Ok(());
                 }
@@ -489,19 +492,14 @@ fn tx_worker_loop(
 ) -> EcResult<()> {
     let mut retries = 0usize;
     let mut next_heartbeat = Instant::now() + TX_HEARTBEAT_INTERVAL;
-    let mut heartbeat_count = 0u64;
     loop {
         let now = Instant::now();
-        let (packet, heartbeat_seq) = if now >= next_heartbeat {
+        let packet = if now >= next_heartbeat {
             next_heartbeat = now + TX_HEARTBEAT_INTERVAL;
-            heartbeat_count += 1;
-            (
-                runtime.tx_heartbeat_packet().to_vec(),
-                Some(heartbeat_count),
-            )
+            runtime.tx_heartbeat_packet().to_vec()
         } else {
             match rx.recv_timeout(next_heartbeat - now) {
-                Ok(packet) => (packet, None),
+                Ok(packet) => packet,
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
             }
@@ -509,7 +507,6 @@ fn tx_worker_loop(
 
         if stream.write_all(&packet).is_ok() {
             retries = 0;
-            log_tx_heartbeat_if_sampled(heartbeat_seq, packet.len());
             continue;
         }
 
@@ -519,43 +516,7 @@ fn tx_worker_loop(
             EcError::Runtime(format!("tx stream write failed after reconnect: {e}"))
         })?;
         retries = 0;
-        log_tx_heartbeat_if_sampled(heartbeat_seq, packet.len());
     }
-}
-
-fn log_tx_heartbeat_if_sampled(seq: Option<u64>, len: usize) {
-    let Some(seq) = seq else {
-        return;
-    };
-    if !should_log_heartbeat_sample(seq) {
-        return;
-    }
-    output::info(
-        Scope::Protocol,
-        format_args!(
-            "TX heartbeat #{} sent: len {}",
-            output::value(seq),
-            output::value(len)
-        ),
-    );
-}
-
-fn log_rx_heartbeat_if_sampled(seq: u64, len: usize) {
-    if !should_log_heartbeat_sample(seq) {
-        return;
-    }
-    output::info(
-        Scope::Protocol,
-        format_args!(
-            "RX heartbeat #{} received: len {}",
-            output::value(seq),
-            output::value(len)
-        ),
-    );
-}
-
-fn should_log_heartbeat_sample(seq: u64) -> bool {
-    seq.is_power_of_two()
 }
 
 fn open_data_stream_with_retries(
@@ -721,7 +682,6 @@ fn start_command_heartbeat(token: [u8; PROTOCOL_TOKEN_LEN]) {
 }
 
 fn command_heartbeat_loop(token: [u8; PROTOCOL_TOKEN_LEN]) -> EcResult<()> {
-    let mut heartbeat_count = 0u64;
     let mut failure_count = 0u32;
     let mut next_delay = COMMAND_HEARTBEAT_INTERVAL;
     loop {
@@ -742,8 +702,6 @@ fn command_heartbeat_loop(token: [u8; PROTOCOL_TOKEN_LEN]) -> EcResult<()> {
             Ok(()) => {
                 failure_count = 0;
                 next_delay = COMMAND_HEARTBEAT_INTERVAL;
-                heartbeat_count += 1;
-                log_command_heartbeat_if_sampled(heartbeat_count);
             }
             Err(CommandHeartbeatFailure::Retryable(reason)) => {
                 failure_count += 1;
@@ -770,16 +728,6 @@ fn command_heartbeat_loop(token: [u8; PROTOCOL_TOKEN_LEN]) -> EcResult<()> {
             }
         }
     }
-}
-
-fn log_command_heartbeat_if_sampled(seq: u64) {
-    if !should_log_heartbeat_sample(seq) {
-        return;
-    }
-    output::info(
-        Scope::Protocol,
-        format_args!("command heartbeat #{} acknowledged", output::value(seq)),
-    );
 }
 
 fn send_command_heartbeat(
@@ -924,7 +872,7 @@ mod tests {
     use super::{
         CommandHeartbeatOutcome, NativeControlType, StreamOpenKind, StreamProfile, TunnelIps,
         TunnelRuntimeParams, classify_command_heartbeat_reply, should_forward_rx_payload,
-        should_log_heartbeat_sample, validate_stream_ack,
+        validate_stream_ack,
     };
 
     #[test]
@@ -1004,17 +952,6 @@ mod tests {
         assert_eq!(&packet[16..20], &[10, 166, 64, 7]);
         assert_eq!(&packet[46..62], b"eab27cdf7c24a40f");
         assert_eq!(&packet[70..76], b"L3VPN\0");
-    }
-
-    #[test]
-    fn tx_heartbeat_log_sampling_uses_powers_of_two() {
-        let sampled: Vec<u64> = (1..=16)
-            .filter(|v| should_log_heartbeat_sample(*v))
-            .collect();
-        assert_eq!(sampled, vec![1, 2, 4, 8, 16]);
-        assert!(!should_log_heartbeat_sample(0));
-        assert!(!should_log_heartbeat_sample(3));
-        assert!(!should_log_heartbeat_sample(12));
     }
 
     #[test]
