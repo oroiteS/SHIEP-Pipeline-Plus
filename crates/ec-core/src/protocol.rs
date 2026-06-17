@@ -43,6 +43,11 @@ enum CommandHeartbeatFailure {
     Fatal(String),
 }
 
+enum CommandHeartbeatOutcome {
+    Ack,
+    Fatal(String),
+}
+
 #[derive(Clone, Copy)]
 struct StreamOpenRetry {
     first_attempt: usize,
@@ -795,25 +800,42 @@ fn send_command_heartbeat(
             "command heartbeat reply is empty or timed out".to_string(),
         ));
     }
-    let control = parse_command_control_reply(&reply[..n]).map_err(|e| {
-        CommandHeartbeatFailure::Fatal(format!(
-            "command heartbeat parse failed: {}",
-            crate::error::concise_error(e)
-        ))
-    })?;
+    classify_command_heartbeat_reply(&reply[..n]).into_result()
+}
+
+fn classify_command_heartbeat_reply(data: &[u8]) -> CommandHeartbeatOutcome {
+    let control = match parse_command_control_reply(data) {
+        Ok(control) => control,
+        Err(err) => {
+            return CommandHeartbeatOutcome::Fatal(format!(
+                "command heartbeat parse failed: {}",
+                crate::error::concise_error(err)
+            ));
+        }
+    };
+
     match control {
-        NativeControlType::Heartbeat => Ok(()),
+        NativeControlType::Heartbeat => CommandHeartbeatOutcome::Ack,
         NativeControlType::Shutdown | NativeControlType::IpKick => {
-            Err(CommandHeartbeatFailure::Fatal(format!(
+            CommandHeartbeatOutcome::Fatal(format!(
                 "command control requested tunnel shutdown: {}",
                 control.label()
-            )))
+            ))
         }
-        control => Err(CommandHeartbeatFailure::Fatal(format!(
+        control => CommandHeartbeatOutcome::Fatal(format!(
             "unexpected command heartbeat reply: {}({})",
             control.label(),
             control.code()
-        ))),
+        )),
+    }
+}
+
+impl CommandHeartbeatOutcome {
+    fn into_result(self) -> Result<(), CommandHeartbeatFailure> {
+        match self {
+            Self::Ack => Ok(()),
+            Self::Fatal(reason) => Err(CommandHeartbeatFailure::Fatal(reason)),
+        }
     }
 }
 
@@ -891,8 +913,9 @@ fn splitmix64(mut x: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        NativeControlType, StreamOpenKind, StreamProfile, TunnelIps, TunnelRuntimeParams,
-        should_forward_rx_payload, should_log_heartbeat_sample, validate_stream_ack,
+        CommandHeartbeatOutcome, NativeControlType, StreamOpenKind, StreamProfile, TunnelIps,
+        TunnelRuntimeParams, classify_command_heartbeat_reply, should_forward_rx_payload,
+        should_log_heartbeat_sample, validate_stream_ack,
     };
 
     #[test]
@@ -983,5 +1006,29 @@ mod tests {
         assert!(!should_log_heartbeat_sample(0));
         assert!(!should_log_heartbeat_sample(3));
         assert!(!should_log_heartbeat_sample(12));
+    }
+
+    #[test]
+    fn command_heartbeat_reply_classifies_ack_and_shutdown() {
+        let mut ack = [0u8; 36];
+        ack[0..4].copy_from_slice(&15u32.to_le_bytes());
+        assert!(matches!(
+            classify_command_heartbeat_reply(&ack),
+            CommandHeartbeatOutcome::Ack
+        ));
+
+        ack[0..4].copy_from_slice(&8u32.to_le_bytes());
+        assert!(matches!(
+            classify_command_heartbeat_reply(&ack),
+            CommandHeartbeatOutcome::Fatal(reason) if reason.contains("shutdown")
+        ));
+    }
+
+    #[test]
+    fn command_heartbeat_reply_classifies_parse_failure_as_fatal() {
+        assert!(matches!(
+            classify_command_heartbeat_reply(&[]),
+            CommandHeartbeatOutcome::Fatal(reason) if reason.contains("parse failed")
+        ));
     }
 }
