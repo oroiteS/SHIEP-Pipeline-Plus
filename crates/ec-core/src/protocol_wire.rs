@@ -12,7 +12,10 @@ const TX_HEARTBEAT_PAYLOAD_PREFIX: &[u8; 18] = b"SANGFORSCSIPCLIENT";
 const TX_HEARTBEAT_PAYLOAD_SUFFIX: &[u8; 6] = b"L3VPN\0";
 const NATIVE_CONTROL_FRAME_LEN: usize = 0x28;
 const NATIVE_CONTROL_MAGIC: &[u8; 4] = b"AABB";
-const SEND_IP_REPLY_MIN_LEN: usize = 16;
+pub(crate) const SEND_IP_REPLY_MIN_LEN: usize = 16;
+pub(crate) const SEND_IP_REPLY_EXPECTED_LEN: usize = 36;
+pub(crate) const COMMAND_REPLY_BODY_EXPECTED_LEN: usize = 36;
+const COMMAND_REPLY_MIN_LEN: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SendIpReply {
@@ -36,6 +39,22 @@ pub(crate) enum NativeControlType {
 }
 
 impl NativeControlType {
+    fn from_code(code: u32) -> Self {
+        match code {
+            0 => Self::SendIp,
+            1 => Self::RxAck,
+            2 => Self::TxAck,
+            3 => Self::ServerReset,
+            4 => Self::Recovered,
+            5 => Self::IpBusy,
+            8 => Self::Shutdown,
+            9 => Self::IpConflict,
+            14 => Self::IpKick,
+            15 => Self::Heartbeat,
+            v => Self::Unknown(v),
+        }
+    }
+
     pub(crate) fn code(self) -> u32 {
         match self {
             Self::SendIp => 0,
@@ -75,19 +94,7 @@ pub(crate) fn parse_native_control_frame(data: &[u8]) -> Option<NativeControlTyp
     }
 
     let code = u32::from_le_bytes(data[4..8].try_into().ok()?);
-    Some(match code {
-        0 => NativeControlType::SendIp,
-        1 => NativeControlType::RxAck,
-        2 => NativeControlType::TxAck,
-        3 => NativeControlType::ServerReset,
-        4 => NativeControlType::Recovered,
-        5 => NativeControlType::IpBusy,
-        8 => NativeControlType::Shutdown,
-        9 => NativeControlType::IpConflict,
-        14 => NativeControlType::IpKick,
-        15 => NativeControlType::Heartbeat,
-        v => NativeControlType::Unknown(v),
-    })
+    Some(NativeControlType::from_code(code))
 }
 
 pub(crate) fn parse_protocol_token(token: &str) -> EcResult<[u8; PROTOCOL_TOKEN_LEN]> {
@@ -107,8 +114,18 @@ pub(crate) fn parse_protocol_token(token: &str) -> EcResult<[u8; PROTOCOL_TOKEN_
 }
 
 pub(crate) fn build_query_ip_message(token: &[u8; PROTOCOL_TOKEN_LEN]) -> [u8; 64] {
+    build_command_message(0, token)
+}
+
+pub(crate) fn build_command_message(op_code: u32, token: &[u8; PROTOCOL_TOKEN_LEN]) -> [u8; 64] {
     let mut message = [0u8; 64];
+    message[0..4].copy_from_slice(&op_code.to_le_bytes());
     message[4..(4 + PROTOCOL_TOKEN_LEN)].copy_from_slice(token);
+    message
+}
+
+pub(crate) fn build_initial_query_ip_message(token: &[u8; PROTOCOL_TOKEN_LEN]) -> [u8; 64] {
+    let mut message = build_query_ip_message(token);
     message[60..64].copy_from_slice(&[0xff, 0xff, 0xff, 0xff]);
     message
 }
@@ -140,6 +157,31 @@ pub(crate) fn parse_send_ip_reply(data: &[u8]) -> EcResult<SendIpReply> {
             .try_into()
             .expect("send-ip lan ip slice is fixed width"),
     })
+}
+
+pub(crate) fn parse_command_control_reply(data: &[u8]) -> EcResult<NativeControlType> {
+    if data.starts_with(NATIVE_CONTROL_MAGIC) {
+        return parse_native_control_frame(data).ok_or_else(|| {
+            EcError::Runtime(format!(
+                "invalid command control frame: {} bytes",
+                data.len()
+            ))
+        });
+    }
+
+    if data.len() < COMMAND_REPLY_MIN_LEN {
+        return Err(EcError::Runtime(format!(
+            "command control reply too short: {} bytes",
+            data.len()
+        )));
+    }
+
+    let code = u32::from_le_bytes(
+        data[0..4]
+            .try_into()
+            .expect("command control reply code slice is fixed width"),
+    );
+    Ok(NativeControlType::from_code(code))
 }
 
 pub(crate) fn build_stream_handshake_message(
@@ -229,11 +271,11 @@ fn internet_checksum(data: &[u8]) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use super::NativeControlType::{Heartbeat, RxAck, Unknown};
     use super::{
-        PROTOCOL_TOKEN_LEN, build_query_ip_message, build_stream_handshake_message,
-        build_tx_heartbeat_packet, is_tx_heartbeat_echo_reply, parse_native_control_frame,
-        parse_protocol_token, parse_send_ip_reply,
+        NativeControlType, PROTOCOL_TOKEN_LEN, build_command_message,
+        build_initial_query_ip_message, build_query_ip_message, build_stream_handshake_message,
+        build_tx_heartbeat_packet, is_tx_heartbeat_echo_reply, parse_command_control_reply,
+        parse_native_control_frame, parse_protocol_token, parse_send_ip_reply,
     };
 
     #[test]
@@ -261,7 +303,28 @@ mod tests {
                 .iter()
                 .all(|v| *v == 0x11)
         );
+        assert_eq!(&message[60..64], &[0x00, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn initial_query_ip_message_uses_official_ff_tail() {
+        let token = [0x11u8; PROTOCOL_TOKEN_LEN];
+        let message = build_initial_query_ip_message(&token);
+        assert_eq!(message[0], 0x00);
         assert_eq!(&message[60..64], &[0xff, 0xff, 0xff, 0xff]);
+    }
+
+    #[test]
+    fn command_message_sets_little_endian_op_code() {
+        let token = [0x22u8; PROTOCOL_TOKEN_LEN];
+        let message = build_command_message(3, &token);
+        assert_eq!(&message[0..4], &[0x03, 0x00, 0x00, 0x00]);
+        assert!(
+            message[4..(4 + PROTOCOL_TOKEN_LEN)]
+                .iter()
+                .all(|v| *v == 0x22)
+        );
+        assert_eq!(&message[60..64], &[0x00, 0x00, 0x00, 0x00]);
     }
 
     #[test]
@@ -286,6 +349,33 @@ mod tests {
     }
 
     #[test]
+    fn command_control_reply_accepts_body_without_aabb() {
+        let mut reply = [0u8; 36];
+        reply[0..4].copy_from_slice(&15u32.to_le_bytes());
+        assert_eq!(
+            parse_command_control_reply(&reply).unwrap(),
+            NativeControlType::Heartbeat
+        );
+
+        reply[0..4].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(
+            parse_command_control_reply(&reply).unwrap(),
+            NativeControlType::SendIp
+        );
+    }
+
+    #[test]
+    fn command_control_reply_accepts_aabb_frame() {
+        let mut frame = [0u8; 0x28];
+        frame[0..4].copy_from_slice(b"AABB");
+        frame[4..8].copy_from_slice(&8u32.to_le_bytes());
+        assert_eq!(
+            parse_command_control_reply(&frame).unwrap(),
+            NativeControlType::Shutdown
+        );
+    }
+
+    #[test]
     fn stream_message_has_expected_layout() {
         let token = [0x22u8; PROTOCOL_TOKEN_LEN];
         let ip_rev = [4u8, 3, 2, 1];
@@ -305,13 +395,22 @@ mod tests {
         let mut frame = [0u8; 0x28];
         frame[0..4].copy_from_slice(b"AABB");
         frame[4..8].copy_from_slice(&15u32.to_le_bytes());
-        assert_eq!(parse_native_control_frame(&frame), Some(Heartbeat));
+        assert_eq!(
+            parse_native_control_frame(&frame),
+            Some(NativeControlType::Heartbeat)
+        );
 
         frame[4..8].copy_from_slice(&1u32.to_le_bytes());
-        assert_eq!(parse_native_control_frame(&frame), Some(RxAck));
+        assert_eq!(
+            parse_native_control_frame(&frame),
+            Some(NativeControlType::RxAck)
+        );
 
         frame[4..8].copy_from_slice(&42u32.to_le_bytes());
-        assert_eq!(parse_native_control_frame(&frame), Some(Unknown(42)));
+        assert_eq!(
+            parse_native_control_frame(&frame),
+            Some(NativeControlType::Unknown(42))
+        );
     }
 
     #[test]

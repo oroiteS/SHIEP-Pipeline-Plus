@@ -2,10 +2,11 @@ use crate::endpoint::parse_server;
 use crate::error::{EcError, EcResult};
 use crate::output::{self, Scope};
 use crate::protocol_wire::{
-    HEARTBEAT_OPAQUE_TAIL_LEN, HEARTBEAT_SESSION_LEN, NativeControlType, PROTOCOL_TOKEN_LEN,
-    SendIpReply, build_query_ip_message, build_stream_handshake_message, build_tx_heartbeat_packet,
-    is_tx_heartbeat_echo_reply, parse_native_control_frame, parse_protocol_token,
-    parse_send_ip_reply,
+    COMMAND_REPLY_BODY_EXPECTED_LEN, HEARTBEAT_OPAQUE_TAIL_LEN, HEARTBEAT_SESSION_LEN,
+    NativeControlType, PROTOCOL_TOKEN_LEN, SEND_IP_REPLY_EXPECTED_LEN, SendIpReply,
+    build_command_message, build_initial_query_ip_message, build_stream_handshake_message,
+    build_tx_heartbeat_packet, is_tx_heartbeat_echo_reply, parse_command_control_reply,
+    parse_native_control_frame, parse_protocol_token, parse_send_ip_reply,
 };
 use openssl::ssl::SslStream;
 use std::io::{ErrorKind, Read, Write};
@@ -19,6 +20,8 @@ const STREAM_RETRY_DELAY: Duration = Duration::from_secs(1);
 const QUERY_IP_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 const STREAM_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const TX_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(12);
+const COMMAND_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const COMMAND_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
 const RUNTIME_ALREADY_STARTED: &str = "tunnel runtime already started in this process";
 
 #[derive(Clone, Copy)]
@@ -200,10 +203,9 @@ impl From<SendIpReply> for TunnelIps {
 }
 
 static TX_PACKET_SENDER: OnceLock<mpsc::Sender<Vec<u8>>> = OnceLock::new();
-// This is not EasyConnect's command socket or keepalive channel. SHIEP's server
-// still appears to require the query-ip TLS context to remain open before later
-// L3 RX/TX streams are accepted.
-static QUERY_IP_STREAM_HOLDER: OnceLock<Mutex<Option<SslStream<TcpStream>>>> = OnceLock::new();
+// L3IP op0/SEND_IP leaves a command/control stream open. Official op3
+// heartbeat must stay on that same stream instead of the RX/TX data streams.
+static COMMAND_STREAM_HOLDER: OnceLock<Mutex<Option<SslStream<TcpStream>>>> = OnceLock::new();
 static RX_PACKET_RECEIVER: OnceLock<Mutex<Option<mpsc::Receiver<Vec<u8>>>>> = OnceLock::new();
 static TUNNEL_FATAL_STATE: OnceLock<TunnelFatalState> = OnceLock::new();
 
@@ -223,7 +225,8 @@ pub fn start_tunnel_runtime(server: &str, token: &str, ips: TunnelIps) -> EcResu
     clear_tunnel_fatal_reason();
 
     let (authority, host) = parse_server(server)?;
-    let runtime = TunnelRuntimeParams::new(authority, host, parse_protocol_token(token)?, ips);
+    let token_bytes = parse_protocol_token(token)?;
+    let runtime = TunnelRuntimeParams::new(authority, host, token_bytes, ips);
 
     let rx_stream = runtime.open_stream(StreamProfile::Rx)?;
     output::success(Scope::Protocol, "RX handshake successful");
@@ -244,6 +247,8 @@ pub fn start_tunnel_runtime(server: &str, token: &str, ips: TunnelIps) -> EcResu
         let result = tx_worker_loop(runtime, tx_stream, tx_receiver);
         handle_worker_exit(StreamProfile::Tx, result);
     });
+
+    start_command_heartbeat(token_bytes);
 
     Ok(())
 }
@@ -364,27 +369,24 @@ fn query_assigned_ip_once(
 ) -> EcResult<TunnelIps> {
     let mut stream = connect_vpn_tls(authority, host)?;
 
-    let message = build_query_ip_message(token_bytes);
+    let message = build_initial_query_ip_message(token_bytes);
     stream
         .write_all(&message)
         .map_err(|e| EcError::Runtime(format!("query-ip write failed: {e}")))?;
 
     let mut reply = [0u8; 0x80];
-    let mut total = 0usize;
-    let deadline = Instant::now() + QUERY_IP_REPLY_TIMEOUT;
-    while total < reply.len() && Instant::now() < deadline {
-        match stream.read(&mut reply[total..]) {
-            Ok(0) => break,
-            Ok(n) => {
-                total += n;
-                if total >= 8 {
-                    break;
-                }
-            }
-            Err(e) if is_wouldblock_or_timeout(&e) => continue,
-            Err(e) => return Err(EcError::Runtime(format!("query-ip read failed: {e}"))),
-        }
-    }
+    let total = read_at_least(
+        &mut stream,
+        &mut reply,
+        SEND_IP_REPLY_EXPECTED_LEN,
+        QUERY_IP_REPLY_TIMEOUT,
+    )
+    .map_err(|e| {
+        EcError::Runtime(format!(
+            "query-ip read failed: {}",
+            crate::error::concise_error(e)
+        ))
+    })?;
 
     if total == 0 {
         return Err(EcError::Runtime(
@@ -393,7 +395,7 @@ fn query_assigned_ip_once(
     }
 
     let send_ip = parse_send_ip_reply(&reply[..total])?;
-    hold_query_ip_stream(stream)?;
+    hold_command_stream(stream)?;
     Ok(send_ip.into())
 }
 
@@ -664,15 +666,100 @@ fn connect_vpn_tls(authority: &str, host: &str) -> EcResult<SslStream<TcpStream>
     crate::tls::handshake(ssl, tcp, "vpn")
 }
 
-fn hold_query_ip_stream(stream: SslStream<TcpStream>) -> EcResult<()> {
-    // Real command-channel behavior needs CmdRealSsl/JJYY handling. This holder
-    // only preserves the query-ip context that gates subsequent data streams.
-    let holder = QUERY_IP_STREAM_HOLDER.get_or_init(|| Mutex::new(None));
+fn hold_command_stream(stream: SslStream<TcpStream>) -> EcResult<()> {
+    let holder = COMMAND_STREAM_HOLDER.get_or_init(|| Mutex::new(None));
     let mut guard = holder
         .lock()
-        .map_err(|_| EcError::Runtime("query-ip stream holder mutex poisoned".to_string()))?;
+        .map_err(|_| EcError::Runtime("command stream holder mutex poisoned".to_string()))?;
     *guard = Some(stream);
     Ok(())
+}
+
+fn start_command_heartbeat(token: [u8; PROTOCOL_TOKEN_LEN]) {
+    thread::spawn(move || {
+        if let Err(err) = command_heartbeat_loop(token) {
+            let detail = format!(
+                "command heartbeat stopped: {}",
+                crate::error::concise_error(err)
+            );
+            output::warn(Scope::Protocol, &detail);
+            record_tunnel_fatal_reason(detail);
+        }
+    });
+}
+
+fn command_heartbeat_loop(token: [u8; PROTOCOL_TOKEN_LEN]) -> EcResult<()> {
+    loop {
+        thread::sleep(COMMAND_HEARTBEAT_INTERVAL);
+        let holder = COMMAND_STREAM_HOLDER
+            .get()
+            .ok_or_else(|| EcError::Runtime("command stream is not initialized".to_string()))?;
+        let mut guard = holder
+            .lock()
+            .map_err(|_| EcError::Runtime("command stream holder mutex poisoned".to_string()))?;
+        let stream = guard
+            .as_mut()
+            .ok_or_else(|| EcError::Runtime("command stream is not available".to_string()))?;
+        send_command_heartbeat(stream, &token)?;
+    }
+}
+
+fn send_command_heartbeat(
+    stream: &mut SslStream<TcpStream>,
+    token: &[u8; PROTOCOL_TOKEN_LEN],
+) -> EcResult<()> {
+    let message = build_command_message(3, token);
+    stream
+        .write_all(&message)
+        .map_err(|e| EcError::Runtime(format!("command heartbeat write failed: {e}")))?;
+
+    let mut reply = [0u8; 0x80];
+    let n = read_at_least(
+        stream,
+        &mut reply,
+        COMMAND_REPLY_BODY_EXPECTED_LEN,
+        COMMAND_HEARTBEAT_TIMEOUT,
+    )?;
+    if n == 0 {
+        return Err(EcError::Runtime(
+            "command heartbeat reply is empty or timed out".to_string(),
+        ));
+    }
+    let control = parse_command_control_reply(&reply[..n])?;
+    match control {
+        NativeControlType::Heartbeat => Ok(()),
+        NativeControlType::Shutdown | NativeControlType::IpKick => Err(EcError::Runtime(format!(
+            "command control requested tunnel shutdown: {}",
+            control.label()
+        ))),
+        control => Err(EcError::Runtime(format!(
+            "unexpected command heartbeat reply: {}({})",
+            control.label(),
+            control.code()
+        ))),
+    }
+}
+
+fn read_at_least<S: Read + Write>(
+    stream: &mut SslStream<S>,
+    buf: &mut [u8],
+    min_len: usize,
+    timeout: Duration,
+) -> EcResult<usize> {
+    let deadline = Instant::now() + timeout;
+    let mut total = 0usize;
+    while total < min_len && total < buf.len() {
+        if Instant::now() >= deadline {
+            break;
+        }
+        match stream.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(e) if is_wouldblock_or_timeout(&e) => continue,
+            Err(e) => return Err(EcError::Runtime(format!("stream read failed: {e}"))),
+        }
+    }
+    Ok(total)
 }
 
 fn read_stream_once<S: Read + Write>(
