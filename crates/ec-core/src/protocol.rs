@@ -5,8 +5,8 @@ use crate::protocol_wire::{
     COMMAND_REPLY_BODY_EXPECTED_LEN, HEARTBEAT_OPAQUE_TAIL_LEN, HEARTBEAT_SESSION_LEN,
     NativeControlType, PROTOCOL_TOKEN_LEN, SEND_IP_REPLY_EXPECTED_LEN, SendIpReply,
     build_command_message, build_initial_query_ip_message, build_stream_handshake_message,
-    build_tx_heartbeat_packet, is_tx_heartbeat_echo_reply, parse_command_control_reply,
-    parse_native_control_frame, parse_protocol_token, parse_send_ip_reply,
+    build_tx_heartbeat_packet, parse_command_control_reply, parse_native_control_frame,
+    parse_protocol_token, parse_send_ip_reply,
 };
 use openssl::ssl::SslStream;
 use std::io::{ErrorKind, Read, Write};
@@ -175,16 +175,6 @@ impl TunnelRuntimeParams {
 
     fn tx_heartbeat_packet(&self) -> [u8; 0x4c] {
         build_tx_heartbeat_packet(
-            self.assigned_ip,
-            self.heartbeat_dst,
-            self.heartbeat_session(),
-            &self.heartbeat_tail,
-        )
-    }
-
-    fn is_tx_heartbeat_echo_reply(&self, data: &[u8]) -> bool {
-        is_tx_heartbeat_echo_reply(
-            data,
             self.assigned_ip,
             self.heartbeat_dst,
             self.heartbeat_session(),
@@ -465,7 +455,6 @@ fn rx_worker_loop(
                 if !should_forward_rx_payload(&buf[..n])? {
                     continue;
                 }
-                let _ = runtime.is_tx_heartbeat_echo_reply(&buf[..n]);
                 if tx.send(buf[..n].to_vec()).is_err() {
                     return Ok(());
                 }

@@ -127,7 +127,16 @@ pub fn plan_target_with_proto(host: &str, port: u16, flow_proto: FlowProto) -> E
     let mode = holder
         .lock()
         .map_err(|_| EcError::Runtime("route matcher mutex poisoned".to_string()))?;
-    match &*mode {
+    plan_from_mode(&mode, host, port, flow_proto)
+}
+
+fn plan_from_mode(
+    mode: &RouteMode,
+    host: &str,
+    port: u16,
+    flow_proto: FlowProto,
+) -> EcResult<RoutePlan> {
+    match mode {
         RouteMode::Matcher(matcher) => Ok(matcher.plan(host, port, flow_proto)),
         RouteMode::TunnelFallback => Ok(RoutePlan::Remote {
             dial: format!("{host}:{port}"),
@@ -685,7 +694,7 @@ fn rule_matches_flow(rule: &CompiledRule, port: u16, flow_proto: FlowProto) -> b
 
 #[cfg(test)]
 mod tests {
-    use super::{FlowProto, RouteMatcher, RoutePlan, RouteSource};
+    use super::{FlowProto, RouteMatcher, RouteMode, RoutePlan, RouteSource, plan_from_mode};
     use crate::route_table::{DnsRecord, PortRange, RouteRule, RouteTable};
 
     #[test]
@@ -723,6 +732,31 @@ mod tests {
                 assert_eq!(source, RouteSource::DnsMap);
             }
             _ => panic!("expected remote plan"),
+        }
+    }
+
+    #[test]
+    fn tunnel_fallback_mode_routes_everything_remote() {
+        let plan = plan_from_mode(
+            &RouteMode::TunnelFallback,
+            "example.invalid",
+            443,
+            FlowProto::Tcp,
+        )
+        .unwrap();
+        match plan {
+            RoutePlan::Remote {
+                dial,
+                rc_id,
+                rc_name,
+                source,
+            } => {
+                assert_eq!(dial, "example.invalid:443");
+                assert_eq!(rc_id, 0);
+                assert_eq!(rc_name, "route-table-unavailable");
+                assert_eq!(source, RouteSource::RouteTableUnavailable);
+            }
+            _ => panic!("expected remote tunnel fallback plan"),
         }
     }
 
