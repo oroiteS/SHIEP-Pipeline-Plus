@@ -22,6 +22,8 @@ const STREAM_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const TX_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(12);
 const COMMAND_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const COMMAND_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
+const COMMAND_HEARTBEAT_RETRY_DELAY: Duration = Duration::from_secs(3);
+const COMMAND_HEARTBEAT_FAILURE_LIMIT: u32 = 3;
 const RUNTIME_ALREADY_STARTED: &str = "tunnel runtime already started in this process";
 
 #[derive(Clone, Copy)]
@@ -34,6 +36,11 @@ enum StreamProfile {
 enum StreamOpenKind {
     First,
     Resume,
+}
+
+enum CommandHeartbeatFailure {
+    Retryable(String),
+    Fatal(String),
 }
 
 #[derive(Clone, Copy)]
@@ -701,20 +708,53 @@ fn start_command_heartbeat(token: [u8; PROTOCOL_TOKEN_LEN]) {
 
 fn command_heartbeat_loop(token: [u8; PROTOCOL_TOKEN_LEN]) -> EcResult<()> {
     let mut heartbeat_count = 0u64;
+    let mut failure_count = 0u32;
+    let mut next_delay = COMMAND_HEARTBEAT_INTERVAL;
     loop {
-        thread::sleep(COMMAND_HEARTBEAT_INTERVAL);
+        thread::sleep(next_delay);
         let holder = COMMAND_STREAM_HOLDER
             .get()
             .ok_or_else(|| EcError::Runtime("command stream is not initialized".to_string()))?;
-        let mut guard = holder
-            .lock()
-            .map_err(|_| EcError::Runtime("command stream holder mutex poisoned".to_string()))?;
-        let stream = guard
-            .as_mut()
-            .ok_or_else(|| EcError::Runtime("command stream is not available".to_string()))?;
-        send_command_heartbeat(stream, &token)?;
-        heartbeat_count += 1;
-        log_command_heartbeat_if_sampled(heartbeat_count);
+        let result = {
+            let mut guard = holder.lock().map_err(|_| {
+                EcError::Runtime("command stream holder mutex poisoned".to_string())
+            })?;
+            let stream = guard
+                .as_mut()
+                .ok_or_else(|| EcError::Runtime("command stream is not available".to_string()))?;
+            send_command_heartbeat(stream, &token)
+        };
+        match result {
+            Ok(()) => {
+                failure_count = 0;
+                next_delay = COMMAND_HEARTBEAT_INTERVAL;
+                heartbeat_count += 1;
+                log_command_heartbeat_if_sampled(heartbeat_count);
+            }
+            Err(CommandHeartbeatFailure::Retryable(reason)) => {
+                failure_count += 1;
+                if failure_count >= COMMAND_HEARTBEAT_FAILURE_LIMIT {
+                    return Err(EcError::Runtime(format!(
+                        "command heartbeat reached failure limit ({}/{}): {reason}",
+                        failure_count, COMMAND_HEARTBEAT_FAILURE_LIMIT
+                    )));
+                }
+                output::warn(
+                    Scope::Protocol,
+                    format_args!(
+                        "command heartbeat failed: {}; retrying after {}s ({}/{})",
+                        reason,
+                        COMMAND_HEARTBEAT_RETRY_DELAY.as_secs(),
+                        output::value(failure_count),
+                        output::value(COMMAND_HEARTBEAT_FAILURE_LIMIT)
+                    ),
+                );
+                next_delay = COMMAND_HEARTBEAT_RETRY_DELAY;
+            }
+            Err(CommandHeartbeatFailure::Fatal(reason)) => {
+                return Err(EcError::Runtime(reason));
+            }
+        }
     }
 }
 
@@ -731,11 +771,11 @@ fn log_command_heartbeat_if_sampled(seq: u64) {
 fn send_command_heartbeat(
     stream: &mut SslStream<TcpStream>,
     token: &[u8; PROTOCOL_TOKEN_LEN],
-) -> EcResult<()> {
+) -> Result<(), CommandHeartbeatFailure> {
     let message = build_command_message(3, token);
-    stream
-        .write_all(&message)
-        .map_err(|e| EcError::Runtime(format!("command heartbeat write failed: {e}")))?;
+    stream.write_all(&message).map_err(|e| {
+        CommandHeartbeatFailure::Retryable(format!("command heartbeat write failed: {e}"))
+    })?;
 
     let mut reply = [0u8; 0x80];
     let n = read_at_least(
@@ -743,20 +783,33 @@ fn send_command_heartbeat(
         &mut reply,
         COMMAND_REPLY_BODY_EXPECTED_LEN,
         COMMAND_HEARTBEAT_TIMEOUT,
-    )?;
+    )
+    .map_err(|e| {
+        CommandHeartbeatFailure::Retryable(format!(
+            "command heartbeat read failed: {}",
+            crate::error::concise_error(e)
+        ))
+    })?;
     if n == 0 {
-        return Err(EcError::Runtime(
+        return Err(CommandHeartbeatFailure::Retryable(
             "command heartbeat reply is empty or timed out".to_string(),
         ));
     }
-    let control = parse_command_control_reply(&reply[..n])?;
+    let control = parse_command_control_reply(&reply[..n]).map_err(|e| {
+        CommandHeartbeatFailure::Fatal(format!(
+            "command heartbeat parse failed: {}",
+            crate::error::concise_error(e)
+        ))
+    })?;
     match control {
         NativeControlType::Heartbeat => Ok(()),
-        NativeControlType::Shutdown | NativeControlType::IpKick => Err(EcError::Runtime(format!(
-            "command control requested tunnel shutdown: {}",
-            control.label()
-        ))),
-        control => Err(EcError::Runtime(format!(
+        NativeControlType::Shutdown | NativeControlType::IpKick => {
+            Err(CommandHeartbeatFailure::Fatal(format!(
+                "command control requested tunnel shutdown: {}",
+                control.label()
+            )))
+        }
+        control => Err(CommandHeartbeatFailure::Fatal(format!(
             "unexpected command heartbeat reply: {}({})",
             control.label(),
             control.code()
