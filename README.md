@@ -18,6 +18,7 @@ The project focuses on minimal scope, clear structure, and maintainability, with
 - Automatic route-table fetch and parse (`/por/rclist.csp`) for split-routing decisions
 - Route table based target decision (whitelist hit -> remote)
 - Configurable TCP fallback routing (non-whitelist -> direct or upstream proxy via `--fallback`)
+- Explicit tunnel degradation when the route table is unavailable
 - Structured, colorized logging that balances operational detail and visual clarity
 - Supported fallback proxy input formats:
 
@@ -87,6 +88,15 @@ SHIEP_PIPELINE_PASSWORD=<PASSWORD> ./SHIEP-Pipeline \
 - If no whitelist rule matches, TCP traffic goes fallback.
 - With `--fallback`, TCP traffic goes through the upstream proxy.
 - Without `--fallback`, TCP traffic goes direct.
+- If the route table cannot be fetched, routing degrades to tunnel mode and requests are marked as `route-table-unavailable`.
+- UDP ASSOCIATE is supported for remote routes. UDP fallback is not supported.
+
+## Logs
+
+- `[REQ]` shows local proxy requests and the selected route.
+- `[UPSTREAM]` shows upstream routing, DNS resolution, and route execution errors.
+- `[VPN]` shows tunnel setup, heartbeat policy, and tunnel shutdown reasons.
+- `[NETSTACK]` shows local network-stack runtime errors.
 
 ## Release Artifacts
 
