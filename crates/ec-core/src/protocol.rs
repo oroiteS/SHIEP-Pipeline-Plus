@@ -22,7 +22,7 @@ const STREAM_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const TX_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(12);
 const COMMAND_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const COMMAND_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
-const COMMAND_HEARTBEAT_RETRY_DELAY: Duration = Duration::from_secs(3);
+const COMMAND_HEARTBEAT_RETRY_DELAY: Duration = Duration::from_secs(1);
 const COMMAND_HEARTBEAT_FAILURE_LIMIT: u32 = 3;
 const RUNTIME_ALREADY_STARTED: &str = "tunnel runtime already started in this process";
 
