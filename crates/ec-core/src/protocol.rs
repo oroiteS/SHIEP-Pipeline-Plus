@@ -271,6 +271,15 @@ pub fn start_tunnel_runtime(server: &str, token: &str, ips: TunnelIps) -> EcResu
         handle_worker_exit(StreamProfile::Tx, result);
     });
 
+    output::info(
+        Scope::Protocol,
+        format_args!(
+            "command heartbeat: every {}s; retry {}s x{}",
+            output::value(COMMAND_HEARTBEAT_INTERVAL.as_secs()),
+            output::value(COMMAND_HEARTBEAT_RETRY_DELAY.as_secs()),
+            output::value(COMMAND_HEARTBEAT_FAILURE_LIMIT)
+        ),
+    );
     start_command_heartbeat(token_bytes);
 
     Ok(())
