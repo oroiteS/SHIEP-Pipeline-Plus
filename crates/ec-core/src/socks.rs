@@ -26,11 +26,8 @@ pub fn serve(bind_addr: &str, fallback_proxy: Option<&str>) -> EcResult<()> {
     log_socks_startup(normalized.as_str(), fallback_proxy.as_ref());
     spawn_accept_loop(listener, fallback_proxy.clone());
 
-    let reason = crate::protocol::wait_tunnel_fatal_reason();
-    Err(EcError::Runtime(format!(
-        "tunnel closed: {}",
-        crate::error::concise_message(reason)
-    )))
+    let _reason = crate::protocol::wait_tunnel_fatal_reason();
+    Err(EcError::Runtime("tunnel closed".to_string()))
 }
 
 fn normalize_bind_addr(bind_addr: &str) -> String {
