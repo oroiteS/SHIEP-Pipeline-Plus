@@ -48,6 +48,17 @@ enum CommandHeartbeatOutcome {
     Fatal(String),
 }
 
+enum StreamOpenError {
+    Retryable(EcError),
+    Fatal(EcError),
+}
+
+enum StreamAckReply {
+    Expected,
+    UnexpectedControl(NativeControlType),
+    NonControl,
+}
+
 #[derive(Clone, Copy)]
 struct StreamOpenRetry {
     first_attempt: usize,
@@ -102,6 +113,15 @@ impl StreamOpenKind {
     }
 }
 
+impl StreamOpenKind {
+    fn action_label(self) -> &'static str {
+        match self {
+            Self::First => "open",
+            Self::Resume => "resume",
+        }
+    }
+}
+
 impl StreamOpenRetry {
     fn first_open() -> Self {
         Self {
@@ -117,6 +137,28 @@ impl StreamOpenRetry {
             delay_first_attempt: true,
             phase: "reconnect",
         }
+    }
+}
+
+impl StreamOpenError {
+    fn retryable(err: EcError) -> Self {
+        Self::Retryable(err)
+    }
+
+    fn error(&self) -> &EcError {
+        match self {
+            Self::Retryable(err) | Self::Fatal(err) => err,
+        }
+    }
+
+    fn into_error(self) -> EcError {
+        match self {
+            Self::Retryable(err) | Self::Fatal(err) => err,
+        }
+    }
+
+    fn is_fatal(&self) -> bool {
+        matches!(self, Self::Fatal(_))
     }
 }
 
@@ -549,8 +591,11 @@ fn open_data_stream_with_retries(
         match open_data_stream(authority, host, token, ip_rev, profile, kind) {
             Ok(stream) => return Ok(stream),
             Err(err) => {
-                let concise = crate::error::concise_error(&err);
+                let concise = crate::error::concise_error(err.error());
                 debug_stream_open_failure(profile, kind, retry.phase, attempt, concise.as_str());
+                if err.is_fatal() {
+                    return Err(err.into_error());
+                }
                 last_error = Some(concise);
                 attempt += 1;
             }
@@ -575,64 +620,120 @@ fn open_data_stream(
     ip_rev: &[u8; 4],
     profile: StreamProfile,
     kind: StreamOpenKind,
-) -> EcResult<SslStream<TcpStream>> {
-    let mut stream = connect_vpn_tls(authority, host)?;
+) -> Result<SslStream<TcpStream>, StreamOpenError> {
+    let mut stream = connect_vpn_tls(authority, host).map_err(StreamOpenError::retryable)?;
     let op_code = profile.op_code(kind);
     let expected_ack = profile.expected_ack();
 
     let message = build_stream_handshake_message(op_code, token, ip_rev);
-    stream
-        .write_all(&message)
-        .map_err(|e| EcError::Runtime(format!("stream handshake write failed: {e}")))?;
+    stream.write_all(&message).map_err(|e| {
+        StreamOpenError::retryable(EcError::Runtime(format!(
+            "stream handshake write failed: {e}"
+        )))
+    })?;
 
     let mut reply = [0u8; 1500];
-    let n = read_stream_once(&mut stream, &mut reply, STREAM_HANDSHAKE_TIMEOUT)?;
+    let n = read_stream_once(&mut stream, &mut reply, STREAM_HANDSHAKE_TIMEOUT)
+        .map_err(StreamOpenError::retryable)?;
     if n == 0 {
         let op = format!("0x{op_code:02x}");
-        return Err(EcError::Runtime(format!(
+        return Err(StreamOpenError::retryable(EcError::Runtime(format!(
             "{} stream handshake reply is empty or timed out; op: {}",
             profile.label(),
             op,
-        )));
+        ))));
     }
-    validate_stream_ack(profile, op_code, expected_ack, &reply[..n])?;
+    validate_stream_ack(profile, kind, op_code, expected_ack, &reply[..n])?;
 
-    clear_data_stream_read_timeout(&stream, profile)?;
+    clear_data_stream_read_timeout(&stream, profile).map_err(StreamOpenError::retryable)?;
     Ok(stream)
 }
 
 fn validate_stream_ack(
     profile: StreamProfile,
+    kind: StreamOpenKind,
     op_code: u8,
     expected_ack: NativeControlType,
     reply: &[u8],
-) -> EcResult<()> {
-    match parse_native_control_frame(reply) {
-        Some(control) if control == expected_ack => Ok(()),
-        Some(control) => {
+) -> Result<(), StreamOpenError> {
+    match classify_stream_ack_reply(reply, expected_ack) {
+        StreamAckReply::Expected => Ok(()),
+        StreamAckReply::UnexpectedControl(control) => {
             debug_stream_ack_reply(profile, op_code, reply);
-            Err(unexpected_stream_ack_err(
-                profile,
-                op_code,
-                expected_ack,
-                format_args!("{}({})", control.label(), control.code()),
-            ))
+            let err = if is_terminal_stream_control(control) {
+                StreamOpenError::Fatal(stream_control_rejected_err(profile, kind, op_code, control))
+            } else {
+                StreamOpenError::Retryable(unexpected_stream_ack_err(
+                    profile,
+                    op_code,
+                    expected_ack,
+                    format_args!("{}({})", control.label(), control.code()),
+                ))
+            };
+            Err(err)
         }
-        None if legacy_stream_ack_matches(reply, expected_ack) => Ok(()),
-        None => {
+        StreamAckReply::NonControl => {
             debug_stream_ack_reply(profile, op_code, reply);
-            Err(unexpected_stream_ack_err(
+            Err(StreamOpenError::Retryable(unexpected_stream_ack_err(
                 profile,
                 op_code,
                 expected_ack,
                 format_args!("non-control-frame len={}", reply.len()),
-            ))
+            )))
         }
     }
 }
 
+fn classify_stream_ack_reply(reply: &[u8], expected_ack: NativeControlType) -> StreamAckReply {
+    if let Some(control) = parse_native_control_frame(reply) {
+        return if control == expected_ack {
+            StreamAckReply::Expected
+        } else {
+            StreamAckReply::UnexpectedControl(control)
+        };
+    }
+
+    if legacy_stream_ack_matches(reply, expected_ack) {
+        return StreamAckReply::Expected;
+    }
+
+    if reply.len() == COMMAND_REPLY_BODY_EXPECTED_LEN
+        && let Ok(control) = parse_command_control_reply(reply)
+    {
+        return if control == expected_ack {
+            StreamAckReply::Expected
+        } else {
+            StreamAckReply::UnexpectedControl(control)
+        };
+    }
+
+    StreamAckReply::NonControl
+}
+
 fn legacy_stream_ack_matches(reply: &[u8], expected_ack: NativeControlType) -> bool {
     reply.first().copied() == u8::try_from(expected_ack.code()).ok()
+}
+
+fn is_terminal_stream_control(control: NativeControlType) -> bool {
+    matches!(
+        control,
+        NativeControlType::Shutdown | NativeControlType::IpKick | NativeControlType::IpConflict
+    )
+}
+
+fn stream_control_rejected_err(
+    profile: StreamProfile,
+    kind: StreamOpenKind,
+    op_code: u8,
+    control: NativeControlType,
+) -> EcError {
+    EcError::Runtime(format!(
+        "{} stream {} rejected by server: {}({}); op: 0x{op_code:02x}",
+        profile.label(),
+        kind.action_label(),
+        control.label(),
+        control.code(),
+    ))
 }
 
 fn unexpected_stream_ack_err(
@@ -1022,12 +1123,26 @@ mod tests {
         frame[0..4].copy_from_slice(b"AABB");
         frame[4..8].copy_from_slice(&1u32.to_le_bytes());
         assert!(
-            validate_stream_ack(StreamProfile::Rx, 0x06, NativeControlType::RxAck, &frame).is_ok()
+            validate_stream_ack(
+                StreamProfile::Rx,
+                StreamOpenKind::First,
+                0x06,
+                NativeControlType::RxAck,
+                &frame
+            )
+            .is_ok()
         );
 
         frame[4..8].copy_from_slice(&2u32.to_le_bytes());
         assert!(
-            validate_stream_ack(StreamProfile::Tx, 0x05, NativeControlType::TxAck, &frame).is_ok()
+            validate_stream_ack(
+                StreamProfile::Tx,
+                StreamOpenKind::First,
+                0x05,
+                NativeControlType::TxAck,
+                &frame
+            )
+            .is_ok()
         );
     }
 
@@ -1037,18 +1152,47 @@ mod tests {
         frame[0..4].copy_from_slice(b"AABB");
         frame[4..8].copy_from_slice(&2u32.to_le_bytes());
         assert!(
-            validate_stream_ack(StreamProfile::Rx, 0x06, NativeControlType::RxAck, &frame).is_err()
+            validate_stream_ack(
+                StreamProfile::Rx,
+                StreamOpenKind::First,
+                0x06,
+                NativeControlType::RxAck,
+                &frame
+            )
+            .is_err()
         );
 
         let legacy_marker_reply = [0x01u8, 0, 0, 0, 0, 0, 0, 0];
         assert!(
             validate_stream_ack(
                 StreamProfile::Rx,
+                StreamOpenKind::First,
                 0x06,
                 NativeControlType::RxAck,
                 &legacy_marker_reply
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn stream_ack_classifies_code_style_shutdown_as_fatal() {
+        let mut reply = [0u8; 36];
+        reply[0..4].copy_from_slice(&8u32.to_le_bytes());
+        let err = validate_stream_ack(
+            StreamProfile::Rx,
+            StreamOpenKind::Resume,
+            0x07,
+            NativeControlType::RxAck,
+            &reply,
+        )
+        .unwrap_err();
+
+        assert!(err.is_fatal());
+        assert!(
+            err.error()
+                .to_string()
+                .contains("rx stream resume rejected by server: shutdown(8)")
         );
     }
 
