@@ -3,11 +3,12 @@
 SHIEP-Pipeline is a **Rust CLI-only** EasyConnect implementation for SHIEP.
 The project focuses on minimal scope, clear structure, and maintainability, with no GUI.
 
-## Design Goal
+## Project Focus
 
 - Minimal CLI-only
-- Reproduce the core connection flow first
-- Refactor and organize code without adding unrelated features
+- SHIEP-oriented EasyConnect protocol behavior
+- Route-table based split routing
+- Clear runtime logs and maintainable structure
 
 ## Current Capabilities
 
@@ -16,58 +17,54 @@ The project focuses on minimal scope, clear structure, and maintainability, with
 - VPN tunnel setup with RX/TX runtime
 - Local SOCKS5 listener (CONNECT and UDP ASSOCIATE for remote routes, no auth)
 - Automatic route-table fetch and parse (`/por/rclist.csp`) for split-routing decisions
-- Route table based target decision (whitelist hit -> remote)
+- Route table based target decisions using whitelist rules, DNS records, DNS server lookup, CNAMEs, and IP-range matches
 - Configurable TCP fallback routing (non-whitelist -> direct or upstream proxy via `--fallback`)
 - Explicit tunnel degradation when the route table is unavailable
 - Structured, colorized logging that balances operational detail and visual clarity
-- Supported fallback proxy input formats:
-
-| Input format | Interpreted as |
-| --- | --- |
-| `socks5://host:port` | SOCKS5 proxy |
-| `socks5h://host:port` | SOCKS5 proxy with remote DNS |
-| `http://host:port` | HTTP CONNECT proxy |
-| `host:port` | Plain host/port, interpreted as `socks5h://host:port` |
-
-## Project Structure
-
-- `crates/ec-cli`: CLI entry point and argument parsing
-- `crates/ec-core`: Core implementation (login, protocol, tunnel, netstack, route-table parsing, and forwarding)
-- `.github/workflows/build-release.yml`: Build and upload release artifacts on `release.published`
 
 ## Quick Start
 
-### Option A: Download From Release
+### 1. Download From Release
 
 1. Go to the latest release page on GitHub.
 2. Download the artifact for your platform:
    - Linux: `SHIEP-Pipeline-<tag>-linux-x64`
    - macOS (Apple Silicon): `SHIEP-Pipeline-<tag>-macos-arm64`
    - Windows: `SHIEP-Pipeline-<tag>-windows-x64.exe`
-3. Run it with required arguments:
+3. Run it with required arguments.
 
 ```bash
+chmod +x ./SHIEP-Pipeline
 SHIEP_PIPELINE_PASSWORD=<PASSWORD> ./SHIEP-Pipeline --server <VPN_SERVER> --username <USERNAME>
 ```
 
-### Option B: Run From Source
-
-1. Install Rust stable
-2. Install OpenSSL development dependencies (your system may already have them)
-3. Run with Cargo
+Or pass the password directly. This is not recommended because process arguments may be visible:
 
 ```bash
-SHIEP_PIPELINE_PASSWORD=<PASSWORD> cargo run -p ec-cli -- --server <VPN_SERVER> --username <USERNAME>
+./SHIEP-Pipeline --server <VPN_SERVER> --username <USERNAME> --password <PASSWORD>
 ```
 
-Default listener address: `127.0.0.1:1080`.
+### 2. Use With Browser
+
+Recommended browser-side companion: [ZeroOmega](https://github.com/zero-peak/ZeroOmega).
+
+ZeroOmega is a Manifest V3 compatible fork of SwitchyOmega for managing and switching browser proxy profiles. It is useful when you want selected browser traffic to enter SHIEP-Pipeline while keeping the system proxy untouched.
+
+Typical setup:
+
+- Start SHIEP-Pipeline with the default listener, or choose one with `--bind`.
+- In ZeroOmega, create a SOCKS5 proxy profile.
+- Set the proxy server to `127.0.0.1` and the port to the SHIEP-Pipeline listener port, default `1080`.
+- Use ZeroOmega rules or manual switching to decide which browser traffic is sent into SHIEP-Pipeline.
+
+SHIEP-Pipeline still performs its own route-table based split-routing after traffic reaches the local SOCKS5 listener.
 
 ## CLI Arguments
 
 - `--server` required, VPN server address
 - `--username` required, username
 - `SHIEP_PIPELINE_PASSWORD` required unless `--password` is provided
-- `--password` optional, VPN password; not recommended because process arguments may be visible
+- `--password` optional, VPN password; usable as an alternative to `SHIEP_PIPELINE_PASSWORD`, but not recommended because process arguments may be visible
 - `--bind` optional, local bind address, default `127.0.0.1:1080`
 - `--fallback` optional, fallback upstream proxy address
 
@@ -84,23 +81,64 @@ SHIEP_PIPELINE_PASSWORD=<PASSWORD> ./SHIEP-Pipeline \
 ## Routing and Fallback
 
 - The app fetches and parses route rules from `/por/rclist.csp`.
-- If a whitelist rule matches, traffic goes remote (preferring mapped DNS IP).
+- If a route-table rule or trusted route-table DNS resolution chain matches, traffic goes remote.
 - If no whitelist rule matches, TCP traffic goes fallback.
 - With `--fallback`, TCP traffic goes through the upstream proxy.
 - Without `--fallback`, TCP traffic goes direct.
 - If the route table cannot be fetched, routing degrades to tunnel mode and requests are marked as `route-table-unavailable`.
 - UDP ASSOCIATE is supported for remote routes. UDP fallback is not supported.
 
+Supported fallback proxy input formats:
+
+| Input format | Interpreted as |
+| --- | --- |
+| `socks5://host:port` | SOCKS5 proxy |
+| `socks5h://host:port` | SOCKS5 proxy with remote DNS |
+| `http://host:port` | HTTP CONNECT proxy |
+| `host:port` | Plain host/port, interpreted as `socks5h://host:port` |
+
 ## Logs
 
+- `[APP]` shows startup, route-table status, fallback mode, and listener status.
+- `[LOGIN]` shows login and session acquisition.
+- `[AGENT]` shows agent-token acquisition.
 - `[REQ]` shows local proxy requests and the selected route.
 - `[UPSTREAM]` shows upstream routing, DNS resolution, and route execution errors.
 - `[VPN]` shows tunnel setup, heartbeat policy, and tunnel shutdown reasons.
 - `[NETSTACK]` shows local network-stack runtime errors.
+- `[CLI]` shows top-level configuration and runtime errors.
+
+## Development
+
+### Run From Source
+
+1. Install Rust stable
+2. Install OpenSSL development dependencies (your system may already have them)
+3. Run with Cargo
+
+```bash
+SHIEP_PIPELINE_PASSWORD=<PASSWORD> cargo run -p ec-cli -- --server <VPN_SERVER> --username <USERNAME>
+```
+
+### Diagnostics
+
+Debug builds expose an additional `--debug` flag:
+
+```bash
+SHIEP_PIPELINE_PASSWORD=<PASSWORD> cargo run -p ec-cli -- --server <VPN_SERVER> --username <USERNAME> --debug
+```
+
+This enables verbose protocol diagnostics such as TLS summaries, stream reconnect attempts, and raw abnormal protocol replies. Release builds do not include this flag or the diagnostic strings.
+
+## Project Structure
+
+- `crates/ec-cli`: CLI entry point and argument parsing
+- `crates/ec-core`: Core implementation (login, protocol, tunnel, netstack, route-table parsing, and forwarding)
+- `.github/workflows/build-release.yml`: Build and upload release artifacts on `release.published`
 
 ## Release Artifacts
 
-The workflow triggers on GitHub Release `published` and uploads:
+The workflow triggers on GitHub Release `published` and uploads platform-specific binaries:
 
 - Linux: `SHIEP-Pipeline-<tag>-linux-x64`
 - macOS (Apple Silicon): `SHIEP-Pipeline-<tag>-macos-arm64`
