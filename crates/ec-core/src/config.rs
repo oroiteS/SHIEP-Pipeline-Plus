@@ -54,7 +54,9 @@ impl AppConfig {
         require_non_empty_trimmed(self.server.as_str(), "server is required")?;
         require_non_empty_trimmed(self.username.as_str(), "username is required")?;
         if self.password.is_empty() {
-            return Err(EcError::InvalidConfig("password is required"));
+            return Err(EcError::InvalidConfig(
+                "password is required; pass --password or set SHIEP_PIPELINE_PASSWORD",
+            ));
         }
         require_non_empty_trimmed(self.socks_bind.as_str(), "bind is required")?;
         Ok(())
@@ -102,6 +104,22 @@ mod tests {
             None,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn password_error_points_to_supported_inputs() {
+        let err = AppConfig::new(
+            "vpn.example.com:443".to_string(),
+            "alice".to_string(),
+            "".to_string(),
+            "127.0.0.1:1080".to_string(),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("--password"));
+        assert!(err.contains("SHIEP_PIPELINE_PASSWORD"));
     }
 
     #[test]
