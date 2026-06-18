@@ -9,6 +9,8 @@ pub struct EasyConnectApp {
 
 impl EasyConnectApp {
     pub fn new(config: AppConfig) -> Self {
+        #[cfg(debug_assertions)]
+        output::set_debug_enabled(config.debug_enabled);
         Self { config }
     }
 

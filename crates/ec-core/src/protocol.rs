@@ -92,6 +92,16 @@ impl StreamProfile {
     }
 }
 
+#[cfg(debug_assertions)]
+impl StreamOpenKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::First => "first",
+            Self::Resume => "resume",
+        }
+    }
+}
+
 impl StreamOpenRetry {
     fn first_open() -> Self {
         Self {
@@ -430,7 +440,9 @@ fn open_command_stream_once(
         ));
     }
 
-    let send_ip = parse_send_ip_reply(&reply[..total])?;
+    let send_ip = parse_send_ip_reply(&reply[..total]).inspect_err(|_| {
+        debug_protocol_hex("debug: SEND_IP raw reply", &reply[..total]);
+    })?;
     hold_command_stream(stream)?;
     Ok(send_ip.into())
 }
@@ -472,11 +484,14 @@ fn rx_worker_loop(
 fn should_forward_rx_payload(data: &[u8]) -> EcResult<bool> {
     match parse_native_control_frame(data) {
         Some(NativeControlType::RxAck) => Ok(false),
-        Some(control) => Err(EcError::Runtime(format!(
-            "unexpected rx control frame: {}({})",
-            control.label(),
-            control.code()
-        ))),
+        Some(control) => {
+            debug_protocol_hex("debug: unexpected rx control frame raw", data);
+            Err(EcError::Runtime(format!(
+                "unexpected rx control frame: {}({})",
+                control.label(),
+                control.code()
+            )))
+        }
         None => Ok(true),
     }
 }
@@ -530,10 +545,13 @@ fn open_data_stream_with_retries(
         if retry.delay_first_attempt || attempt > retry.first_attempt {
             thread::sleep(STREAM_RETRY_DELAY);
         }
+        debug_stream_open_attempt(profile, kind, retry.phase, attempt);
         match open_data_stream(authority, host, token, ip_rev, profile, kind) {
             Ok(stream) => return Ok(stream),
             Err(err) => {
-                last_error = Some(crate::error::concise_error(&err));
+                let concise = crate::error::concise_error(&err);
+                debug_stream_open_failure(profile, kind, retry.phase, attempt, concise.as_str());
+                last_error = Some(concise);
                 attempt += 1;
             }
         }
@@ -591,19 +609,25 @@ fn validate_stream_ack(
 ) -> EcResult<()> {
     match parse_native_control_frame(reply) {
         Some(control) if control == expected_ack => Ok(()),
-        Some(control) => Err(unexpected_stream_ack_err(
-            profile,
-            op_code,
-            expected_ack,
-            format_args!("{}({})", control.label(), control.code()),
-        )),
+        Some(control) => {
+            debug_stream_ack_reply(profile, op_code, reply);
+            Err(unexpected_stream_ack_err(
+                profile,
+                op_code,
+                expected_ack,
+                format_args!("{}({})", control.label(), control.code()),
+            ))
+        }
         None if legacy_stream_ack_matches(reply, expected_ack) => Ok(()),
-        None => Err(unexpected_stream_ack_err(
-            profile,
-            op_code,
-            expected_ack,
-            format_args!("non-control-frame len={}", reply.len()),
-        )),
+        None => {
+            debug_stream_ack_reply(profile, op_code, reply);
+            Err(unexpected_stream_ack_err(
+                profile,
+                op_code,
+                expected_ack,
+                format_args!("non-control-frame len={}", reply.len()),
+            ))
+        }
     }
 }
 
@@ -638,6 +662,112 @@ fn clear_data_stream_read_timeout(
     })
 }
 
+#[cfg(debug_assertions)]
+fn debug_stream_ack_reply(profile: StreamProfile, op_code: u8, reply: &[u8]) {
+    if !output::is_debug_enabled() {
+        return;
+    }
+
+    debug_protocol_hex(
+        format_args!(
+            "debug: unexpected {} ack raw reply; op: 0x{op_code:02x}",
+            profile.label()
+        ),
+        reply,
+    );
+}
+
+#[cfg(not(debug_assertions))]
+fn debug_stream_ack_reply(_: StreamProfile, _: u8, _: &[u8]) {}
+
+#[cfg(debug_assertions)]
+fn debug_stream_open_attempt(
+    profile: StreamProfile,
+    kind: StreamOpenKind,
+    phase: &str,
+    attempt: usize,
+) {
+    if !output::is_debug_enabled() {
+        return;
+    }
+    output::debug(
+        Scope::Protocol,
+        format_args!(
+            "debug: opening {} stream; phase: {}; kind: {}; op: 0x{:02x}; attempt: {}/{}",
+            profile.label(),
+            phase,
+            kind.label(),
+            profile.op_code(kind),
+            attempt + 1,
+            STREAM_RETRY_LIMIT + 1
+        ),
+    );
+}
+
+#[cfg(not(debug_assertions))]
+fn debug_stream_open_attempt(_: StreamProfile, _: StreamOpenKind, _: &str, _: usize) {}
+
+#[cfg(debug_assertions)]
+fn debug_stream_open_failure(
+    profile: StreamProfile,
+    kind: StreamOpenKind,
+    phase: &str,
+    attempt: usize,
+    reason: &str,
+) {
+    if !output::is_debug_enabled() {
+        return;
+    }
+    output::debug(
+        Scope::Protocol,
+        format_args!(
+            "debug: {} stream open failed; phase: {}; kind: {}; op: 0x{:02x}; attempt: {}/{}; reason: {}",
+            profile.label(),
+            phase,
+            kind.label(),
+            profile.op_code(kind),
+            attempt + 1,
+            STREAM_RETRY_LIMIT + 1,
+            reason
+        ),
+    );
+}
+
+#[cfg(not(debug_assertions))]
+fn debug_stream_open_failure(_: StreamProfile, _: StreamOpenKind, _: &str, _: usize, _: &str) {}
+
+#[cfg(debug_assertions)]
+fn debug_protocol_hex(label: impl std::fmt::Display, data: &[u8]) {
+    output::debug_hex(Scope::Protocol, label, data);
+}
+
+#[cfg(not(debug_assertions))]
+fn debug_protocol_hex(_: impl std::fmt::Display, _: &[u8]) {}
+
+#[cfg(debug_assertions)]
+fn debug_tls_summary(stream: &SslStream<TcpStream>) {
+    if !output::is_debug_enabled() {
+        return;
+    }
+
+    let ssl = stream.ssl();
+    let version = ssl.version_str();
+    let cipher = ssl
+        .current_cipher()
+        .map(|cipher| cipher.name())
+        .unwrap_or("unknown");
+    output::debug(
+        Scope::Protocol,
+        format_args!(
+            "debug: vpn tls handshake; version: {}; cipher: {}; sni: disabled; legacy: enabled",
+            version, cipher
+        ),
+    );
+}
+
+#[cfg(not(debug_assertions))]
+fn debug_tls_summary(_: &SslStream<TcpStream>) {}
+
 fn connect_vpn_tls(authority: &str, host: &str) -> EcResult<SslStream<TcpStream>> {
     let tcp = crate::tls::connect_vpn_tcp(authority, Duration::from_secs(5))?;
     let mut builder = crate::tls::new_insecure_connector_builder("vpn")?;
@@ -652,7 +782,9 @@ fn connect_vpn_tls(authority: &str, host: &str) -> EcResult<SslStream<TcpStream>
     })?;
     crate::protocol_session::apply_l3ip_session_id(&mut ssl, 0x0303)?;
 
-    crate::tls::handshake(ssl, tcp, "vpn")
+    let stream = crate::tls::handshake(ssl, tcp, "vpn")?;
+    debug_tls_summary(&stream);
+    Ok(stream)
 }
 
 fn hold_command_stream(stream: SslStream<TcpStream>) -> EcResult<()> {
@@ -753,13 +885,14 @@ fn send_command_heartbeat(
             "command heartbeat reply is empty or timed out".to_string(),
         ));
     }
-    classify_command_heartbeat_reply(&reply[..n]).into_result()
+    classify_command_heartbeat_reply(&reply[..n], &reply[..n]).into_result()
 }
 
-fn classify_command_heartbeat_reply(data: &[u8]) -> CommandHeartbeatOutcome {
+fn classify_command_heartbeat_reply(data: &[u8], raw: &[u8]) -> CommandHeartbeatOutcome {
     let control = match parse_command_control_reply(data) {
         Ok(control) => control,
         Err(err) => {
+            debug_protocol_hex("debug: command heartbeat parse-failed raw reply", raw);
             return CommandHeartbeatOutcome::Fatal(format!(
                 "command heartbeat parse failed: {}",
                 crate::error::concise_error(err)
@@ -770,16 +903,20 @@ fn classify_command_heartbeat_reply(data: &[u8]) -> CommandHeartbeatOutcome {
     match control {
         NativeControlType::Heartbeat => CommandHeartbeatOutcome::Ack,
         NativeControlType::Shutdown | NativeControlType::IpKick => {
+            debug_protocol_hex("debug: command heartbeat shutdown raw reply", raw);
             CommandHeartbeatOutcome::Fatal(format!(
                 "command control requested tunnel shutdown: {}",
                 control.label()
             ))
         }
-        control => CommandHeartbeatOutcome::Fatal(format!(
-            "unexpected command heartbeat reply: {}({})",
-            control.label(),
-            control.code()
-        )),
+        control => {
+            debug_protocol_hex("debug: unexpected command heartbeat raw reply", raw);
+            CommandHeartbeatOutcome::Fatal(format!(
+                "unexpected command heartbeat reply: {}({})",
+                control.label(),
+                control.code()
+            ))
+        }
     }
 }
 
@@ -955,13 +1092,13 @@ mod tests {
         let mut ack = [0u8; 36];
         ack[0..4].copy_from_slice(&15u32.to_le_bytes());
         assert!(matches!(
-            classify_command_heartbeat_reply(&ack),
+            classify_command_heartbeat_reply(&ack, &ack),
             CommandHeartbeatOutcome::Ack
         ));
 
         ack[0..4].copy_from_slice(&8u32.to_le_bytes());
         assert!(matches!(
-            classify_command_heartbeat_reply(&ack),
+            classify_command_heartbeat_reply(&ack, &ack),
             CommandHeartbeatOutcome::Fatal(reason) if reason.contains("shutdown")
         ));
     }
@@ -969,7 +1106,7 @@ mod tests {
     #[test]
     fn command_heartbeat_reply_classifies_parse_failure_as_fatal() {
         assert!(matches!(
-            classify_command_heartbeat_reply(&[]),
+            classify_command_heartbeat_reply(&[], &[]),
             CommandHeartbeatOutcome::Fatal(reason) if reason.contains("parse failed")
         ));
     }

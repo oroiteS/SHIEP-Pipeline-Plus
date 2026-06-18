@@ -1,6 +1,8 @@
 use anstyle::{Ansi256Color, Color, Style};
 use chrono::Local;
 use std::fmt::{Display, Formatter, Result as FmtResult};
+#[cfg(debug_assertions)]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const COLOR_VALUE: u8 = 183;
 const COLOR_WEAK: u8 = 95;
@@ -21,6 +23,9 @@ const COLOR_TS_CLOCK: u8 = 247;
 const COLOR_SUCCESS: u8 = 34;
 const COLOR_WARN: u8 = 220;
 const COLOR_ERROR: u8 = 196;
+
+#[cfg(debug_assertions)]
+static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy)]
 pub enum Scope {
@@ -103,6 +108,40 @@ pub fn error(scope: Scope, message: impl Display) {
 
 pub fn success(scope: Scope, message: impl Display) {
     log(Level::Success, scope, message);
+}
+
+#[cfg(debug_assertions)]
+pub fn set_debug_enabled(enabled: bool) {
+    DEBUG_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+#[cfg(debug_assertions)]
+pub fn is_debug_enabled() -> bool {
+    DEBUG_ENABLED.load(Ordering::Relaxed)
+}
+
+#[cfg(debug_assertions)]
+pub fn debug(scope: Scope, message: impl Display) {
+    if is_debug_enabled() {
+        log(Level::Info, scope, message);
+    }
+}
+
+#[cfg(debug_assertions)]
+pub fn debug_hex(scope: Scope, label: impl Display, data: &[u8]) {
+    if !is_debug_enabled() {
+        return;
+    }
+
+    let hex = data
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    debug(
+        scope,
+        format_args!("{label}; len: {}; hex: {hex}", data.len()),
+    );
 }
 
 pub fn value<T: Display>(value: T) -> Styled<T> {

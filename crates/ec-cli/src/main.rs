@@ -35,6 +35,14 @@ struct CliArgs {
         help = "Fallback upstream proxy address"
     )]
     fallback_proxy: Option<String>,
+
+    #[cfg(debug_assertions)]
+    #[arg(
+        long,
+        help_heading = "Debug",
+        help = "Enable verbose protocol diagnostics"
+    )]
+    debug: bool,
 }
 
 fn main() {
@@ -48,13 +56,7 @@ fn main() {
         ),
     );
 
-    let config = match AppConfig::new(
-        args.server,
-        args.username,
-        resolve_password(args.password),
-        args.socks_bind,
-        args.fallback_proxy,
-    ) {
+    let config = match build_config(args) {
         Ok(cfg) => cfg,
         Err(err) => {
             output::error(
@@ -92,6 +94,29 @@ fn resolve_password(arg_password: Option<String>) -> String {
     arg_password
         .or_else(|| std::env::var("SHIEP_PIPELINE_PASSWORD").ok())
         .unwrap_or_default()
+}
+
+#[cfg(debug_assertions)]
+fn build_config(args: CliArgs) -> ec_core::EcResult<AppConfig> {
+    AppConfig::new_with_debug(
+        args.server,
+        args.username,
+        resolve_password(args.password),
+        args.socks_bind,
+        args.fallback_proxy,
+        args.debug,
+    )
+}
+
+#[cfg(not(debug_assertions))]
+fn build_config(args: CliArgs) -> ec_core::EcResult<AppConfig> {
+    AppConfig::new(
+        args.server,
+        args.username,
+        resolve_password(args.password),
+        args.socks_bind,
+        args.fallback_proxy,
+    )
 }
 
 fn current_bin_name() -> Option<String> {

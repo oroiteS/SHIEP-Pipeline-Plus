@@ -7,6 +7,8 @@ pub struct AppConfig {
     pub password: String,
     pub socks_bind: String,
     pub fallback_proxy: Option<String>,
+    #[cfg(debug_assertions)]
+    pub debug_enabled: bool,
 }
 
 impl AppConfig {
@@ -27,8 +29,24 @@ impl AppConfig {
             password,
             socks_bind,
             fallback_proxy,
+            #[cfg(debug_assertions)]
+            debug_enabled: false,
         };
         cfg.validate()?;
+        Ok(cfg)
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn new_with_debug(
+        server: String,
+        username: String,
+        password: String,
+        socks_bind: String,
+        fallback_proxy: Option<String>,
+        debug_enabled: bool,
+    ) -> EcResult<Self> {
+        let mut cfg = Self::new(server, username, password, socks_bind, fallback_proxy)?;
+        cfg.debug_enabled = debug_enabled;
         Ok(cfg)
     }
 
