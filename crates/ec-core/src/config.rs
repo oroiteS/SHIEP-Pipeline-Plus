@@ -159,6 +159,12 @@ fn require_non_empty_trimmed(value: &str, error: &'static str) -> EcResult<()> {
 #[cfg(test)]
 mod tests {
     use super::{AppConfig, RememberedConfig, REMEMBERED_FILE};
+    use std::sync::{Mutex, OnceLock};
+
+    fn remembered_file_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
 
     #[test]
     fn remembered_config_roundtrip() {
@@ -222,6 +228,7 @@ mod tests {
 
     #[test]
     fn resolve_with_remember_explicit_args_saves_file() {
+        let _guard = remembered_file_lock();
         let _ = std::fs::remove_file(REMEMBERED_FILE);
         let result = AppConfig::resolve(
             Some("vpn.example.com:443".into()),
@@ -243,6 +250,7 @@ mod tests {
 
     #[test]
     fn resolve_with_remember_reads_saved_file() {
+        let _guard = remembered_file_lock();
         let _ = std::fs::remove_file(REMEMBERED_FILE);
         let saved = RememberedConfig {
             server: "saved.example.com".into(),
@@ -269,6 +277,7 @@ mod tests {
 
     #[test]
     fn resolve_with_remember_args_override_saved() {
+        let _guard = remembered_file_lock();
         let _ = std::fs::remove_file(REMEMBERED_FILE);
         let saved = RememberedConfig {
             server: "saved.example.com".into(),
