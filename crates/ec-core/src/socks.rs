@@ -26,11 +26,8 @@ pub fn serve(bind_addr: &str, fallback_proxy: Option<&str>) -> EcResult<()> {
     log_socks_startup(normalized.as_str(), fallback_proxy.as_ref());
     spawn_accept_loop(listener, fallback_proxy.clone());
 
-    let reason = crate::protocol::wait_tunnel_fatal_reason();
-    Err(EcError::Runtime(format!(
-        "tunnel terminated: {}",
-        crate::error::concise_message(reason)
-    )))
+    let _reason = crate::protocol::wait_tunnel_fatal_reason();
+    Err(EcError::Runtime("tunnel closed".to_string()))
 }
 
 fn normalize_bind_addr(bind_addr: &str) -> String {
@@ -52,7 +49,7 @@ fn log_socks_startup(bind_addr: &str, fallback_proxy: Option<&FallbackProxy>) {
     }
     output::info(
         Scope::App,
-        format_args!("socks listening on {}", output::value(bind_addr)),
+        format_args!("listening on {}", output::value(bind_addr)),
     );
 }
 
@@ -62,7 +59,7 @@ fn spawn_accept_loop(listener: TcpListener, fallback_proxy: Option<FallbackProxy
             let (stream, _peer) = match listener.accept() {
                 Ok(v) => v,
                 Err(err) => {
-                    output::warn(Scope::Rx, format_args!("accept failed: {err}"));
+                    output::warn(Scope::Req, format_args!("accept failed: {err}"));
                     continue;
                 }
             };
@@ -99,7 +96,7 @@ fn handle_connect(
 ) -> EcResult<()> {
     let target_display = target.to_string();
     let route = decide_route(&target, fallback_proxy);
-    output::info(Scope::Rx, &route.line);
+    output::info(Scope::Req, &route.line);
     execute_route(client, target_display.as_str(), route)
 }
 
@@ -136,7 +133,7 @@ fn handle_udp_associate(
         return Err(err);
     }
     output::info(
-        Scope::Rx,
+        Scope::Req,
         format_args!("UDP ASSOCIATE -> {}", output::value(relay_addr)),
     );
 
@@ -210,7 +207,7 @@ fn decide_route(target: &ConnectTarget, fallback_proxy: Option<&FallbackProxy>) 
             reason,
             fallback_proxy,
         ),
-        Err(err) => route_decision_legacy(target, target_display.as_str(), err),
+        Err(err) => route_decision_planner_error(target_display.as_str(), err),
     }
 }
 
@@ -238,13 +235,14 @@ fn decide_udp_route(
             log_resolved_route_source(target.host(), resolved_ip, rc_id, source);
             let decision =
                 route_decision_remote(target_display.as_str(), target_is_ip, dial, rc_name, source);
-            let transport = match resolve_dial_v4_from_str(decision_tunnel_target(&decision)) {
-                Ok(target) => UdpRouteTransport::Tunnel(target),
-                Err(err) => UdpRouteTransport::Unsupported(format!(
-                    "udp remote target is not ipv4: {}",
-                    crate::error::concise_error(err)
-                )),
-            };
+            let transport =
+                match decision_tunnel_target(&decision).and_then(resolve_dial_v4_from_str) {
+                    Ok(target) => UdpRouteTransport::Tunnel(target),
+                    Err(err) => UdpRouteTransport::Unsupported(format!(
+                        "udp remote target is not ipv4: {}",
+                        crate::error::concise_error(err)
+                    )),
+                };
             UdpRouteDecision {
                 line: decision.line,
                 path: decision.path,
@@ -270,18 +268,14 @@ fn decide_udp_route(
                 ),
             }
         }
-        Err(err) => UdpRouteDecision {
-            line: format!(
-                "{target_display}{}{}{}legacy",
-                output::weak(" -> "),
-                output::route_label(RouteKind::Remote),
-                output::weak(" -> "),
-            ),
-            path: format!("remote -> legacy planner-unavailable={err}"),
-            transport: UdpRouteTransport::Unsupported(
-                "udp legacy route is not supported".to_string(),
-            ),
-        },
+        Err(err) => {
+            let decision = route_decision_planner_error(target_display.as_str(), err);
+            UdpRouteDecision {
+                line: decision.line,
+                path: decision.path,
+                transport: UdpRouteTransport::Unsupported("route planner unavailable".to_string()),
+            }
+        }
     }
 }
 
@@ -338,11 +332,12 @@ fn log_resolved_route_source(
     }
 }
 
-fn decision_tunnel_target(decision: &RouteDecision) -> &str {
+fn decision_tunnel_target(decision: &RouteDecision) -> EcResult<&str> {
     match &decision.transport {
-        RouteTransport::Tunnel(dial) => dial,
-        RouteTransport::Direct(dial) => dial,
-        RouteTransport::Proxy(_, target) => target.host(),
+        RouteTransport::Tunnel(dial) => Ok(dial),
+        _ => Err(EcError::Runtime(
+            "route decision is not a tunnel transport".to_string(),
+        )),
     }
 }
 
@@ -378,7 +373,7 @@ fn run_udp_relay(
         }
         if !remember_udp_client(&client_peer, peer) {
             output::warn(
-                Scope::Rx,
+                Scope::Req,
                 format_args!(
                     "drop udp packet from unexpected peer {}",
                     output::value(peer)
@@ -391,7 +386,7 @@ fn run_udp_relay(
             Ok(packet) => packet,
             Err(err) => {
                 output::warn(
-                    Scope::Rx,
+                    Scope::Req,
                     format_args!(
                         "drop invalid udp packet: {}",
                         crate::error::concise_error(err)
@@ -401,14 +396,14 @@ fn run_udp_relay(
             }
         };
         let route = decide_udp_route(&packet.target, fallback_proxy);
-        output::info(Scope::Rx, &route.line);
+        output::info(Scope::Req, &route.line);
         match route.transport {
             UdpRouteTransport::Tunnel(target) => {
                 if let Err(err) = tunnel_sender.send(target, packet.payload) {
                     output::error(
                         Scope::Upstream,
                         format_args!(
-                            "{}; failed: {}",
+                            "{}; error: {}",
                             route.path,
                             crate::error::concise_error(err)
                         ),
@@ -418,7 +413,7 @@ fn run_udp_relay(
             UdpRouteTransport::Unsupported(reason) => {
                 output::error(
                     Scope::Upstream,
-                    format_args!("{}; failed: {reason}", route.path),
+                    format_args!("{}; error: {reason}", route.path),
                 );
             }
         }
@@ -522,27 +517,21 @@ fn route_decision_fallback(
             output::route_label(RouteKind::Fallback),
             output::route_label(RouteKind::Direct),
         ),
-        path: format!("fallback -> direct dial={dial}; reason: {reason}"),
+        path: format!("fallback -> direct; dial: {dial}; reason: {reason}"),
         transport: RouteTransport::Direct(dial),
     }
 }
 
-fn route_decision_legacy(
-    target: &ConnectTarget,
-    target_display: &str,
-    err: EcError,
-) -> RouteDecision {
+fn route_decision_planner_error(target_display: &str, err: EcError) -> RouteDecision {
     let arrow = output::weak(" -> ");
-    let lparen = output::weak("(");
-    let rparen = output::weak(")");
-    let legacy = target.to_socket_target();
+    let reason = crate::error::concise_error(err);
     RouteDecision {
         line: format!(
-            "{target_display}{arrow}{}{arrow}legacy{lparen}{legacy}{rparen}",
-            output::route_label(RouteKind::Remote),
+            "{target_display}{arrow}{}{arrow}route planner unavailable",
+            output::route_label(RouteKind::Fallback),
         ),
-        path: format!("remote -> legacy({legacy}) planner-unavailable={err}"),
-        transport: RouteTransport::Tunnel(legacy),
+        path: format!("fallback -> unavailable; reason: route planner unavailable: {reason}"),
+        transport: RouteTransport::Unsupported("route planner unavailable".to_string()),
     }
 }
 
@@ -573,6 +562,11 @@ fn execute_route(client: TcpStream, target_display: &str, route: RouteDecision) 
                 .map_err(|e| route_runtime_error(target_display, route_path, e))?;
             relay_direct_with_reply(client, conn, target_display, route_path)
         }
+        RouteTransport::Unsupported(reason) => Err(route_runtime_error(
+            target_display,
+            route_path,
+            reason.as_str(),
+        )),
     }
 }
 
@@ -582,7 +576,7 @@ fn route_runtime_error(
     err: impl std::fmt::Display,
 ) -> EcError {
     let cause = crate::error::concise_error(err);
-    EcError::Runtime(format!("{target_display} -> {route_path}; failed: {cause}"))
+    EcError::Runtime(format!("{target_display} -> {route_path}; error: {cause}"))
 }
 
 fn write_connect_ok_reply(
@@ -702,6 +696,7 @@ enum RouteTransport {
     Tunnel(String),
     Direct(String),
     Proxy(FallbackProxy, ConnectTarget),
+    Unsupported(String),
 }
 
 struct RouteDecision {

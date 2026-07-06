@@ -57,6 +57,14 @@ struct CliArgs {
         help = "Remember server and username for future use (password is never saved)"
     )]
     remember: bool,
+
+    #[cfg(debug_assertions)]
+    #[arg(
+        long,
+        help_heading = "Debug",
+        help = "Enable verbose protocol diagnostics"
+    )]
+    debug: bool,
 }
 
 fn main() {
@@ -70,16 +78,7 @@ fn main() {
         ),
     );
 
-    let config = match AppConfig::resolve(
-        args.server,
-        args.username,
-        resolve_password(args.password),
-        args.socks_bind,
-        args.fallback_proxy,
-        args.extra,
-        args.details,
-        args.remember,
-    ) {
+    let config = match build_config(args) {
         Ok(cfg) => cfg,
         Err(err) => {
             output::error(
@@ -119,6 +118,35 @@ fn resolve_password(arg_password: Option<String>) -> String {
     arg_password
         .or_else(|| std::env::var("SHIEP_PIPELINE_PASSWORD").ok())
         .unwrap_or_default()
+}
+
+#[cfg(debug_assertions)]
+fn build_config(args: CliArgs) -> ec_core::EcResult<AppConfig> {
+    AppConfig::resolve_with_debug(
+        args.server,
+        args.username,
+        resolve_password(args.password),
+        args.socks_bind,
+        args.fallback_proxy,
+        args.extra,
+        args.details,
+        args.remember,
+        args.debug,
+    )
+}
+
+#[cfg(not(debug_assertions))]
+fn build_config(args: CliArgs) -> ec_core::EcResult<AppConfig> {
+    AppConfig::resolve(
+        args.server,
+        args.username,
+        resolve_password(args.password),
+        args.socks_bind,
+        args.fallback_proxy,
+        args.extra,
+        args.details,
+        args.remember,
+    )
 }
 
 fn current_bin_name() -> Option<String> {

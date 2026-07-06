@@ -53,12 +53,14 @@ impl TxToken for TunnelTxToken {
                     if let Some(reason) = crate::protocol::tunnel_fatal_reason() {
                         output::warn(
                             Scope::Netstack,
-                            format_args!("tunnel tx channel closed after protocol stop: {reason}"),
+                            format_args!(
+                                "dropping outbound packet; tunnel already closed: {reason}"
+                            ),
                         );
                     } else {
                         output::warn(
                             Scope::Netstack,
-                            "tunnel tx channel closed; dropping outbound packets",
+                            "dropping outbound packet; tunnel channel is closed",
                         );
                     }
                 }

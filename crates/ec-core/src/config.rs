@@ -10,6 +10,8 @@ pub struct AppConfig {
     pub fallback_proxy: Option<String>,
     pub extra_ips: Vec<String>,
     pub details: bool,
+    #[cfg(debug_assertions)]
+    pub debug_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,6 +101,32 @@ impl AppConfig {
         )
     }
 
+    #[cfg(debug_assertions)]
+    pub fn resolve_with_debug(
+        server: Option<String>,
+        username: Option<String>,
+        password: String,
+        socks_bind: String,
+        fallback_proxy: Option<String>,
+        extra_ips: Vec<String>,
+        details: bool,
+        remember: bool,
+        debug_enabled: bool,
+    ) -> EcResult<Self> {
+        let mut cfg = Self::resolve(
+            server,
+            username,
+            password,
+            socks_bind,
+            fallback_proxy,
+            extra_ips,
+            details,
+            remember,
+        )?;
+        cfg.debug_enabled = debug_enabled;
+        Ok(cfg)
+    }
+
     pub fn new(
         server: String,
         username: String,
@@ -125,8 +153,34 @@ impl AppConfig {
             fallback_proxy,
             extra_ips,
             details,
+            #[cfg(debug_assertions)]
+            debug_enabled: false,
         };
         cfg.validate()?;
+        Ok(cfg)
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn new_with_debug(
+        server: String,
+        username: String,
+        password: String,
+        socks_bind: String,
+        fallback_proxy: Option<String>,
+        extra_ips: Vec<String>,
+        details: bool,
+        debug_enabled: bool,
+    ) -> EcResult<Self> {
+        let mut cfg = Self::new(
+            server,
+            username,
+            password,
+            socks_bind,
+            fallback_proxy,
+            extra_ips,
+            details,
+        )?;
+        cfg.debug_enabled = debug_enabled;
         Ok(cfg)
     }
 
@@ -134,7 +188,9 @@ impl AppConfig {
         require_non_empty_trimmed(self.server.as_str(), "server is required")?;
         require_non_empty_trimmed(self.username.as_str(), "username is required")?;
         if self.password.is_empty() {
-            return Err(EcError::InvalidConfig("password is required"));
+            return Err(EcError::InvalidConfig(
+                "password is required; pass --password or set SHIEP_PIPELINE_PASSWORD",
+            ));
         }
         require_non_empty_trimmed(self.socks_bind.as_str(), "bind is required")?;
         Ok(())
@@ -331,6 +387,24 @@ mod tests {
             false,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn password_error_points_to_supported_inputs() {
+        let err = AppConfig::new(
+            "vpn.example.com:443".to_string(),
+            "alice".to_string(),
+            "".to_string(),
+            "127.0.0.1:1080".to_string(),
+            None,
+            vec![],
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("--password"));
+        assert!(err.contains("SHIEP_PIPELINE_PASSWORD"));
     }
 
     #[test]

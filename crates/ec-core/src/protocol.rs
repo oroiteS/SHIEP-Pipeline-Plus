@@ -2,10 +2,11 @@ use crate::endpoint::parse_server;
 use crate::error::{EcError, EcResult};
 use crate::output::{self, Scope};
 use crate::protocol_wire::{
-    HEARTBEAT_OPAQUE_TAIL_LEN, HEARTBEAT_SESSION_LEN, NativeControlType, PROTOCOL_TOKEN_LEN,
-    TX_HEARTBEAT_DEFAULT_DST, build_query_ip_message, build_stream_handshake_message,
-    build_tx_heartbeat_packet, is_tx_heartbeat_echo_reply, parse_native_control_frame,
-    parse_protocol_token,
+    COMMAND_REPLY_BODY_EXPECTED_LEN, HEARTBEAT_OPAQUE_TAIL_LEN, HEARTBEAT_SESSION_LEN,
+    NativeControlType, PROTOCOL_TOKEN_LEN, SEND_IP_REPLY_EXPECTED_LEN, SendIpReply,
+    build_command_message, build_initial_query_ip_message, build_stream_handshake_message,
+    build_tx_heartbeat_packet, parse_command_control_reply, parse_native_control_frame,
+    parse_protocol_token, parse_send_ip_reply,
 };
 use openssl::ssl::SslStream;
 use std::io::{ErrorKind, Read, Write};
@@ -19,6 +20,10 @@ const STREAM_RETRY_DELAY: Duration = Duration::from_secs(1);
 const QUERY_IP_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 const STREAM_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const TX_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(12);
+const COMMAND_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const COMMAND_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
+const COMMAND_HEARTBEAT_RETRY_DELAY: Duration = Duration::from_secs(1);
+const COMMAND_HEARTBEAT_FAILURE_LIMIT: u32 = 3;
 const RUNTIME_ALREADY_STARTED: &str = "tunnel runtime already started in this process";
 
 #[derive(Clone, Copy)]
@@ -31,6 +36,27 @@ enum StreamProfile {
 enum StreamOpenKind {
     First,
     Resume,
+}
+
+enum CommandHeartbeatFailure {
+    Retryable(String),
+    Fatal(String),
+}
+
+enum CommandHeartbeatOutcome {
+    Ack,
+    Fatal(String),
+}
+
+enum StreamOpenError {
+    Retryable(EcError),
+    Fatal(EcError),
+}
+
+enum StreamAckReply {
+    Expected,
+    UnexpectedControl(NativeControlType),
+    NonControl,
 }
 
 #[derive(Clone, Copy)]
@@ -77,6 +103,25 @@ impl StreamProfile {
     }
 }
 
+#[cfg(debug_assertions)]
+impl StreamOpenKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::First => "first",
+            Self::Resume => "resume",
+        }
+    }
+}
+
+impl StreamOpenKind {
+    fn action_label(self) -> &'static str {
+        match self {
+            Self::First => "open",
+            Self::Resume => "resume",
+        }
+    }
+}
+
 impl StreamOpenRetry {
     fn first_open() -> Self {
         Self {
@@ -92,6 +137,28 @@ impl StreamOpenRetry {
             delay_first_attempt: true,
             phase: "reconnect",
         }
+    }
+}
+
+impl StreamOpenError {
+    fn retryable(err: EcError) -> Self {
+        Self::Retryable(err)
+    }
+
+    fn error(&self) -> &EcError {
+        match self {
+            Self::Retryable(err) | Self::Fatal(err) => err,
+        }
+    }
+
+    fn into_error(self) -> EcError {
+        match self {
+            Self::Retryable(err) | Self::Fatal(err) => err,
+        }
+    }
+
+    fn is_fatal(&self) -> bool {
+        matches!(self, Self::Fatal(_))
     }
 }
 
@@ -111,21 +178,21 @@ impl TunnelRuntimeParams {
         authority: String,
         host: String,
         token: [u8; PROTOCOL_TOKEN_LEN],
-        assigned_ip: [u8; 4],
+        ips: TunnelIps,
     ) -> Self {
-        let heartbeat_tail = new_heartbeat_tail(&token, assigned_ip);
+        let heartbeat_tail = new_heartbeat_tail(&token, ips.assigned_ip);
         Self {
             authority,
             host,
             token,
-            assigned_ip,
+            assigned_ip: ips.assigned_ip,
             ip_rev: [
-                assigned_ip[3],
-                assigned_ip[2],
-                assigned_ip[1],
-                assigned_ip[0],
+                ips.assigned_ip[3],
+                ips.assigned_ip[2],
+                ips.assigned_ip[1],
+                ips.assigned_ip[0],
             ],
-            heartbeat_dst: TX_HEARTBEAT_DEFAULT_DST,
+            heartbeat_dst: ips.lan_ip,
             heartbeat_tail,
         }
     }
@@ -167,16 +234,6 @@ impl TunnelRuntimeParams {
         )
     }
 
-    fn is_tx_heartbeat_echo_reply(&self, data: &[u8]) -> bool {
-        is_tx_heartbeat_echo_reply(
-            data,
-            self.assigned_ip,
-            self.heartbeat_dst,
-            self.heartbeat_session(),
-            &self.heartbeat_tail,
-        )
-    }
-
     fn heartbeat_session(&self) -> &[u8; HEARTBEAT_SESSION_LEN] {
         self.token[32..48]
             .try_into()
@@ -184,11 +241,36 @@ impl TunnelRuntimeParams {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TunnelIps {
+    pub assigned_ip: [u8; 4],
+    pub lan_ip: [u8; 4],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CommandStreamInit {
+    pub ips: TunnelIps,
+}
+
+impl From<SendIpReply> for TunnelIps {
+    fn from(reply: SendIpReply) -> Self {
+        Self {
+            assigned_ip: reply.assigned_ip,
+            lan_ip: reply.lan_ip,
+        }
+    }
+}
+
+impl From<SendIpReply> for CommandStreamInit {
+    fn from(reply: SendIpReply) -> Self {
+        Self { ips: reply.into() }
+    }
+}
+
 static TX_PACKET_SENDER: OnceLock<mpsc::Sender<Vec<u8>>> = OnceLock::new();
-// This is not EasyConnect's command socket or keepalive channel. SHIEP's server
-// still appears to require the query-ip TLS context to remain open before later
-// L3 RX/TX streams are accepted.
-static QUERY_IP_STREAM_HOLDER: OnceLock<Mutex<Option<SslStream<TcpStream>>>> = OnceLock::new();
+// L3IP op0/SEND_IP leaves a command/control stream open. Official op3
+// heartbeat must stay on that same stream instead of the RX/TX data streams.
+static COMMAND_STREAM_HOLDER: OnceLock<Mutex<Option<SslStream<TcpStream>>>> = OnceLock::new();
 static RX_PACKET_RECEIVER: OnceLock<Mutex<Option<mpsc::Receiver<Vec<u8>>>>> = OnceLock::new();
 static TUNNEL_FATAL_STATE: OnceLock<TunnelFatalState> = OnceLock::new();
 
@@ -197,19 +279,19 @@ struct TunnelFatalState {
     cv: Condvar,
 }
 
-pub fn query_assigned_ip(server: &str, token: &str) -> EcResult<[u8; 4]> {
+pub fn open_command_stream(server: &str, token: &str) -> EcResult<CommandStreamInit> {
     let (authority, host) = parse_server(server)?;
     let token_bytes = parse_protocol_token(token)?;
 
-    query_assigned_ip_once(&authority, &host, &token_bytes)
+    open_command_stream_once(&authority, &host, &token_bytes)
 }
 
-pub fn start_tunnel_runtime(server: &str, token: &str, assigned_ip: [u8; 4]) -> EcResult<()> {
+pub fn start_tunnel_runtime(server: &str, token: &str, ips: TunnelIps) -> EcResult<()> {
     clear_tunnel_fatal_reason();
 
     let (authority, host) = parse_server(server)?;
-    let runtime =
-        TunnelRuntimeParams::new(authority, host, parse_protocol_token(token)?, assigned_ip);
+    let token_bytes = parse_protocol_token(token)?;
+    let runtime = TunnelRuntimeParams::new(authority, host, token_bytes, ips);
 
     let rx_stream = runtime.open_stream(StreamProfile::Rx)?;
     output::success(Scope::Protocol, "RX handshake successful");
@@ -230,6 +312,24 @@ pub fn start_tunnel_runtime(server: &str, token: &str, assigned_ip: [u8; 4]) -> 
         let result = tx_worker_loop(runtime, tx_stream, tx_receiver);
         handle_worker_exit(StreamProfile::Tx, result);
     });
+
+    output::info(
+        Scope::Protocol,
+        format_args!(
+            "data heartbeat: TX every {}s",
+            output::value(TX_HEARTBEAT_INTERVAL.as_secs())
+        ),
+    );
+    output::info(
+        Scope::Protocol,
+        format_args!(
+            "command heartbeat: every {}s; retry {}s x{}",
+            output::value(COMMAND_HEARTBEAT_INTERVAL.as_secs()),
+            output::value(COMMAND_HEARTBEAT_RETRY_DELAY.as_secs()),
+            output::value(COMMAND_HEARTBEAT_FAILURE_LIMIT)
+        ),
+    );
+    start_command_heartbeat(token_bytes);
 
     Ok(())
 }
@@ -302,6 +402,10 @@ pub(crate) fn wait_tunnel_fatal_reason() -> String {
     }
 }
 
+pub(crate) fn record_runtime_fatal(reason: impl Into<String>) {
+    record_tunnel_fatal_reason(reason.into());
+}
+
 fn clear_tunnel_fatal_reason() {
     let state = tunnel_fatal_state();
     if let Ok(mut guard) = state.reason.lock() {
@@ -321,9 +425,12 @@ fn record_tunnel_fatal_reason(reason: String) {
 
 fn worker_exit_detail(profile: StreamProfile, result: EcResult<()>) -> String {
     match result {
-        Ok(()) => format!("{} worker exited unexpectedly", profile.label()),
+        Ok(()) => format!(
+            "stream closed: {}; reason: exited unexpectedly",
+            profile.label()
+        ),
         Err(err) => format!(
-            "{} worker stopped: {}",
+            "stream closed: {}; reason: {}",
             profile.label(),
             crate::error::concise_error(err)
         ),
@@ -343,50 +450,43 @@ fn tunnel_fatal_state() -> &'static TunnelFatalState {
     })
 }
 
-fn query_assigned_ip_once(
+fn open_command_stream_once(
     authority: &str,
     host: &str,
     token_bytes: &[u8; PROTOCOL_TOKEN_LEN],
-) -> EcResult<[u8; 4]> {
+) -> EcResult<CommandStreamInit> {
     let mut stream = connect_vpn_tls(authority, host)?;
 
-    let message = build_query_ip_message(token_bytes);
+    let message = build_initial_query_ip_message(token_bytes);
     stream
         .write_all(&message)
-        .map_err(|e| EcError::Runtime(format!("query-ip write failed: {e}")))?;
+        .map_err(|e| EcError::Runtime(format!("SEND_IP write failed: {e}")))?;
 
     let mut reply = [0u8; 0x80];
-    let mut total = 0usize;
-    let deadline = Instant::now() + QUERY_IP_REPLY_TIMEOUT;
-    while total < reply.len() && Instant::now() < deadline {
-        match stream.read(&mut reply[total..]) {
-            Ok(0) => break,
-            Ok(n) => {
-                total += n;
-                if total >= 8 {
-                    break;
-                }
-            }
-            Err(e) if is_wouldblock_or_timeout(&e) => continue,
-            Err(e) => return Err(EcError::Runtime(format!("query-ip read failed: {e}"))),
-        }
+    let total = read_at_least(
+        &mut stream,
+        &mut reply,
+        SEND_IP_REPLY_EXPECTED_LEN,
+        QUERY_IP_REPLY_TIMEOUT,
+    )
+    .map_err(|e| {
+        EcError::Runtime(format!(
+            "SEND_IP read failed: {}",
+            crate::error::concise_error(e)
+        ))
+    })?;
+
+    if total == 0 {
+        return Err(EcError::Runtime(
+            "SEND_IP reply is empty or timed out".to_string(),
+        ));
     }
 
-    if total < 8 {
-        return Err(EcError::Runtime(format!(
-            "query-ip reply too short or timeout: {total} bytes"
-        )));
-    }
-    if reply[0] != 0x00 {
-        return Err(EcError::Runtime(format!(
-            "unexpected query-ip reply marker: 0x{:02x}",
-            reply[0]
-        )));
-    }
-
-    let assigned_ip = [reply[4], reply[5], reply[6], reply[7]];
-    hold_query_ip_stream(stream)?;
-    Ok(assigned_ip)
+    let send_ip = parse_send_ip_reply(&reply[..total]).inspect_err(|_| {
+        debug_protocol_hex("debug: SEND_IP raw reply", &reply[..total]);
+    })?;
+    hold_command_stream(stream)?;
+    Ok(send_ip.into())
 }
 
 fn rx_worker_loop(
@@ -395,7 +495,6 @@ fn rx_worker_loop(
     tx: mpsc::Sender<Vec<u8>>,
 ) -> EcResult<()> {
     let mut retries = 0usize;
-    let mut heartbeat_reply_count = 0u64;
     let mut buf = [0u8; 4096];
 
     loop {
@@ -409,10 +508,6 @@ fn rx_worker_loop(
                 retries = 0;
                 if !should_forward_rx_payload(&buf[..n])? {
                     continue;
-                }
-                if runtime.is_tx_heartbeat_echo_reply(&buf[..n]) {
-                    heartbeat_reply_count += 1;
-                    log_rx_heartbeat_if_sampled(heartbeat_reply_count, n);
                 }
                 if tx.send(buf[..n].to_vec()).is_err() {
                     return Ok(());
@@ -431,11 +526,14 @@ fn rx_worker_loop(
 fn should_forward_rx_payload(data: &[u8]) -> EcResult<bool> {
     match parse_native_control_frame(data) {
         Some(NativeControlType::RxAck) => Ok(false),
-        Some(control) => Err(EcError::Runtime(format!(
-            "unexpected rx control frame: {}({})",
-            control.label(),
-            control.code()
-        ))),
+        Some(control) => {
+            debug_protocol_hex("debug: unexpected rx control frame raw", data);
+            Err(EcError::Runtime(format!(
+                "unexpected rx control frame: {}({})",
+                control.label(),
+                control.code()
+            )))
+        }
         None => Ok(true),
     }
 }
@@ -447,19 +545,14 @@ fn tx_worker_loop(
 ) -> EcResult<()> {
     let mut retries = 0usize;
     let mut next_heartbeat = Instant::now() + TX_HEARTBEAT_INTERVAL;
-    let mut heartbeat_count = 0u64;
     loop {
         let now = Instant::now();
-        let (packet, heartbeat_seq) = if now >= next_heartbeat {
+        let packet = if now >= next_heartbeat {
             next_heartbeat = now + TX_HEARTBEAT_INTERVAL;
-            heartbeat_count += 1;
-            (
-                runtime.tx_heartbeat_packet().to_vec(),
-                Some(heartbeat_count),
-            )
+            runtime.tx_heartbeat_packet().to_vec()
         } else {
             match rx.recv_timeout(next_heartbeat - now) {
-                Ok(packet) => (packet, None),
+                Ok(packet) => packet,
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
             }
@@ -467,7 +560,6 @@ fn tx_worker_loop(
 
         if stream.write_all(&packet).is_ok() {
             retries = 0;
-            log_tx_heartbeat_if_sampled(heartbeat_seq, packet.len());
             continue;
         }
 
@@ -484,43 +576,7 @@ fn tx_worker_loop(
             EcError::Runtime(format!("tx stream write failed after reconnect: {e}"))
         })?;
         retries = 0;
-        log_tx_heartbeat_if_sampled(heartbeat_seq, packet.len());
     }
-}
-
-fn log_tx_heartbeat_if_sampled(seq: Option<u64>, len: usize) {
-    let Some(seq) = seq else {
-        return;
-    };
-    if !should_log_heartbeat_sample(seq) {
-        return;
-    }
-    output::info(
-        Scope::Protocol,
-        format_args!(
-            "TX heartbeat #{} sent: len {}",
-            output::value(seq),
-            output::value(len)
-        ),
-    );
-}
-
-fn log_rx_heartbeat_if_sampled(seq: u64, len: usize) {
-    if !should_log_heartbeat_sample(seq) {
-        return;
-    }
-    output::info(
-        Scope::Protocol,
-        format_args!(
-            "RX heartbeat #{} received: len {}",
-            output::value(seq),
-            output::value(len)
-        ),
-    );
-}
-
-fn should_log_heartbeat_sample(seq: u64) -> bool {
-    seq.is_power_of_two()
 }
 
 fn open_data_stream_with_retries(
@@ -538,10 +594,16 @@ fn open_data_stream_with_retries(
         if retry.delay_first_attempt || attempt > retry.first_attempt {
             thread::sleep(STREAM_RETRY_DELAY);
         }
+        debug_stream_open_attempt(profile, kind, retry.phase, attempt);
         match open_data_stream(authority, host, token, ip_rev, profile, kind) {
             Ok(stream) => return Ok(stream),
             Err(err) => {
-                last_error = Some(crate::error::concise_error(&err));
+                let concise = crate::error::concise_error(err.error());
+                debug_stream_open_failure(profile, kind, retry.phase, attempt, concise.as_str());
+                if err.is_fatal() {
+                    return Err(err.into_error());
+                }
+                last_error = Some(concise);
                 attempt += 1;
             }
         }
@@ -565,58 +627,120 @@ fn open_data_stream(
     ip_rev: &[u8; 4],
     profile: StreamProfile,
     kind: StreamOpenKind,
-) -> EcResult<SslStream<TcpStream>> {
-    let mut stream = connect_vpn_tls(authority, host)?;
+) -> Result<SslStream<TcpStream>, StreamOpenError> {
+    let mut stream = connect_vpn_tls(authority, host).map_err(StreamOpenError::retryable)?;
     let op_code = profile.op_code(kind);
     let expected_ack = profile.expected_ack();
 
     let message = build_stream_handshake_message(op_code, token, ip_rev);
-    stream
-        .write_all(&message)
-        .map_err(|e| EcError::Runtime(format!("stream handshake write failed: {e}")))?;
+    stream.write_all(&message).map_err(|e| {
+        StreamOpenError::retryable(EcError::Runtime(format!(
+            "stream handshake write failed: {e}"
+        )))
+    })?;
 
     let mut reply = [0u8; 1500];
-    let n = read_stream_once(&mut stream, &mut reply, STREAM_HANDSHAKE_TIMEOUT)?;
+    let n = read_stream_once(&mut stream, &mut reply, STREAM_HANDSHAKE_TIMEOUT)
+        .map_err(StreamOpenError::retryable)?;
     if n == 0 {
         let op = format!("0x{op_code:02x}");
-        return Err(EcError::Runtime(format!(
+        return Err(StreamOpenError::retryable(EcError::Runtime(format!(
             "{} stream handshake reply is empty or timed out; op: {}",
             profile.label(),
             op,
-        )));
+        ))));
     }
-    validate_stream_ack(profile, op_code, expected_ack, &reply[..n])?;
+    validate_stream_ack(profile, kind, op_code, expected_ack, &reply[..n])?;
 
-    clear_data_stream_read_timeout(&stream, profile)?;
+    clear_data_stream_read_timeout(&stream, profile).map_err(StreamOpenError::retryable)?;
     Ok(stream)
 }
 
 fn validate_stream_ack(
     profile: StreamProfile,
+    kind: StreamOpenKind,
     op_code: u8,
     expected_ack: NativeControlType,
     reply: &[u8],
-) -> EcResult<()> {
-    match parse_native_control_frame(reply) {
-        Some(control) if control == expected_ack => Ok(()),
-        Some(control) => Err(unexpected_stream_ack_err(
-            profile,
-            op_code,
-            expected_ack,
-            format_args!("{}({})", control.label(), control.code()),
-        )),
-        None if legacy_stream_ack_matches(reply, expected_ack) => Ok(()),
-        None => Err(unexpected_stream_ack_err(
-            profile,
-            op_code,
-            expected_ack,
-            format_args!("non-control-frame len={}", reply.len()),
-        )),
+) -> Result<(), StreamOpenError> {
+    match classify_stream_ack_reply(reply, expected_ack) {
+        StreamAckReply::Expected => Ok(()),
+        StreamAckReply::UnexpectedControl(control) => {
+            debug_stream_ack_reply(profile, op_code, reply);
+            let err = if is_terminal_stream_control(control) {
+                StreamOpenError::Fatal(stream_control_rejected_err(profile, kind, op_code, control))
+            } else {
+                StreamOpenError::Retryable(unexpected_stream_ack_err(
+                    profile,
+                    op_code,
+                    expected_ack,
+                    format_args!("{}({})", control.label(), control.code()),
+                ))
+            };
+            Err(err)
+        }
+        StreamAckReply::NonControl => {
+            debug_stream_ack_reply(profile, op_code, reply);
+            Err(StreamOpenError::Retryable(unexpected_stream_ack_err(
+                profile,
+                op_code,
+                expected_ack,
+                format_args!("non-control-frame len={}", reply.len()),
+            )))
+        }
     }
+}
+
+fn classify_stream_ack_reply(reply: &[u8], expected_ack: NativeControlType) -> StreamAckReply {
+    if let Some(control) = parse_native_control_frame(reply) {
+        return if control == expected_ack {
+            StreamAckReply::Expected
+        } else {
+            StreamAckReply::UnexpectedControl(control)
+        };
+    }
+
+    if legacy_stream_ack_matches(reply, expected_ack) {
+        return StreamAckReply::Expected;
+    }
+
+    if reply.len() == COMMAND_REPLY_BODY_EXPECTED_LEN
+        && let Ok(control) = parse_command_control_reply(reply)
+    {
+        return if control == expected_ack {
+            StreamAckReply::Expected
+        } else {
+            StreamAckReply::UnexpectedControl(control)
+        };
+    }
+
+    StreamAckReply::NonControl
 }
 
 fn legacy_stream_ack_matches(reply: &[u8], expected_ack: NativeControlType) -> bool {
     reply.first().copied() == u8::try_from(expected_ack.code()).ok()
+}
+
+fn is_terminal_stream_control(control: NativeControlType) -> bool {
+    matches!(
+        control,
+        NativeControlType::Shutdown | NativeControlType::IpKick | NativeControlType::IpConflict
+    )
+}
+
+fn stream_control_rejected_err(
+    profile: StreamProfile,
+    kind: StreamOpenKind,
+    op_code: u8,
+    control: NativeControlType,
+) -> EcError {
+    EcError::Runtime(format!(
+        "{} stream {} rejected by server: {}({}); op: 0x{op_code:02x}",
+        profile.label(),
+        kind.action_label(),
+        control.label(),
+        control.code(),
+    ))
 }
 
 fn unexpected_stream_ack_err(
@@ -646,6 +770,112 @@ fn clear_data_stream_read_timeout(
     })
 }
 
+#[cfg(debug_assertions)]
+fn debug_stream_ack_reply(profile: StreamProfile, op_code: u8, reply: &[u8]) {
+    if !output::is_debug_enabled() {
+        return;
+    }
+
+    debug_protocol_hex(
+        format_args!(
+            "debug: unexpected {} ack raw reply; op: 0x{op_code:02x}",
+            profile.label()
+        ),
+        reply,
+    );
+}
+
+#[cfg(not(debug_assertions))]
+fn debug_stream_ack_reply(_: StreamProfile, _: u8, _: &[u8]) {}
+
+#[cfg(debug_assertions)]
+fn debug_stream_open_attempt(
+    profile: StreamProfile,
+    kind: StreamOpenKind,
+    phase: &str,
+    attempt: usize,
+) {
+    if !output::is_debug_enabled() {
+        return;
+    }
+    output::debug(
+        Scope::Protocol,
+        format_args!(
+            "debug: opening {} stream; phase: {}; kind: {}; op: 0x{:02x}; attempt: {}/{}",
+            profile.label(),
+            phase,
+            kind.label(),
+            profile.op_code(kind),
+            attempt + 1,
+            STREAM_RETRY_LIMIT + 1
+        ),
+    );
+}
+
+#[cfg(not(debug_assertions))]
+fn debug_stream_open_attempt(_: StreamProfile, _: StreamOpenKind, _: &str, _: usize) {}
+
+#[cfg(debug_assertions)]
+fn debug_stream_open_failure(
+    profile: StreamProfile,
+    kind: StreamOpenKind,
+    phase: &str,
+    attempt: usize,
+    reason: &str,
+) {
+    if !output::is_debug_enabled() {
+        return;
+    }
+    output::debug(
+        Scope::Protocol,
+        format_args!(
+            "debug: {} stream open failed; phase: {}; kind: {}; op: 0x{:02x}; attempt: {}/{}; reason: {}",
+            profile.label(),
+            phase,
+            kind.label(),
+            profile.op_code(kind),
+            attempt + 1,
+            STREAM_RETRY_LIMIT + 1,
+            reason
+        ),
+    );
+}
+
+#[cfg(not(debug_assertions))]
+fn debug_stream_open_failure(_: StreamProfile, _: StreamOpenKind, _: &str, _: usize, _: &str) {}
+
+#[cfg(debug_assertions)]
+fn debug_protocol_hex(label: impl std::fmt::Display, data: &[u8]) {
+    output::debug_hex(Scope::Protocol, label, data);
+}
+
+#[cfg(not(debug_assertions))]
+fn debug_protocol_hex(_: impl std::fmt::Display, _: &[u8]) {}
+
+#[cfg(debug_assertions)]
+fn debug_tls_summary(stream: &SslStream<TcpStream>) {
+    if !output::is_debug_enabled() {
+        return;
+    }
+
+    let ssl = stream.ssl();
+    let version = ssl.version_str();
+    let cipher = ssl
+        .current_cipher()
+        .map(|cipher| cipher.name())
+        .unwrap_or("unknown");
+    output::debug(
+        Scope::Protocol,
+        format_args!(
+            "debug: vpn tls handshake; version: {}; cipher: {}; sni: disabled; legacy: enabled",
+            version, cipher
+        ),
+    );
+}
+
+#[cfg(not(debug_assertions))]
+fn debug_tls_summary(_: &SslStream<TcpStream>) {}
+
 fn connect_vpn_tls(authority: &str, host: &str) -> EcResult<SslStream<TcpStream>> {
     let tcp = crate::tls::connect_vpn_tcp(authority, Duration::from_secs(5))?;
     let mut builder = crate::tls::new_insecure_connector_builder("vpn")?;
@@ -660,18 +890,173 @@ fn connect_vpn_tls(authority: &str, host: &str) -> EcResult<SslStream<TcpStream>
     })?;
     crate::protocol_session::apply_l3ip_session_id(&mut ssl, 0x0303)?;
 
-    crate::tls::handshake(ssl, tcp, "vpn")
+    let stream = crate::tls::handshake(ssl, tcp, "vpn")?;
+    debug_tls_summary(&stream);
+    Ok(stream)
 }
 
-fn hold_query_ip_stream(stream: SslStream<TcpStream>) -> EcResult<()> {
-    // Real command-channel behavior needs CmdRealSsl/JJYY handling. This holder
-    // only preserves the query-ip context that gates subsequent data streams.
-    let holder = QUERY_IP_STREAM_HOLDER.get_or_init(|| Mutex::new(None));
+fn hold_command_stream(stream: SslStream<TcpStream>) -> EcResult<()> {
+    let holder = COMMAND_STREAM_HOLDER.get_or_init(|| Mutex::new(None));
     let mut guard = holder
         .lock()
-        .map_err(|_| EcError::Runtime("query-ip stream holder mutex poisoned".to_string()))?;
+        .map_err(|_| EcError::Runtime("command stream holder mutex poisoned".to_string()))?;
     *guard = Some(stream);
     Ok(())
+}
+
+fn start_command_heartbeat(token: [u8; PROTOCOL_TOKEN_LEN]) {
+    thread::spawn(move || {
+        if let Err(err) = command_heartbeat_loop(token) {
+            let detail = format!(
+                "stream closed: command; reason: {}",
+                crate::error::concise_error(err)
+            );
+            output::warn(Scope::Protocol, &detail);
+            record_tunnel_fatal_reason(detail);
+        }
+    });
+}
+
+fn command_heartbeat_loop(token: [u8; PROTOCOL_TOKEN_LEN]) -> EcResult<()> {
+    let mut failure_count = 0u32;
+    let mut next_delay = COMMAND_HEARTBEAT_INTERVAL;
+    loop {
+        thread::sleep(next_delay);
+        let holder = COMMAND_STREAM_HOLDER
+            .get()
+            .ok_or_else(|| EcError::Runtime("command stream is not initialized".to_string()))?;
+        let result = {
+            let mut guard = holder.lock().map_err(|_| {
+                EcError::Runtime("command stream holder mutex poisoned".to_string())
+            })?;
+            let stream = guard
+                .as_mut()
+                .ok_or_else(|| EcError::Runtime("command stream is not available".to_string()))?;
+            send_command_heartbeat(stream, &token)
+        };
+        match result {
+            Ok(()) => {
+                failure_count = 0;
+                next_delay = COMMAND_HEARTBEAT_INTERVAL;
+            }
+            Err(CommandHeartbeatFailure::Retryable(reason)) => {
+                failure_count += 1;
+                if failure_count >= COMMAND_HEARTBEAT_FAILURE_LIMIT {
+                    return Err(EcError::Runtime(format!(
+                        "command heartbeat reached failure limit ({}/{}): {reason}",
+                        failure_count, COMMAND_HEARTBEAT_FAILURE_LIMIT
+                    )));
+                }
+                output::warn(
+                    Scope::Protocol,
+                    format_args!(
+                        "command heartbeat failed: {}; retrying in {}s ({}/{})",
+                        reason,
+                        COMMAND_HEARTBEAT_RETRY_DELAY.as_secs(),
+                        output::value(failure_count),
+                        output::value(COMMAND_HEARTBEAT_FAILURE_LIMIT)
+                    ),
+                );
+                next_delay = COMMAND_HEARTBEAT_RETRY_DELAY;
+            }
+            Err(CommandHeartbeatFailure::Fatal(reason)) => {
+                return Err(EcError::Runtime(reason));
+            }
+        }
+    }
+}
+
+fn send_command_heartbeat(
+    stream: &mut SslStream<TcpStream>,
+    token: &[u8; PROTOCOL_TOKEN_LEN],
+) -> Result<(), CommandHeartbeatFailure> {
+    let message = build_command_message(3, token);
+    stream.write_all(&message).map_err(|e| {
+        CommandHeartbeatFailure::Retryable(format!("command heartbeat write failed: {e}"))
+    })?;
+
+    let mut reply = [0u8; 0x80];
+    let n = read_at_least(
+        stream,
+        &mut reply,
+        COMMAND_REPLY_BODY_EXPECTED_LEN,
+        COMMAND_HEARTBEAT_TIMEOUT,
+    )
+    .map_err(|e| {
+        CommandHeartbeatFailure::Retryable(format!(
+            "command heartbeat read failed: {}",
+            crate::error::concise_error(e)
+        ))
+    })?;
+    if n == 0 {
+        return Err(CommandHeartbeatFailure::Retryable(
+            "command heartbeat reply is empty or timed out".to_string(),
+        ));
+    }
+    classify_command_heartbeat_reply(&reply[..n], &reply[..n]).into_result()
+}
+
+fn classify_command_heartbeat_reply(data: &[u8], raw: &[u8]) -> CommandHeartbeatOutcome {
+    let control = match parse_command_control_reply(data) {
+        Ok(control) => control,
+        Err(err) => {
+            debug_protocol_hex("debug: command heartbeat parse-failed raw reply", raw);
+            return CommandHeartbeatOutcome::Fatal(format!(
+                "command heartbeat parse failed: {}",
+                crate::error::concise_error(err)
+            ));
+        }
+    };
+
+    match control {
+        NativeControlType::Heartbeat => CommandHeartbeatOutcome::Ack,
+        NativeControlType::Shutdown | NativeControlType::IpKick => {
+            debug_protocol_hex("debug: command heartbeat shutdown raw reply", raw);
+            CommandHeartbeatOutcome::Fatal(format!(
+                "command control requested tunnel shutdown: {}",
+                control.label()
+            ))
+        }
+        control => {
+            debug_protocol_hex("debug: unexpected command heartbeat raw reply", raw);
+            CommandHeartbeatOutcome::Fatal(format!(
+                "unexpected command heartbeat reply: {}({})",
+                control.label(),
+                control.code()
+            ))
+        }
+    }
+}
+
+impl CommandHeartbeatOutcome {
+    fn into_result(self) -> Result<(), CommandHeartbeatFailure> {
+        match self {
+            Self::Ack => Ok(()),
+            Self::Fatal(reason) => Err(CommandHeartbeatFailure::Fatal(reason)),
+        }
+    }
+}
+
+fn read_at_least<S: Read + Write>(
+    stream: &mut SslStream<S>,
+    buf: &mut [u8],
+    min_len: usize,
+    timeout: Duration,
+) -> EcResult<usize> {
+    let deadline = Instant::now() + timeout;
+    let mut total = 0usize;
+    while total < min_len && total < buf.len() {
+        if Instant::now() >= deadline {
+            break;
+        }
+        match stream.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(e) if is_wouldblock_or_timeout(&e) => continue,
+            Err(e) => return Err(EcError::Runtime(format!("stream read failed: {e}"))),
+        }
+    }
+    Ok(total)
 }
 
 fn read_stream_once<S: Read + Write>(
@@ -726,8 +1111,9 @@ fn splitmix64(mut x: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        NativeControlType, StreamOpenKind, StreamProfile, TunnelRuntimeParams,
-        should_forward_rx_payload, should_log_heartbeat_sample, validate_stream_ack,
+        CommandHeartbeatOutcome, NativeControlType, StreamOpenKind, StreamProfile, TunnelIps,
+        TunnelRuntimeParams, classify_command_heartbeat_reply, should_forward_rx_payload,
+        validate_stream_ack,
     };
 
     #[test]
@@ -744,12 +1130,26 @@ mod tests {
         frame[0..4].copy_from_slice(b"AABB");
         frame[4..8].copy_from_slice(&1u32.to_le_bytes());
         assert!(
-            validate_stream_ack(StreamProfile::Rx, 0x06, NativeControlType::RxAck, &frame).is_ok()
+            validate_stream_ack(
+                StreamProfile::Rx,
+                StreamOpenKind::First,
+                0x06,
+                NativeControlType::RxAck,
+                &frame
+            )
+            .is_ok()
         );
 
         frame[4..8].copy_from_slice(&2u32.to_le_bytes());
         assert!(
-            validate_stream_ack(StreamProfile::Tx, 0x05, NativeControlType::TxAck, &frame).is_ok()
+            validate_stream_ack(
+                StreamProfile::Tx,
+                StreamOpenKind::First,
+                0x05,
+                NativeControlType::TxAck,
+                &frame
+            )
+            .is_ok()
         );
     }
 
@@ -759,18 +1159,47 @@ mod tests {
         frame[0..4].copy_from_slice(b"AABB");
         frame[4..8].copy_from_slice(&2u32.to_le_bytes());
         assert!(
-            validate_stream_ack(StreamProfile::Rx, 0x06, NativeControlType::RxAck, &frame).is_err()
+            validate_stream_ack(
+                StreamProfile::Rx,
+                StreamOpenKind::First,
+                0x06,
+                NativeControlType::RxAck,
+                &frame
+            )
+            .is_err()
         );
 
         let legacy_marker_reply = [0x01u8, 0, 0, 0, 0, 0, 0, 0];
         assert!(
             validate_stream_ack(
                 StreamProfile::Rx,
+                StreamOpenKind::First,
                 0x06,
                 NativeControlType::RxAck,
                 &legacy_marker_reply
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn stream_ack_classifies_code_style_shutdown_as_fatal() {
+        let mut reply = [0u8; 36];
+        reply[0..4].copy_from_slice(&8u32.to_le_bytes());
+        let err = validate_stream_ack(
+            StreamProfile::Rx,
+            StreamOpenKind::Resume,
+            0x07,
+            NativeControlType::RxAck,
+            &reply,
+        )
+        .unwrap_err();
+
+        assert!(err.is_fatal());
+        assert!(
+            err.error()
+                .to_string()
+                .contains("rx stream resume rejected by server: shutdown(8)")
         );
     }
 
@@ -796,24 +1225,40 @@ mod tests {
             "vpn.example:443".to_string(),
             "vpn.example".to_string(),
             token,
-            [10, 166, 80, 12],
+            TunnelIps {
+                assigned_ip: [10, 166, 80, 12],
+                lan_ip: [10, 166, 64, 7],
+            },
         );
 
         let packet = runtime.tx_heartbeat_packet();
         assert_eq!(&packet[12..16], &[10, 166, 80, 12]);
-        assert_eq!(&packet[16..20], &[10, 166, 64, 3]);
+        assert_eq!(&packet[16..20], &[10, 166, 64, 7]);
         assert_eq!(&packet[46..62], b"eab27cdf7c24a40f");
         assert_eq!(&packet[70..76], b"L3VPN\0");
     }
 
     #[test]
-    fn tx_heartbeat_log_sampling_uses_powers_of_two() {
-        let sampled: Vec<u64> = (1..=16)
-            .filter(|v| should_log_heartbeat_sample(*v))
-            .collect();
-        assert_eq!(sampled, vec![1, 2, 4, 8, 16]);
-        assert!(!should_log_heartbeat_sample(0));
-        assert!(!should_log_heartbeat_sample(3));
-        assert!(!should_log_heartbeat_sample(12));
+    fn command_heartbeat_reply_classifies_ack_and_shutdown() {
+        let mut ack = [0u8; 36];
+        ack[0..4].copy_from_slice(&15u32.to_le_bytes());
+        assert!(matches!(
+            classify_command_heartbeat_reply(&ack, &ack),
+            CommandHeartbeatOutcome::Ack
+        ));
+
+        ack[0..4].copy_from_slice(&8u32.to_le_bytes());
+        assert!(matches!(
+            classify_command_heartbeat_reply(&ack, &ack),
+            CommandHeartbeatOutcome::Fatal(reason) if reason.contains("shutdown")
+        ));
+    }
+
+    #[test]
+    fn command_heartbeat_reply_classifies_parse_failure_as_fatal() {
+        assert!(matches!(
+            classify_command_heartbeat_reply(&[], &[]),
+            CommandHeartbeatOutcome::Fatal(reason) if reason.contains("parse failed")
+        ));
     }
 }

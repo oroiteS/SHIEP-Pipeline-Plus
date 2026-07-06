@@ -40,7 +40,7 @@ pub fn login(config: &AppConfig) -> EcResult<String> {
         extract_tag(&login_auth_body, "RSA_ENCRYPT_EXP").unwrap_or_else(|| "65537".to_string());
     let csrf = extract_tag(&login_auth_body, "CSRF_RAND_CODE").unwrap_or_default();
     if csrf.is_empty() {
-        output::warn(Scope::Login, "CSRF code missing; using legacy auth flow");
+        output::info(Scope::Login, "CSRF code missing; using legacy auth flow");
     }
 
     let password_input = if csrf.is_empty() {
@@ -71,7 +71,7 @@ pub fn login(config: &AppConfig) -> EcResult<String> {
         .map_err(|e| EcError::Runtime(format!("login_psw body read failed: {e}")))?;
 
     if let Some(reason) = unsupported_2fa_reason(&login_psw_body) {
-        return Err(EcError::NotImplemented(reason));
+        return Err(EcError::Unsupported(reason));
     }
     if !login_psw_body.contains(TAG_RESULT_SUCCESS) {
         return Err(EcError::Runtime(

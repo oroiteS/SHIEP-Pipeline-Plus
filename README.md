@@ -1,69 +1,120 @@
 # SHIEP-Pipeline-Plus
 
-[SHIEP-Pipeline](https://github.com/Yan233th/SHIEP-Pipeline) 的 fork，在路由逻辑上做了一些功能扩展。
+[SHIEP-Pipeline](https://github.com/Yan233th/SHIEP-Pipeline) 的 fork，基于上游 v2.0.0，并保留 Plus 路由和配置扩展。
 
-## 与原版的区别
+## 与上游的区别
 
-原版的 split-routing 完全依赖服务端下发的 route table。如果某个 IP 不在表中（例如学校内网的非标端口服务），流量会被 fallback 到直连或上游代理，导致无法通过 VPN 隧道访问。
+Plus 保留上游 v2.0.0 的协议、日志、SOCKS5、UDP ASSOCIATE、路由表降级和 debug 诊断行为，并额外提供以下参数：
 
-本 fork 新增以下功能：
+- `--extra <IP>`：手动添加额外 IPv4 隧道路由，可重复指定。
+- `--details`：成功获取路由表后，将规则和 DNS 记录写入 `route-details.txt`。
+- `--remember`：记住 `--server` 和 `--username` 到 `remembered.json`，不会保存密码。
 
-**`--extra <IP>`：手动白名单 IP**
+`--extra` 支持三种格式：
 
-允许手动将额外 IP 加入隧道路由白名单，支持三种格式。
+| 格式 | 示例 |
+| --- | --- |
+| 单个 IP | `--extra 10.50.2.206` |
+| IP 范围 | `--extra 10.50.2.1~10.50.2.254` |
+| CIDR 网段 | `--extra 10.50.2.0/24` |
 
-> **注意**：`--extra` 仅修改本地路由逻辑，不改变服务端策略。实测中 VPN 服务器可能仍拒绝转发额外 IP 的流量。此功能仅做路由层面的能力扩展。
+> 注意：`--extra` 只改变本地路由选择，不改变服务端策略。VPN 服务端仍可能拒绝转发额外目标。
 
-| 格式      | 示例                      |
-| --------- | ------------------------- |
-| 单个 IP   | `--extra 1.1.1.1`         |
-| IP 范围   | `--extra 1.1.1.1~1.1.1.2` |
-| CIDR 网段 | `--extra 1.1.1.0/24`      |
-
-可多次指定：`--extra 1.1.1.1 --extra 192.168.1.0/24`
-
-**`--details`：输出路由表详情**
-
-启用后，将服务端下发的路由表（IP 规则、域名规则、DNS 记录、Extra IP）写入当前目录的 `route-details.txt`。终端仅显示一行简要提示。
+## Quick Start
 
 ```bash
-SHIEP-Pipeline --server ... --username ... --password ... --details
+SHIEP_PIPELINE_PASSWORD=<PASSWORD> ./SHIEP-Pipeline \
+  --server <VPN_SERVER> \
+  --username <USERNAME>
 ```
 
-## 使用
+也可以直接传入密码，但不推荐，因为进程参数可能被系统上其他用户看到：
 
 ```bash
-# 从源码运行
-cargo run -p ec-cli -- \
-  --server <VPN_SERVER> \
-  --username <USERNAME> \
-  --password <PASSWORD> \
-  --extra <IP>
+./SHIEP-Pipeline --server <VPN_SERVER> --username <USERNAME> --password <PASSWORD>
+```
 
-# 完整参数
-./SHIEP-Pipeline \
+使用 Plus 参数：
+
+```bash
+SHIEP_PIPELINE_PASSWORD=<PASSWORD> ./SHIEP-Pipeline \
   --server <VPN_SERVER> \
   --username <USERNAME> \
   --bind 127.0.0.1:1080 \
   --fallback socks5h://127.0.0.1:114514 \
-  --extra <IP>
+  --extra 10.50.2.206 \
+  --extra 10.50.2.0/24 \
+  --details \
+  --remember
 ```
 
-默认 SOCKS5 监听地址：`127.0.0.1:1080`。
+再次使用已保存的 server 和 username：
+
+```bash
+SHIEP_PIPELINE_PASSWORD=<PASSWORD> ./SHIEP-Pipeline --remember
+```
+
+## CLI Arguments
+
+- `--server` VPN server address；未使用 `--remember` 时必需。
+- `--username` VPN username；未使用 `--remember` 时必需。
+- `SHIEP_PIPELINE_PASSWORD` required unless `--password` is provided。
+- `--password` VPN password；可替代 `SHIEP_PIPELINE_PASSWORD`，但不推荐。
+- `--bind` local bind address，默认 `127.0.0.1:1080`。
+- `--fallback` fallback upstream proxy address。
+- `--extra <IP>` extra IPv4/CIDR/range tunnel route，可重复指定。
+- `--details` write `route-details.txt` after fetching the route table。
+- `--remember` remember server and username in `remembered.json`。
+
+Debug builds expose an additional `--debug` flag. Release builds do not include this flag or the diagnostic strings.
+
+## Routing and Fallback
 
 - VPN 启动后自动从 `/por/rclist.csp` 获取并解析路由规则。
-- 白名单规则命中时，流量走远程隧道（优先使用映射的 DNS IP）。
-- 未命中白名单时，TCP 流量走 fallback 路由。
-- 指定 `--fallback` 时，TCP 流量走上游代理。
-- 未指定 `--fallback` 时，TCP 流量直连。
+- 如果路由表规则、DNS 记录、DNS server lookup、CNAME 或 IP range 匹配，流量走远程隧道。
+- 如果目标 IPv4 命中 `--extra`，流量走远程隧道，日志 source 为 `extra-ip`。
+- 未命中白名单时，TCP 流量走 fallback。
+- 指定 `--fallback` 时，TCP fallback 走上游代理。
+- 未指定 `--fallback` 时，TCP fallback 直连。
+- 如果路由表无法获取，上游 v2.0.0 行为会退化为全隧道模式，请求 source 为 `route-table-unavailable`。
+- UDP ASSOCIATE 支持远程路由；UDP fallback 不支持。
 
-所有参数的详细说明见[原版 README](https://github.com/Yan233th/SHIEP-Pipeline)。
+Supported fallback proxy input formats:
 
-## 致谢
+| Input format | Interpreted as |
+| --- | --- |
+| `socks5://host:port` | SOCKS5 proxy |
+| `socks5h://host:port` | SOCKS5 proxy with remote DNS |
+| `http://host:port` | HTTP CONNECT proxy |
+| `host:port` | Plain host/port, interpreted as `socks5h://host:port` |
 
-- [SHIEP-Pipeline](https://github.com/Yan233th/SHIEP-Pipeline) — 原版项目作者
-- [NJUConnect](https://github.com/lyc8503/NJUConnect) / [EasierConnect](https://github.com/Yan233th/EasierConnect) — 上游参考项目
+## Development
+
+```bash
+SHIEP_PIPELINE_PASSWORD=<PASSWORD> cargo run -p ec-cli -- \
+  --server <VPN_SERVER> \
+  --username <USERNAME>
+```
+
+Debug diagnostics:
+
+```bash
+SHIEP_PIPELINE_PASSWORD=<PASSWORD> cargo run -p ec-cli -- \
+  --server <VPN_SERVER> \
+  --username <USERNAME> \
+  --debug
+```
+
+## Project Structure
+
+- `crates/ec-cli`: CLI entry point and argument parsing
+- `crates/ec-core`: Core implementation
+
+## Acknowledgements
+
+- [SHIEP-Pipeline](https://github.com/Yan233th/SHIEP-Pipeline) - upstream project
+- [NJUConnect](https://github.com/lyc8503/NJUConnect) / [EasierConnect](https://github.com/Yan233th/EasierConnect) - upstream reference projects
 
 ## Issues
 
-本 fork 仅做增量修改，不计划长期维护。如遇 bug，建议先去[原版仓库](https://github.com/Yan233th/SHIEP-Pipeline/issues)提交 issue。
+本 fork 仅做增量修改。如遇上游协议或核心运行时问题，建议先参考[原版仓库](https://github.com/Yan233th/SHIEP-Pipeline/issues)。
